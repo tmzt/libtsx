@@ -17,4 +17,4 @@ pub mod dag;
 mod parse;
 
 #[cfg(feature = "parse")]
-pub use parse::{AttrValue, Element, Node, TsxDocument, extract_interfaces, parse_tsx};
+pub use parse::{AttrValue, Element, Node, TsxDocument, extract_interfaces, parse_app, parse_tsx};

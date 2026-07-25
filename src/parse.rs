@@ -110,6 +110,52 @@ pub fn parse_tsx(source: &str) -> Result<TsxDocument, Vec<String>> {
     Ok(TsxDocument { root_nodes })
 }
 
+/// Parse a **multi-file app** into one combined [`TsxDocument`]: the app-level
+/// file (`app_src`) supplies the root element (its tag + attributes — e.g.
+/// `<App>` and any app-level props), and each entry of `screens` is a per-screen
+/// source file whose own root element is spliced in as a child of that root, in
+/// the given order.
+///
+/// This is the boundary for Highbay's multi-file app model (EDITOR_PLAN §7): the
+/// hidden app-level file holds the screen registry/structure while each screen is
+/// its own document, and the combined graph is derived from both. Keeping the
+/// splice here (rather than in the consumer) keeps every `oxc_*` type quarantined
+/// — callers get the same owned [`TsxDocument`] as [`parse_tsx`].
+///
+/// The returned document has exactly one root node: the app root element with the
+/// screen root elements as its children (the app file's own children are
+/// replaced by the screen elements — the screen files are the content authority).
+/// A screen source with no root element, or an app source with no root element,
+/// is an error.
+pub fn parse_app(app_src: &str, screens: &[&str]) -> Result<TsxDocument, Vec<String>> {
+    let app_doc = parse_tsx(app_src)?;
+    let app_el = app_doc
+        .root_nodes
+        .into_iter()
+        .find_map(|n| match n {
+            Node::Element(e) => Some(e),
+            _ => None,
+        })
+        .ok_or_else(|| vec!["app source has no root element".to_string()])?;
+
+    let mut children = Vec::with_capacity(screens.len());
+    for (i, src) in screens.iter().enumerate() {
+        let doc = parse_tsx(src)?;
+        let el = doc
+            .root_nodes
+            .into_iter()
+            .find_map(|n| match n {
+                Node::Element(e) => Some(e),
+                _ => None,
+            })
+            .ok_or_else(|| vec![format!("screen source {i} has no root element")])?;
+        children.push(Node::Element(el));
+    }
+
+    let combined = Element { tag: app_el.tag, attrs: app_el.attrs, children };
+    Ok(TsxDocument { root_nodes: vec![Node::Element(combined)] })
+}
+
 /// Extract every top-level TypeScript `interface` into an owned
 /// [`InterfaceDecl`] (the Props-shape / DagNode contract).
 ///
@@ -433,5 +479,50 @@ mod tests {
         let ifaces = extract_interfaces("export interface P { ok: boolean; }").expect("parse");
         assert_eq!(ifaces.len(), 1);
         assert_eq!(ifaces[0].fields[0].ty, TypeShape::Bool);
+    }
+
+    #[test]
+    fn parse_app_splices_screen_files_under_the_app_root() {
+        // The app-level file supplies the root <App> (with its attrs); each screen
+        // file is spliced in as a child in order.
+        let app = r#"<App><Screen name="Home" file="home.tsx" /></App>"#;
+        let home = r#"<Screen name="Home" icon="home"><Item><Content>{"Hi"}</Content></Item></Screen>"#;
+        let search = r#"<Screen name="Search"><Item><Content>{"Go"}</Content></Item></Screen>"#;
+        let doc = parse_app(app, &[home, search]).expect("combined parse");
+
+        assert_eq!(doc.root_nodes.len(), 1);
+        let Node::Element(app_el) = &doc.root_nodes[0] else { panic!("root is the App element") };
+        assert_eq!(app_el.tag, "App");
+        // The app file's own <Screen> registry children are replaced by the two
+        // screen documents (screen files are the content authority).
+        assert_eq!(app_el.children.len(), 2, "one child per screen file, in order");
+        let Node::Element(s0) = &app_el.children[0] else { panic!() };
+        let Node::Element(s1) = &app_el.children[1] else { panic!() };
+        assert_eq!(s0.tag, "Screen");
+        assert_eq!(s0.attr("name"), Some(&AttrValue::Str("Home".into())));
+        assert_eq!(s0.attr("icon"), Some(&AttrValue::Str("home".into())));
+        // The screen content survived the splice.
+        assert!(matches!(&s0.children[0], Node::Element(item) if item.tag == "Item"));
+        assert_eq!(s1.attr("name"), Some(&AttrValue::Str("Search".into())));
+    }
+
+    #[test]
+    fn parse_app_preserves_app_root_attributes() {
+        // App-level props (a future depth/theme attribute) ride on the root.
+        let app = r#"<App depth={2} />"#;
+        let doc = parse_app(app, &[r#"<Screen name="Only" />"#]).expect("parse");
+        let Node::Element(app_el) = &doc.root_nodes[0] else { panic!() };
+        assert_eq!(app_el.attr("depth"), Some(&AttrValue::Num(2.0)));
+        assert_eq!(app_el.children.len(), 1);
+    }
+
+    #[test]
+    fn parse_app_is_deterministic_and_reports_bad_screens() {
+        let app = "<App />";
+        let a = parse_app(app, &[r#"<Screen name="A" />"#]).unwrap();
+        let b = parse_app(app, &[r#"<Screen name="A" />"#]).unwrap();
+        assert_eq!(a, b);
+        // A screen file with no root element is a reported error, not a panic.
+        assert!(parse_app(app, &["   // just a comment"]).is_err());
     }
 }
