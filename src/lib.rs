@@ -17,4 +17,10 @@ pub mod dag;
 mod parse;
 
 #[cfg(feature = "parse")]
+mod transpile;
+
+#[cfg(feature = "parse")]
 pub use parse::{AttrValue, Element, Node, TsxDocument, extract_interfaces, parse_app, parse_tsx};
+
+#[cfg(feature = "parse")]
+pub use transpile::transpile_ts;
