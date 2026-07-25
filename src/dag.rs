@@ -50,6 +50,45 @@ pub struct InterfaceDecl {
     pub fields: Vec<FieldDecl>,
 }
 
+/// An ES `import { a, b as c } from "src"` declaration — the **typed reference**
+/// edge from a module to a provider it consumes (a screen importing a Script's
+/// exported source, e.g. a `ListAdapter` provider). Owned + serde; no `oxc_*`
+/// type appears here. The semantic AST records the edge (what a module depends
+/// on and under what local name); resolving it to a concrete provider is the
+/// consumer's job (highbay_ui's provider registry today; a real module runtime
+/// later).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ImportDecl {
+    /// The module specifier string (`from "…"`) — a Script's display name in the
+    /// Highbay module system, or a real package path.
+    pub source: String,
+    /// The imported bindings, in source order.
+    pub names: Vec<ImportName>,
+}
+
+/// One imported binding of an [`ImportDecl`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ImportName {
+    /// The local name this module refers to the binding by.
+    pub local: String,
+    /// The name exported by the source module. Equals `local` for a default or
+    /// namespace import; the `imported` half of `imported as local` otherwise.
+    pub imported: String,
+    /// Which import form introduced the binding.
+    pub kind: ImportKind,
+}
+
+/// The three import binding forms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ImportKind {
+    /// `import { imported as local }` (or `import { name }`).
+    Named,
+    /// `import local from "src"`.
+    Default,
+    /// `import * as local from "src"`.
+    Namespace,
+}
+
 /// One field of an interface (or one named function parameter).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FieldDecl {
@@ -221,6 +260,20 @@ mod tests {
         let json = serde_json::to_string(&node).expect("serialize");
         let back: DagNode = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(node, back);
+    }
+
+    #[test]
+    fn import_decl_round_trips_through_serde() {
+        let imp = ImportDecl {
+            source: "Library Feed".into(),
+            names: vec![
+                ImportName { local: "libraryFeed".into(), imported: "libraryFeed".into(), kind: ImportKind::Named },
+                ImportName { local: "Feed".into(), imported: "default".into(), kind: ImportKind::Default },
+            ],
+        };
+        let json = serde_json::to_string(&imp).expect("serialize");
+        let back: ImportDecl = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(imp, back);
     }
 
     #[test]

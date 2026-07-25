@@ -12,11 +12,12 @@
 //! * Expression children (`{binding}`) and string-literal children are
 //!   captured (the old proof-of-concept dropped them).
 
-use crate::dag::{FieldDecl, InterfaceDecl, TypeShape};
+use crate::dag::{FieldDecl, ImportDecl, ImportKind, ImportName, InterfaceDecl, TypeShape};
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
-    Expression, JSXAttributeItem, JSXAttributeName, JSXAttributeValue, JSXChild, JSXElement,
-    JSXElementName, PropertyKey, Statement, TSSignature, TSType,
+    ArrowFunctionExpression, ExportDefaultDeclarationKind, Expression, ImportDeclarationSpecifier,
+    JSXAttributeItem, JSXAttributeName, JSXAttributeValue, JSXChild, JSXElement, JSXElementName,
+    ModuleExportName, PropertyKey, Statement, TSSignature, TSType,
 };
 use oxc_parser::Parser;
 use oxc_span::SourceType;
@@ -72,12 +73,28 @@ pub enum Node {
 #[derive(Debug, Clone, PartialEq)]
 pub struct TsxDocument {
     pub root_nodes: Vec<Node>,
+    /// Top-level `import … from "…"` declarations, in source order — the typed
+    /// reference edges from this module to the providers it consumes (empty for
+    /// a bare `<JSX/>` document). See [`ImportDecl`].
+    pub imports: Vec<ImportDecl>,
 }
 
 /// Parse TSX source into an owned [`TsxDocument`].
 ///
-/// Only top-level JSX expression statements contribute root nodes; interface
-/// and other declarations are ignored here (see [`extract_interfaces`]).
+/// Two module shapes contribute root JSX nodes (EDITOR_PLAN §7 / MODULE_PLAN):
+/// * **bare JSX** — a top-level `<JSX/>` expression statement (the original
+///   Highbay screen/widget shape); every such statement contributes a root node.
+/// * **export-default arrow component** — `export default () => (<JSX/>)`, or a
+///   `const Name = () => (<JSX/>)` referenced by `export default Name`. The
+///   arrow's returned JSX element becomes the (single) root node. This is the
+///   full-module screen shape: an `import` for a provider plus a default-exported
+///   component that passes it as a prop.
+///
+/// Top-level `import` declarations are captured into [`TsxDocument::imports`]
+/// regardless of shape. Interface and other declarations are ignored here (see
+/// [`extract_interfaces`]). `export default const …` is intentionally *not*
+/// accepted — it is invalid TS and oxc rejects it (use the `const … ;
+/// export default …` split, which is what Highbay writes).
 pub fn parse_tsx(source: &str) -> Result<TsxDocument, Vec<String>> {
     let allocator = Allocator::default();
     let ret = Parser::new(&allocator, source, SourceType::tsx()).parse();
@@ -91,23 +108,126 @@ pub fn parse_tsx(source: &str) -> Result<TsxDocument, Vec<String>> {
     }
 
     let mut root_nodes = Vec::new();
+    let mut imports = Vec::new();
+    // Pass 1: bare JSX statements, imports, and a table of
+    // `const Name = () => (<JSX/>)` arrow components (for export-default-by-name).
+    let mut arrow_components: Vec<(&str, &JSXElement)> = Vec::new();
     for stmt in &ret.program.body {
-        if let Statement::ExpressionStatement(expr_stmt) = stmt {
-            match &expr_stmt.expression {
-                Expression::JSXElement(jsx) => {
-                    root_nodes.push(Node::Element(convert_element(jsx)));
-                }
+        match stmt {
+            Statement::ImportDeclaration(decl) => imports.push(convert_import(decl)),
+            Statement::ExpressionStatement(expr_stmt) => match &expr_stmt.expression {
+                Expression::JSXElement(jsx) => root_nodes.push(Node::Element(convert_element(jsx))),
                 Expression::JSXFragment(frag) => {
                     for child in &frag.children {
                         push_child(&mut root_nodes, child);
                     }
                 }
                 _ => {}
+            },
+            Statement::VariableDeclaration(var) => {
+                for d in &var.declarations {
+                    if let (Some(name), Some(Expression::ArrowFunctionExpression(arrow))) =
+                        (d.id.get_binding_identifier(), d.init.as_ref())
+                    {
+                        if let Some(jsx) = arrow_root_jsx(arrow) {
+                            arrow_components.push((name.name.as_str(), jsx));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Pass 2: the export-default component — an inline arrow, or a reference to a
+    // `const` arrow component collected above. Its JSX is the module's root.
+    for stmt in &ret.program.body {
+        if let Statement::ExportDefaultDeclaration(decl) = stmt {
+            let jsx = match &decl.declaration {
+                ExportDefaultDeclarationKind::ArrowFunctionExpression(arrow) => arrow_root_jsx(arrow),
+                ExportDefaultDeclarationKind::Identifier(id) => arrow_components
+                    .iter()
+                    .find(|(n, _)| *n == id.name.as_str())
+                    .map(|(_, jsx)| *jsx),
+                _ => None,
+            };
+            if let Some(jsx) = jsx {
+                root_nodes.push(Node::Element(convert_element(jsx)));
             }
         }
     }
 
-    Ok(TsxDocument { root_nodes })
+    // Lenient fallback: a module with a single `const` arrow component and no
+    // export/bare-JSX still yields its JSX (so a mid-edit missing `export default`
+    // doesn't blank the preview).
+    if root_nodes.is_empty() {
+        if let Some((_, jsx)) = arrow_components.first() {
+            root_nodes.push(Node::Element(convert_element(jsx)));
+        }
+    }
+
+    Ok(TsxDocument { root_nodes, imports })
+}
+
+/// The JSX element an arrow function returns, if it is a JSX component: a concise
+/// body `() => (<JSX/>)` or an explicit `() => { return <JSX/>; }`. Parentheses
+/// are transparent. `None` for a non-JSX arrow.
+fn arrow_root_jsx<'a>(arrow: &'a ArrowFunctionExpression<'a>) -> Option<&'a JSXElement<'a>> {
+    for st in &arrow.body.statements {
+        match st {
+            Statement::ExpressionStatement(es) => return expr_root_jsx(&es.expression),
+            Statement::ReturnStatement(rs) => {
+                return rs.argument.as_ref().and_then(expr_root_jsx);
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Unwrap parentheses to a root JSX element, if the expression is one.
+fn expr_root_jsx<'a>(expr: &'a Expression<'a>) -> Option<&'a JSXElement<'a>> {
+    match expr {
+        Expression::JSXElement(j) => Some(j),
+        Expression::ParenthesizedExpression(p) => expr_root_jsx(&p.expression),
+        _ => None,
+    }
+}
+
+/// Convert an oxc import declaration into the owned [`ImportDecl`] typed
+/// reference (default / named / namespace bindings, in source order).
+fn convert_import(decl: &oxc_ast::ast::ImportDeclaration) -> ImportDecl {
+    let mut names = Vec::new();
+    if let Some(specifiers) = &decl.specifiers {
+        for spec in specifiers {
+            match spec {
+                ImportDeclarationSpecifier::ImportSpecifier(s) => {
+                    let imported = match &s.imported {
+                        ModuleExportName::IdentifierName(i) => i.name.to_string(),
+                        ModuleExportName::IdentifierReference(i) => i.name.to_string(),
+                        ModuleExportName::StringLiteral(s) => s.value.to_string(),
+                    };
+                    names.push(ImportName {
+                        local: s.local.name.to_string(),
+                        imported,
+                        kind: ImportKind::Named,
+                    });
+                }
+                ImportDeclarationSpecifier::ImportDefaultSpecifier(s) => {
+                    names.push(ImportName {
+                        local: s.local.name.to_string(),
+                        imported: "default".to_string(),
+                        kind: ImportKind::Default,
+                    });
+                }
+                ImportDeclarationSpecifier::ImportNamespaceSpecifier(s) => {
+                    let local = s.local.name.to_string();
+                    names.push(ImportName { imported: local.clone(), local, kind: ImportKind::Namespace });
+                }
+            }
+        }
+    }
+    ImportDecl { source: decl.source.value.to_string(), names }
 }
 
 /// Parse a **multi-file app** into one combined [`TsxDocument`]: the app-level
@@ -129,6 +249,7 @@ pub fn parse_tsx(source: &str) -> Result<TsxDocument, Vec<String>> {
 /// is an error.
 pub fn parse_app(app_src: &str, screens: &[&str]) -> Result<TsxDocument, Vec<String>> {
     let app_doc = parse_tsx(app_src)?;
+    let mut imports = app_doc.imports;
     let app_el = app_doc
         .root_nodes
         .into_iter()
@@ -140,7 +261,8 @@ pub fn parse_app(app_src: &str, screens: &[&str]) -> Result<TsxDocument, Vec<Str
 
     let mut children = Vec::with_capacity(screens.len());
     for (i, src) in screens.iter().enumerate() {
-        let doc = parse_tsx(src)?;
+        let mut doc = parse_tsx(src)?;
+        imports.append(&mut doc.imports);
         let el = doc
             .root_nodes
             .into_iter()
@@ -153,7 +275,7 @@ pub fn parse_app(app_src: &str, screens: &[&str]) -> Result<TsxDocument, Vec<Str
     }
 
     let combined = Element { tag: app_el.tag, attrs: app_el.attrs, children };
-    Ok(TsxDocument { root_nodes: vec![Node::Element(combined)] })
+    Ok(TsxDocument { root_nodes: vec![Node::Element(combined)], imports })
 }
 
 /// Extract every top-level TypeScript `interface` into an owned
@@ -479,6 +601,75 @@ mod tests {
         let ifaces = extract_interfaces("export interface P { ok: boolean; }").expect("parse");
         assert_eq!(ifaces.len(), 1);
         assert_eq!(ifaces[0].fields[0].ty, TypeShape::Bool);
+    }
+
+    #[test]
+    fn full_module_screen_parses_to_its_root_jsx_and_captures_imports() {
+        // The worked example's shape: an import for a provider + a default-
+        // exported arrow component that returns the screen's <Screen> JSX and
+        // passes the imported provider as a `value=` prop on its <List>.
+        let src = r#"
+            import { libraryFeed } from "Library Feed";
+
+            const Library = () => (
+                <Screen name="Library" icon="library_books">
+                    <List value={libraryFeed} window={20}>
+                        <Item><Content>{"{{title}}"}</Content></Item>
+                    </List>
+                </Screen>
+            );
+
+            export default Library;
+        "#;
+        let doc = parse_tsx(src).expect("full module parses");
+        // Exactly one root node — the <Screen> the default export returns.
+        assert_eq!(doc.root_nodes.len(), 1);
+        let Node::Element(screen) = &doc.root_nodes[0] else { panic!("root is the Screen element") };
+        assert_eq!(screen.tag, "Screen");
+        assert_eq!(screen.attr("name"), Some(&AttrValue::Str("Library".into())));
+        // The <List> passes the imported provider as its bound value.
+        let Node::Element(list) = &screen.children[0] else { panic!("first child is the List") };
+        assert_eq!(list.tag, "List");
+        assert_eq!(list.attr("value"), Some(&AttrValue::Binding("libraryFeed".into())));
+
+        // The import is captured as a typed reference (module + local/imported).
+        assert_eq!(doc.imports.len(), 1);
+        assert_eq!(doc.imports[0].source, "Library Feed");
+        assert_eq!(doc.imports[0].names.len(), 1);
+        assert_eq!(doc.imports[0].names[0].local, "libraryFeed");
+        assert_eq!(doc.imports[0].names[0].imported, "libraryFeed");
+        assert_eq!(doc.imports[0].names[0].kind, crate::dag::ImportKind::Named);
+    }
+
+    #[test]
+    fn export_default_arrow_and_aliased_default_imports_parse() {
+        // Inline `export default () => (<JSX/>)` (no named const) + an aliased
+        // named import and a default import.
+        let src = r#"
+            import Feed, { rows as feedRows } from "Feed Source";
+            export default () => (<Screen name="Feed"><List value={feedRows}/></Screen>);
+        "#;
+        let doc = parse_tsx(src).expect("inline default-export arrow parses");
+        assert_eq!(doc.root_nodes.len(), 1);
+        let Node::Element(screen) = &doc.root_nodes[0] else { panic!() };
+        assert_eq!(screen.attr("name"), Some(&AttrValue::Str("Feed".into())));
+        // Default + aliased-named imports both captured.
+        assert_eq!(doc.imports[0].names[0].kind, crate::dag::ImportKind::Default);
+        assert_eq!(doc.imports[0].names[0].local, "Feed");
+        assert_eq!(doc.imports[0].names[1].local, "feedRows");
+        assert_eq!(doc.imports[0].names[1].imported, "rows");
+    }
+
+    #[test]
+    fn bare_jsx_screen_still_parses_with_no_imports() {
+        // Regression: the original bare-<Screen> shape is unchanged and carries
+        // no imports (so every existing screen/widget keeps parsing).
+        let doc = parse_tsx(r#"<Screen name="Home"><Item><Content>{"Hi"}</Content></Item></Screen>"#)
+            .expect("bare screen parses");
+        assert_eq!(doc.root_nodes.len(), 1);
+        assert!(doc.imports.is_empty());
+        let Node::Element(s) = &doc.root_nodes[0] else { panic!() };
+        assert_eq!(s.tag, "Screen");
     }
 
     #[test]
