@@ -119,7 +119,13 @@ pub fn parse_tsx(source: &str) -> Result<TsxDocument, Vec<String>> {
         return Err(ret
             .diagnostics
             .into_iter()
-            .map(|e| format!("{e:?}"))
+            // `{e}`, not `{e:?}`. These strings are USER-FACING -- the IDE's
+            // live-parse status strip renders them verbatim -- and the Debug
+            // form spells the whole struct, so a typo appeared in the editor as
+            // `Parse error: OxcDiagnostic { inner: OxcDiagnosticInner {
+            // message: "Unexpected token", l...`, truncated mid-field. Display
+            // is the rendered diagnostic oxc means a human to read.
+            .map(|e| e.to_string())
             .collect());
     }
 
@@ -312,7 +318,13 @@ pub fn extract_interfaces(source: &str) -> Result<Vec<InterfaceDecl>, Vec<String
         return Err(ret
             .diagnostics
             .into_iter()
-            .map(|e| format!("{e:?}"))
+            // `{e}`, not `{e:?}`. These strings are USER-FACING -- the IDE's
+            // live-parse status strip renders them verbatim -- and the Debug
+            // form spells the whole struct, so a typo appeared in the editor as
+            // `Parse error: OxcDiagnostic { inner: OxcDiagnosticInner {
+            // message: "Unexpected token", l...`, truncated mid-field. Display
+            // is the rendered diagnostic oxc means a human to read.
+            .map(|e| e.to_string())
             .collect());
     }
 
