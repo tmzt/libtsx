@@ -27,6 +27,22 @@ use oxc_span::SourceType;
 pub struct Element {
     /// The tag name (e.g. `List`, `Content`, `A.B` for member tags).
     pub tag: String,
+    /// The element's **type arguments** — the `Message` in `<List<Message>>`
+    /// (TypeScript's generic JSX form, TS 2.9+), in source order. Empty for the
+    /// ordinary non-generic spelling, which is every element that does not
+    /// write one.
+    ///
+    /// Lowered through the same [`TypeShape`] mapping an `interface` field's
+    /// type takes, so `<List<Message>>` is `[TypeShape::Named("Message")]` and
+    /// `<List<string>>` is `[TypeShape::String]` — one type vocabulary, not a
+    /// second one for the type-argument position.
+    ///
+    /// **Why this is parsed rather than ignored.** A generic element's type
+    /// argument is the author saying what flows through it; dropping it here
+    /// means it exists in the source and nowhere else, which is the whole
+    /// failure mode `Element` is supposed to prevent. Consumers that do not
+    /// model generics simply see an empty `Vec`.
+    pub type_args: Vec<TypeShape>,
     /// Attributes in source order. Ordered (not a map) for deterministic
     /// downstream serialization.
     pub attrs: Vec<(String, AttrValue)>,
@@ -274,7 +290,12 @@ pub fn parse_app(app_src: &str, screens: &[&str]) -> Result<TsxDocument, Vec<Str
         children.push(Node::Element(el));
     }
 
-    let combined = Element { tag: app_el.tag, attrs: app_el.attrs, children };
+    let combined = Element {
+        tag: app_el.tag,
+        type_args: app_el.type_args,
+        attrs: app_el.attrs,
+        children,
+    };
     Ok(TsxDocument { root_nodes: vec![Node::Element(combined)], imports })
 }
 
@@ -405,6 +426,15 @@ fn reference_shape(r: &oxc_ast::ast::TSTypeReference) -> TypeShape {
 fn convert_element(jsx: &JSXElement) -> Element {
     let tag = element_name(&jsx.opening_element.name);
 
+    // `<List<Message> …>` — the opening tag's type arguments, through the same
+    // `TypeShape` lowering an interface field's annotation takes.
+    let type_args: Vec<TypeShape> = jsx
+        .opening_element
+        .type_arguments
+        .as_ref()
+        .map(|args| args.params.iter().map(type_shape).collect())
+        .unwrap_or_default();
+
     let mut attrs = Vec::new();
     for attr in &jsx.opening_element.attributes {
         if let JSXAttributeItem::Attribute(a) = attr {
@@ -435,6 +465,7 @@ fn convert_element(jsx: &JSXElement) -> Element {
 
     Element {
         tag,
+        type_args,
         attrs,
         children,
     }
@@ -547,6 +578,41 @@ mod tests {
         };
         assert_eq!(item.tag, "Item");
         assert_eq!(item.children[0], Node::Text("Hi".into()));
+    }
+
+    /// A **generic JSX element** keeps its type argument. `<List<Message>>` is
+    /// the author declaring what the list's rows are; before this the type
+    /// parameter was present in the source and dropped on the floor.
+    #[test]
+    fn a_generic_element_carries_its_type_arguments() {
+        let doc = parse_tsx(r#"<List<Message> value={chatFeed} window={24}><Item /></List>"#)
+            .expect("a generic JSX element parses");
+        let Node::Element(list) = &doc.root_nodes[0] else { panic!("expected an element") };
+        assert_eq!(list.tag, "List", "the type argument is not part of the tag");
+        assert_eq!(list.type_args, vec![TypeShape::Named("Message".into())]);
+        // Attributes and children are untouched by the generic spelling.
+        assert_eq!(list.attr("value"), Some(&AttrValue::Binding("chatFeed".into())));
+        assert_eq!(list.children.len(), 1);
+
+        // Self-closing, several arguments, and the built-in type vocabulary all
+        // lower through the same mapping an interface field's type does.
+        let doc = parse_tsx(r#"<Grid<Message, string> />"#).expect("parses");
+        let Node::Element(grid) = &doc.root_nodes[0] else { panic!() };
+        assert_eq!(
+            grid.type_args,
+            vec![TypeShape::Named("Message".into()), TypeShape::String],
+        );
+    }
+
+    /// The ordinary spelling stays empty — nothing is invented for an element
+    /// that wrote no type argument.
+    #[test]
+    fn a_plain_element_has_no_type_arguments() {
+        let doc = parse_tsx(r#"<List value={chatFeed}><Item /></List>"#).expect("parses");
+        let Node::Element(list) = &doc.root_nodes[0] else { panic!() };
+        assert!(list.type_args.is_empty());
+        let Node::Element(item) = &list.children[0] else { panic!() };
+        assert!(item.type_args.is_empty());
     }
 
     #[test]
