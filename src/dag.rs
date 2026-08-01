@@ -19,6 +19,11 @@
 //!   restricted semantic AST that projects symmetrically across language
 //!   views and synthesizes directly to wasm. Complex Modules are *not*
 //!   represented here; they are opaque native-language units by design.
+//! * **Effect bindings** ([`NamedEffect`], [`AttrValue::NamedEffect`],
+//!   [`HostEffects`]) - `onTap={navigate("Chat")}`: an [`is_event_binding`]
+//!   attribute whose value is ONE call resolving to a granted host import.
+//!   Deliberately *not* a handler and not a body - see [`NamedEffect`] and
+//!   [`HOST_PREFIX`] (LIBHBUI_PLAN Rules 46, 46a, 48).
 //!
 //! Every type here is serde-serializable and free of parser dependencies:
 //! `dag` is available with `default-features = false`, so a consumer that only
@@ -161,7 +166,291 @@ pub enum AttrValue {
     Binding(String),
     /// An expression we don't lower (element/fragment/complex expr).
     Opaque,
+    /// `onTap={navigate("Chat")}` - an **effect binding** (LIBHBUI_PLAN
+    /// Rules 46, 46a, 48).
+    ///
+    /// The attribute name matched [`is_event_binding`], so the author declared
+    /// an event binding; the value was one call expression resolving to a
+    /// declared host import. See [`NamedEffect`].
+    ///
+    /// **Appended last on purpose.** postcard encodes enum variants
+    /// positionally, so a variant inserted anywhere else would renumber every
+    /// value above it in already-written bytes.
+    NamedEffect(NamedEffect),
 }
+
+/// The prefix that marks a module specifier as a **host namespace**: an import
+/// with no source (LIBHBUI_PLAN Rule 48).
+///
+/// [`ImportDecl::source`] otherwise offers two cases, and both imply something
+/// resolvable to source - "a Script's display name in the Highbay module
+/// system, or a real package path". A host namespace is a third: there is no
+/// file, no compiled Script and nothing to resolve to. A Script import is
+/// *compiled*; a host import is *granted*, and this prefix is how the parse
+/// tells them apart before it tries to do either.
+pub const HOST_PREFIX: &str = "host:";
+
+/// Whether a module specifier names a host namespace at all - spelled with
+/// [`HOST_PREFIX`], whether or not anything grants it.
+pub fn is_host_namespace(source: &str) -> bool {
+    source.starts_with(HOST_PREFIX)
+}
+
+/// Whether an attribute name announces an **event binding**: `on` followed by
+/// an upper-case letter (LIBHBUI_PLAN Rule 46a).
+///
+/// Mechanical, and that is the whole point: there is no reserved-name list to
+/// maintain and no per-tag allowlist to keep in step with the control set. An
+/// attribute matching this *says* it is an event binding, so a value that
+/// cannot be one is a mistake the author declared rather than a shape something
+/// has to know about in advance.
+///
+/// `onTap` and `onLongPress` match; `on`, `once`, `only` and `column` do not.
+pub fn is_event_binding(attr: &str) -> bool {
+    attr.strip_prefix("on")
+        .and_then(|rest| rest.chars().next())
+        .is_some_and(|c| c.is_ascii_uppercase())
+}
+
+/// An **effect**: a declared host import called with arguments
+/// (LIBHBUI_PLAN Rules 46a, 48).
+///
+/// **"Named" is load-bearing.** An effect is never anonymous: [`name`] is a
+/// host import's own exported name, resolved through the module's import chain
+/// and checked against the [`FuncSig`] that namespace declares. A carrier
+/// holding an arbitrary [`Expr`] would admit an anonymous effect and lose that
+/// check; a named one cannot be written without something to resolve to.
+///
+/// [`name`]: NamedEffect::name
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NamedEffect {
+    /// The host import's **exported** name - the `imported` half of the import
+    /// chain, so `import { navigate as go }` and a call to `go(..)` both arrive
+    /// here as `navigate`. An alias is resolved once, at parse, rather than at
+    /// every reader.
+    pub name: String,
+    /// The call's arguments, in source order, lowered against the declared
+    /// parameter types. Literals only - an effect is not an expression
+    /// language (Rule 46a).
+    pub args: Vec<Expr>,
+}
+
+/// The host imports a load **grants**: namespace -> the signatures it declares
+/// (LIBHBUI_PLAN Rule 48).
+///
+/// Not graph data and deliberately not serialized. A grant is what the *host*
+/// offers a source, so it arrives from the embedding rather than out of the
+/// document - which is the difference between a Script import (compiled) and a
+/// host import (granted). `libhbui` declares the one it implements.
+///
+/// **What this does not know.** Whether a non-host specifier names a real
+/// project Script is the consumer's question, not the parser's, so a
+/// non-`host:` import is left alone here exactly as it always has been. What
+/// *is* checkable at parse - and now is - is that a `host:` specifier names a
+/// granted namespace, that its bindings are named imports of signatures the
+/// namespace declares, and that a call through one matches its signature.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct HostEffects {
+    granted: Vec<(String, Vec<FuncSig>)>,
+}
+
+impl HostEffects {
+    /// Nothing granted: every `host:` import is refused, and every effect call
+    /// is unresolved.
+    ///
+    /// The honest default rather than a lenient one. A source that calls an
+    /// effect nothing granted it has named a capability it was not given, and
+    /// that is a refusal at the point it is written.
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    /// One granted namespace and the imports it declares.
+    ///
+    /// # Panics
+    ///
+    /// If `namespace` is not spelled as a host namespace ([`HOST_PREFIX`]) - a
+    /// grant that no import could ever name is a mistake in the embedding, and
+    /// a silent one would look exactly like an effect that does not resolve.
+    pub fn granting(namespace: impl Into<String>, imports: Vec<FuncSig>) -> Self {
+        let mut host = Self::none();
+        host.grant(namespace, imports);
+        host
+    }
+
+    /// Grant another namespace. See [`HostEffects::granting`] for the panic.
+    pub fn grant(&mut self, namespace: impl Into<String>, imports: Vec<FuncSig>) {
+        let namespace = namespace.into();
+        assert!(
+            is_host_namespace(&namespace),
+            "`{namespace}` is granted as a host namespace and is not spelled as one (`{HOST_PREFIX}...`)"
+        );
+        self.granted.push((namespace, imports));
+    }
+
+    /// The signatures a granted namespace declares, or `None` if nothing
+    /// grants it.
+    pub fn namespace(&self, source: &str) -> Option<&[FuncSig]> {
+        self.granted
+            .iter()
+            .find(|(name, _)| name == source)
+            .map(|(_, sigs)| sigs.as_slice())
+    }
+
+    /// The signature a granted namespace declares under this exported name.
+    pub fn declares(&self, namespace: &str, name: &str) -> Option<&FuncSig> {
+        self.namespace(namespace)?.iter().find(|s| s.name == name)
+    }
+}
+
+/// Why an effect binding cannot mean what it says (LIBHBUI_PLAN Rules 46a, 48).
+///
+/// Every variant is a **declaration** that is wrong, and every one of them is a
+/// refusal rather than an `AttrValue::Opaque` that silently does nothing. That
+/// is the whole reason detection and carriage are one step: an attribute
+/// matching [`is_event_binding`] announces itself, so there is no case in which
+/// "we could not lower this" and "the author wrote no effect" arrive as the
+/// same value (Rule 10).
+#[derive(Debug, Clone, PartialEq)]
+pub enum EffectError {
+    /// An `on..` attribute whose value is not a call: a bare identifier, a
+    /// string, an arrow function, a block.
+    NotACall {
+        /// The attribute that announced an effect.
+        attr: String,
+    },
+    /// The callee resolves, through the local->imported chain, to no declared
+    /// host import.
+    Unresolved {
+        /// The attribute that announced an effect.
+        attr: String,
+        /// The callee as written.
+        callee: String,
+    },
+    /// The call supplies a different number of arguments than the signature
+    /// declares.
+    ArgCount {
+        /// The attribute that announced an effect.
+        attr: String,
+        /// The host import's exported name.
+        effect: String,
+        /// How many parameters the signature declares.
+        declared: usize,
+        /// How many arguments the call supplies.
+        given: usize,
+    },
+    /// An argument is a literal of a kind the declared parameter type cannot
+    /// hold - a string where an `S32` is declared, or the reverse.
+    ArgType {
+        /// The attribute that announced an effect.
+        attr: String,
+        /// The host import's exported name.
+        effect: String,
+        /// Which argument, counting from zero.
+        index: usize,
+        /// The parameter type the signature declares.
+        declared: TypeShape,
+    },
+    /// An argument is not a literal at all. An effect call is not an
+    /// expression language: anything wanting a computation is a Module,
+    /// referenced opaquely (Rule 46a).
+    ArgNotALiteral {
+        /// The attribute that announced an effect.
+        attr: String,
+        /// The host import's exported name.
+        effect: String,
+        /// Which argument, counting from zero.
+        index: usize,
+    },
+    /// A host namespace bound by `import * as fx` or `import fx from`.
+    ///
+    /// `fx.navigate(..)` is a member expression and [`Expr::Call`]'s callee is a
+    /// flat `String`; encoding `"fx.navigate"` into it would be structure
+    /// smuggled into a name. Named imports only, until a callee carries a path
+    /// properly.
+    NotANamedImport {
+        /// The host namespace.
+        source: String,
+        /// The local name it was bound to.
+        local: String,
+        /// The import form that bound it.
+        kind: ImportKind,
+    },
+    /// An import from a `host:` namespace nothing granted - neither a project
+    /// Script nor a declared host namespace, so there is nothing for it to be.
+    UnknownHostNamespace {
+        /// The specifier as written.
+        source: String,
+    },
+    /// A host namespace is granted and does not declare this name.
+    UndeclaredHostImport {
+        /// The host namespace.
+        source: String,
+        /// The exported name the import asked for.
+        imported: String,
+    },
+}
+
+impl std::fmt::Display for EffectError {
+    /// ASCII only - these strings reach logs, panic dumps and the editor's
+    /// live-parse status strip.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotACall { attr } => write!(
+                f,
+                "`{attr}` is an event binding, so its value must be one call returning an effect"
+            ),
+            Self::Unresolved { attr, callee } => write!(
+                f,
+                "`{attr}` calls `{callee}`, which is not an imported host effect"
+            ),
+            Self::ArgCount {
+                attr,
+                effect,
+                declared,
+                given,
+            } => write!(
+                f,
+                "`{attr}` calls `{effect}` with {given} arguments and it declares {declared}"
+            ),
+            Self::ArgType {
+                attr,
+                effect,
+                index,
+                declared,
+            } => write!(
+                f,
+                "`{attr}`: argument {index} of `{effect}` is declared {declared:?} and is not one"
+            ),
+            Self::ArgNotALiteral {
+                attr,
+                effect,
+                index,
+            } => write!(
+                f,
+                "`{attr}`: argument {index} of `{effect}` is not a literal, and an effect call is not an expression language"
+            ),
+            Self::NotANamedImport {
+                source,
+                local,
+                kind,
+            } => write!(
+                f,
+                "`{source}` is a host namespace and `{local}` binds it as {kind:?}; effects are named imports only"
+            ),
+            Self::UnknownHostNamespace { source } => write!(
+                f,
+                "`{source}` names no granted host namespace, and there is no source to compile"
+            ),
+            Self::UndeclaredHostImport { source, imported } => write!(
+                f,
+                "the host namespace `{source}` declares no `{imported}`"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for EffectError {}
 
 /// A node in a parsed JSX tree.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -517,9 +806,20 @@ mod tests {
                     },
                 ],
             }],
+            // `navigate` takes the destination's STORED SYMBOL (LIBHBUI_PLAN
+            // Rule 9), so its parameter is a string. It read `S32` here until
+            // the effect producer landed, which disagreed with every real
+            // destination in the system - `navigate(0)` names nothing - and
+            // nothing could see it, because no call was ever checked against a
+            // signature. Now one is, so the sample and the calls below agree by
+            // machine rather than by reading.
             imports: vec![FuncSig {
                 name: "navigate".into(),
-                params: vec![FieldDecl { name: "target".into(), ty: TypeShape::S32, optional: false }],
+                params: vec![FieldDecl {
+                    name: "to".into(),
+                    ty: TypeShape::String,
+                    optional: false,
+                }],
                 result: None,
             }],
             handlers: vec![HandlerDecl {
@@ -532,11 +832,17 @@ mod tests {
                     }],
                     result: Some(TypeShape::S32),
                 },
-                body: vec![Stmt::Return(Some(Expr::Bin {
-                    op: BinOp::Add,
-                    lhs: Box::new(Expr::Param(0)),
-                    rhs: Box::new(Expr::LitS32(1)),
-                }))],
+                body: vec![
+                    Stmt::Expr(Expr::Call {
+                        callee: "navigate".into(),
+                        args: vec![Expr::LitStr("Chat".into())],
+                    }),
+                    Stmt::Return(Some(Expr::Bin {
+                        op: BinOp::Add,
+                        lhs: Box::new(Expr::Param(0)),
+                        rhs: Box::new(Expr::LitS32(1)),
+                    })),
+                ],
             }],
         }
     }
@@ -578,6 +884,13 @@ mod tests {
                 ("title".into(), AttrValue::Str("Chat".into())),
                 ("loading".into(), AttrValue::Bool(true)),
                 ("style".into(), AttrValue::Opaque),
+                (
+                    "onTap".into(),
+                    AttrValue::NamedEffect(NamedEffect {
+                        name: "navigate".into(),
+                        args: vec![Expr::LitStr("Chat".into())],
+                    }),
+                ),
             ],
             children: vec![
                 Node::Element(Element {
@@ -751,6 +1064,70 @@ mod tests {
         let json = serde_json::to_string(&def).expect("serialize");
         let back: Definition = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(def, back);
+    }
+
+    // --- effect bindings (LIBHBUI_PLAN Rules 46a, 48) -----------------------
+
+    /// **The recognition rule, and nothing beside it** (Rule 46a). `on`
+    /// followed by an upper-case letter, mechanically - so the near misses
+    /// matter more than the hits: `on`, `once` and `only` all begin with `on`
+    /// and none of them announces an event, and a list-based rule would have
+    /// had to remember each one.
+    #[test]
+    fn an_event_binding_announces_itself_by_its_name() {
+        for yes in ["onTap", "onLongPress", "onX", "onSubmit"] {
+            assert!(is_event_binding(yes), "`{yes}` is an event binding");
+        }
+        for no in [
+            "on",       // nothing follows
+            "once",     // lower case follows
+            "only",     //
+            "on1",      // a digit is not an upper-case letter
+            "on_Tap",   //
+            "column",   // contains "on", does not start with it
+            "direction",//
+            "ontap",    // the case IS the rule
+            "",         //
+            "Ontap",    //
+        ] {
+            assert!(!is_event_binding(no), "`{no}` is not an event binding");
+        }
+    }
+
+    /// A grant is what the host offers; a namespace nothing grants declares
+    /// nothing, and a granted one declares only what it was given.
+    #[test]
+    fn a_host_grant_answers_only_for_what_it_granted() {
+        let navigate = FuncSig {
+            name: "navigate".into(),
+            params: vec![FieldDecl {
+                name: "to".into(),
+                ty: TypeShape::String,
+                optional: false,
+            }],
+            result: None,
+        };
+        let host = HostEffects::granting("host:effects", vec![navigate.clone()]);
+        assert_eq!(host.declares("host:effects", "navigate"), Some(&navigate));
+        assert_eq!(host.declares("host:effects", "teleport"), None);
+        assert_eq!(host.declares("host:other", "navigate"), None);
+        assert_eq!(host.namespace("host:other"), None);
+        assert_eq!(HostEffects::none().declares("host:effects", "navigate"), None);
+
+        // The specifier form is what tells a host namespace from a Script's
+        // display name or a package path (Rule 48).
+        assert!(is_host_namespace("host:effects"));
+        assert!(!is_host_namespace("Library Feed"));
+        assert!(!is_host_namespace("./widgets/UserCard"));
+        assert!(!is_host_namespace("@highbay/effects"));
+    }
+
+    /// A grant no import could ever name is a mistake in the embedding, and a
+    /// silent one is indistinguishable from an effect that does not resolve.
+    #[test]
+    #[should_panic(expected = "is granted as a host namespace")]
+    fn granting_a_namespace_that_is_not_one_is_a_mistake() {
+        HostEffects::granting("Library Feed", vec![]);
     }
 
     #[test]

@@ -17,10 +17,16 @@
 //!   not a `HashMap`) so downstream node-graph serialization is stable.
 //! * Expression children (`{binding}`) and string-literal children are
 //!   captured (the old proof-of-concept dropped them).
+//! * **Effect bindings are produced here, not inferred later.** An
+//!   [`is_event_binding`] attribute's value is parsed as one call resolving to
+//!   a granted host import and emitted as [`AttrValue::NamedEffect`]
+//!   ([`parse_tsx_with`]); there is no pass that later decides an
+//!   [`AttrValue::Opaque`] was really an effect (LIBHBUI_PLAN Rules 46a, 48).
 
 use crate::dag::{
-    AttrValue, Element, FieldDecl, ImportDecl, ImportKind, ImportName, InterfaceDecl, Node,
-    TsxDocument, TypeShape,
+    AttrValue, EffectError, Element, FieldDecl, FuncSig, HostEffects, ImportDecl, ImportKind,
+    ImportName, InterfaceDecl, NamedEffect, Node, TsxDocument, TypeShape, is_event_binding,
+    is_host_namespace,
 };
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
@@ -30,6 +36,51 @@ use oxc_ast::ast::{
 };
 use oxc_parser::Parser;
 use oxc_span::SourceType;
+
+/// Everything a parse can refuse.
+///
+/// Two kinds, kept apart because they are different facts: oxc could not read
+/// the source, or it read it and the source declared something that cannot mean
+/// what it says. [`parse_tsx`] flattens both into the `Vec<String>` its callers
+/// have always taken; [`parse_tsx_with`] hands the second back **typed**, which
+/// is what lets a refusal be asserted on rather than string-matched.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ParseError {
+    /// oxc's diagnostics, rendered for a human (see [`parse_tsx`]).
+    Syntax(Vec<String>),
+    /// An effect binding or a host import that cannot mean what it says
+    /// (LIBHBUI_PLAN Rules 46a, 48).
+    Effect(EffectError),
+}
+
+impl ParseError {
+    /// The messages [`parse_tsx`] reports - one per diagnostic, or one for the
+    /// refusal.
+    pub fn messages(self) -> Vec<String> {
+        match self {
+            Self::Syntax(messages) => messages,
+            Self::Effect(e) => vec![e.to_string()],
+        }
+    }
+}
+
+impl From<EffectError> for ParseError {
+    fn from(e: EffectError) -> Self {
+        Self::Effect(e)
+    }
+}
+
+impl std::fmt::Display for ParseError {
+    /// ASCII only - these strings reach the editor's live-parse status strip.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Syntax(messages) => write!(f, "{}", messages.join("; ")),
+            Self::Effect(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for ParseError {}
 
 /// Parse TSX source into an owned [`TsxDocument`].
 ///
@@ -48,36 +99,67 @@ use oxc_span::SourceType;
 /// accepted — it is invalid TS and oxc rejects it (use the `const … ;
 /// export default …` split, which is what Highbay writes).
 pub fn parse_tsx(source: &str) -> Result<TsxDocument, Vec<String>> {
+    parse_tsx_with(source, &HostEffects::none()).map_err(ParseError::messages)
+}
+
+/// [`parse_tsx`] against a **host grant**: the effects this load offers the
+/// source (LIBHBUI_PLAN Rule 48).
+///
+/// An `on..` attribute ([`is_event_binding`]) is parsed as one call resolving
+/// through the module's import chain to a signature `host` declares, and
+/// becomes [`AttrValue::NamedEffect`]. Nothing about that is deferred: an
+/// attribute that announced an effect and cannot carry one is refused **here**,
+/// with a typed [`EffectError`], rather than surviving as an
+/// [`AttrValue::Opaque`] that silently does nothing (Rule 46a).
+///
+/// [`parse_tsx`] is this with nothing granted, which is the honest default: a
+/// source calling an effect it was never given has named a capability it does
+/// not have.
+pub fn parse_tsx_with(source: &str, host: &HostEffects) -> Result<TsxDocument, ParseError> {
     let allocator = Allocator::default();
     let ret = Parser::new(&allocator, source, SourceType::tsx()).parse();
 
     if !ret.diagnostics.is_empty() {
-        return Err(ret
-            .diagnostics
-            .into_iter()
-            // `{e}`, not `{e:?}`. These strings are USER-FACING -- the IDE's
-            // live-parse status strip renders them verbatim -- and the Debug
-            // form spells the whole struct, so a typo appeared in the editor as
-            // `Parse error: OxcDiagnostic { inner: OxcDiagnosticInner {
-            // message: "Unexpected token", l...`, truncated mid-field. Display
-            // is the rendered diagnostic oxc means a human to read.
-            .map(|e| e.to_string())
-            .collect());
+        return Err(ParseError::Syntax(
+            ret.diagnostics
+                .into_iter()
+                // `{e}`, not `{e:?}`. These strings are USER-FACING -- the IDE's
+                // live-parse status strip renders them verbatim -- and the Debug
+                // form spells the whole struct, so a typo appeared in the editor as
+                // `Parse error: OxcDiagnostic { inner: OxcDiagnosticInner {
+                // message: "Unexpected token", l...`, truncated mid-field. Display
+                // is the rendered diagnostic oxc means a human to read.
+                .map(|e| e.to_string())
+                .collect(),
+        ));
     }
 
-    let mut root_nodes = Vec::new();
+    // Pass 0: the import edges, and the effect scope they open. This runs
+    // BEFORE any element is converted, because an effect name resolves against
+    // the whole module's imports rather than the ones written above the element
+    // that calls it - and because a scope built as the elements go by would
+    // depend on statement order for its answers.
     let mut imports = Vec::new();
-    // Pass 1: bare JSX statements, imports, and a table of
+    for stmt in &ret.program.body {
+        if let Statement::ImportDeclaration(decl) = stmt {
+            imports.push(convert_import(decl));
+        }
+    }
+    let scope = EffectScope::build(&imports, host)?;
+
+    let mut root_nodes = Vec::new();
+    // Pass 1: bare JSX statements and a table of
     // `const Name = () => (<JSX/>)` arrow components (for export-default-by-name).
     let mut arrow_components: Vec<(&str, &JSXElement)> = Vec::new();
     for stmt in &ret.program.body {
         match stmt {
-            Statement::ImportDeclaration(decl) => imports.push(convert_import(decl)),
             Statement::ExpressionStatement(expr_stmt) => match &expr_stmt.expression {
-                Expression::JSXElement(jsx) => root_nodes.push(Node::Element(convert_element(jsx))),
+                Expression::JSXElement(jsx) => {
+                    root_nodes.push(Node::Element(convert_element(jsx, &scope)?))
+                }
                 Expression::JSXFragment(frag) => {
                     for child in &frag.children {
-                        push_child(&mut root_nodes, child);
+                        push_child(&mut root_nodes, child, &scope)?;
                     }
                 }
                 _ => {}
@@ -110,7 +192,7 @@ pub fn parse_tsx(source: &str) -> Result<TsxDocument, Vec<String>> {
                 _ => None,
             };
             if let Some(jsx) = jsx {
-                root_nodes.push(Node::Element(convert_element(jsx)));
+                root_nodes.push(Node::Element(convert_element(jsx, &scope)?));
             }
         }
     }
@@ -120,11 +202,219 @@ pub fn parse_tsx(source: &str) -> Result<TsxDocument, Vec<String>> {
     // doesn't blank the preview).
     if root_nodes.is_empty() {
         if let Some((_, jsx)) = arrow_components.first() {
-            root_nodes.push(Node::Element(convert_element(jsx)));
+            root_nodes.push(Node::Element(convert_element(jsx, &scope)?));
         }
     }
 
     Ok(TsxDocument { root_nodes, imports })
+}
+
+// --- the effect scope (LIBHBUI_PLAN Rules 46a, 48) ----------------------------
+
+/// The effects a module may call: its **host** imports, checked against what
+/// the load granted.
+///
+/// Built once per parse, from the module's own import edges. A local name is
+/// carried alongside the namespace it came from and the name that namespace
+/// exports, so `import { navigate as go }` resolves `go` to `navigate`'s
+/// signature and the alias is gone by the time anything downstream reads it.
+struct EffectScope<'a> {
+    host: &'a HostEffects,
+    /// `(local, namespace, imported)`, in source order.
+    locals: Vec<(String, String, String)>,
+}
+
+impl<'a> EffectScope<'a> {
+    /// The scope a module's imports open, refusing the ways a host import can
+    /// fail to be one (Rule 48).
+    ///
+    /// Non-`host:` imports are left entirely alone: whether a specifier names a
+    /// real project Script is the consumer's question, not the parser's.
+    fn build(imports: &[ImportDecl], host: &'a HostEffects) -> Result<Self, EffectError> {
+        let mut locals = Vec::new();
+        for decl in imports {
+            if !is_host_namespace(&decl.source) {
+                continue;
+            }
+            // A `host:` specifier that nothing granted is neither a Script to
+            // compile nor a capability to grant, so it is refused at load
+            // rather than producing bindings that can never fire.
+            if host.namespace(&decl.source).is_none() {
+                return Err(EffectError::UnknownHostNamespace {
+                    source: decl.source.clone(),
+                });
+            }
+            for name in &decl.names {
+                // `import * as fx` / `import fx from`: `fx.navigate(...)` is a
+                // member expression and a callee is a flat name, so the only
+                // way such a binding could reach one is as the string
+                // "fx.navigate" - structure smuggled into a name.
+                if name.kind != ImportKind::Named {
+                    return Err(EffectError::NotANamedImport {
+                        source: decl.source.clone(),
+                        local: name.local.clone(),
+                        kind: name.kind,
+                    });
+                }
+                if host.declares(&decl.source, &name.imported).is_none() {
+                    return Err(EffectError::UndeclaredHostImport {
+                        source: decl.source.clone(),
+                        imported: name.imported.clone(),
+                    });
+                }
+                locals.push((
+                    name.local.clone(),
+                    decl.source.clone(),
+                    name.imported.clone(),
+                ));
+            }
+        }
+        Ok(Self { host, locals })
+    }
+
+    /// The signature a local name resolves to, through the local->imported
+    /// chain.
+    fn resolve(&self, local: &str) -> Option<&FuncSig> {
+        let (_, namespace, imported) = self.locals.iter().find(|(name, _, _)| name == local)?;
+        self.host.declares(namespace, imported)
+    }
+}
+
+/// Lower an `on..` attribute's value into [`AttrValue::NamedEffect`], or refuse
+/// it (Rules 46a, 48).
+///
+/// The attribute already announced itself as an event binding, so every exit
+/// from here is either an effect or an error - there is deliberately no path
+/// that yields [`AttrValue::Opaque`].
+fn effect_attr(
+    attr: &str,
+    value: Option<&JSXAttributeValue>,
+    scope: &EffectScope,
+) -> Result<AttrValue, EffectError> {
+    let not_a_call = || EffectError::NotACall {
+        attr: attr.to_string(),
+    };
+    // `onTap="Chat"`, `onTap`, `onTap={goChat}`, `onTap={() => ..}` and
+    // `onTap={<X/>}` all land here: the value is one CALL or it is a mistake.
+    let Some(JSXAttributeValue::ExpressionContainer(container)) = value else {
+        return Err(not_a_call());
+    };
+    let Some(expr) = container.expression.as_expression() else {
+        return Err(not_a_call());
+    };
+    let Expression::CallExpression(call) = unparen(expr) else {
+        return Err(not_a_call());
+    };
+
+    let callee = unparen(&call.callee);
+    let Expression::Identifier(local) = callee else {
+        // Anything that is not a bare name cannot resolve: a member expression
+        // (`fx.navigate`) is refused here rather than flattened into a callee
+        // string, and a computed callee has no name to resolve at all.
+        return Err(EffectError::Unresolved {
+            attr: attr.to_string(),
+            callee: expr_path(callee).unwrap_or_else(|| "a computed callee".to_string()),
+        });
+    };
+    let Some(sig) = scope.resolve(local.name.as_str()) else {
+        return Err(EffectError::Unresolved {
+            attr: attr.to_string(),
+            callee: local.name.to_string(),
+        });
+    };
+
+    if call.arguments.len() != sig.params.len() {
+        return Err(EffectError::ArgCount {
+            attr: attr.to_string(),
+            effect: sig.name.clone(),
+            declared: sig.params.len(),
+            given: call.arguments.len(),
+        });
+    }
+    let mut args = Vec::with_capacity(sig.params.len());
+    for (index, (arg, param)) in call.arguments.iter().zip(&sig.params).enumerate() {
+        let lowered = arg
+            .as_expression()
+            .ok_or(ArgFail::NotALiteral)
+            .and_then(|expr| lower_arg(unparen(expr), &param.ty))
+            .map_err(|fail| match fail {
+                ArgFail::NotALiteral => EffectError::ArgNotALiteral {
+                    attr: attr.to_string(),
+                    effect: sig.name.clone(),
+                    index,
+                },
+                ArgFail::WrongType => EffectError::ArgType {
+                    attr: attr.to_string(),
+                    effect: sig.name.clone(),
+                    index,
+                    declared: param.ty.clone(),
+                },
+            })?;
+        args.push(lowered);
+    }
+
+    Ok(AttrValue::NamedEffect(NamedEffect {
+        // The RESOLVED name: an alias is spent here and never travels.
+        name: sig.name.clone(),
+        args,
+    }))
+}
+
+/// Why an argument could not be lowered.
+enum ArgFail {
+    /// Not a literal at all - an identifier, a member expression, a call. An
+    /// effect call is not an expression language (Rule 46a); a computation
+    /// belongs in a Module.
+    NotALiteral,
+    /// A literal the declared parameter type cannot hold.
+    WrongType,
+}
+
+/// Lower one literal argument **against its declared type**, so the signature
+/// decides what a number becomes rather than the parser guessing (Rule 48).
+///
+/// Every parameter is supplied: optionality of a host import's parameter is not
+/// modelled, and an omitted argument is an [`EffectError::ArgCount`].
+fn lower_arg(expr: &Expression, declared: &TypeShape) -> Result<crate::dag::Expr, ArgFail> {
+    use crate::dag::Expr as E;
+    match expr {
+        Expression::StringLiteral(s) => match declared {
+            TypeShape::String => Ok(E::LitStr(s.value.to_string())),
+            _ => Err(ArgFail::WrongType),
+        },
+        Expression::BooleanLiteral(b) => match declared {
+            TypeShape::Bool => Ok(E::LitBool(b.value)),
+            _ => Err(ArgFail::WrongType),
+        },
+        Expression::NumericLiteral(n) => match declared {
+            TypeShape::S32 => whole(n.value, i32::MIN as f64, i32::MAX as f64)
+                .map(|v| E::LitS32(v as i32))
+                .ok_or(ArgFail::WrongType),
+            // 2^53: past it an f64 literal is no longer the integer it was
+            // written as, and a silently rounded destination or id is the
+            // defect Rule 40 refuses for the same reason.
+            TypeShape::S64 => whole(n.value, -9_007_199_254_740_992.0, 9_007_199_254_740_992.0)
+                .map(|v| E::LitS64(v as i64))
+                .ok_or(ArgFail::WrongType),
+            TypeShape::F32 => Ok(E::LitF32(n.value as f32)),
+            TypeShape::F64 => Ok(E::LitF64(n.value)),
+            _ => Err(ArgFail::WrongType),
+        },
+        _ => Err(ArgFail::NotALiteral),
+    }
+}
+
+/// `value` as a whole number inside `[lo, hi]`, or `None`.
+fn whole(value: f64, lo: f64, hi: f64) -> Option<f64> {
+    (value.fract() == 0.0 && (lo..=hi).contains(&value)).then_some(value)
+}
+
+/// Unwrap parentheses. `onTap={(navigate("Chat"))}` is the same call.
+fn unparen<'a>(expr: &'a Expression<'a>) -> &'a Expression<'a> {
+    match expr {
+        Expression::ParenthesizedExpression(p) => unparen(&p.expression),
+        other => other,
+    }
 }
 
 /// The JSX element an arrow function returns, if it is a JSX component: a concise
@@ -205,6 +495,10 @@ fn convert_import(decl: &oxc_ast::ast::ImportDeclaration) -> ImportDecl {
 /// replaced by the screen elements — the screen files are the content authority).
 /// A screen source with no root element, or an app source with no root element,
 /// is an error.
+///
+/// Nothing is granted (see [`parse_tsx_with`]): the multi-file app path has no
+/// effect surface yet, and inventing one here would be a grant no embedding
+/// asked for.
 pub fn parse_app(app_src: &str, screens: &[&str]) -> Result<TsxDocument, Vec<String>> {
     let app_doc = parse_tsx(app_src)?;
     let mut imports = app_doc.imports;
@@ -371,7 +665,7 @@ fn reference_shape(r: &oxc_ast::ast::TSTypeReference) -> TypeShape {
     TypeShape::Named(name)
 }
 
-fn convert_element(jsx: &JSXElement) -> Element {
+fn convert_element(jsx: &JSXElement, scope: &EffectScope) -> Result<Element, EffectError> {
     let tag = element_name(&jsx.opening_element.name);
 
     // `<List<Message> …>` — the opening tag's type arguments, through the same
@@ -392,15 +686,26 @@ fn convert_element(jsx: &JSXElement) -> Element {
                     format!("{}:{}", n.namespace.name, n.name.name)
                 }
             };
-            let value = match &a.value {
-                None => AttrValue::Bool(true),
-                Some(JSXAttributeValue::StringLiteral(s)) => AttrValue::Str(s.value.to_string()),
-                Some(JSXAttributeValue::ExpressionContainer(c)) => c
-                    .expression
-                    .as_expression()
-                    .map(attr_from_expr)
-                    .unwrap_or(AttrValue::Opaque),
-                _ => AttrValue::Opaque,
+            // **Detection and carriage are one step** (Rule 46a): the name
+            // announces an event binding, so the value is lowered as an effect
+            // right here. There is no later pass that reinterprets an
+            // `AttrValue::Opaque`, which is exactly why an `on..` attribute can
+            // never quietly become one.
+            let value = if is_event_binding(&key) {
+                effect_attr(&key, a.value.as_ref(), scope)?
+            } else {
+                match &a.value {
+                    None => AttrValue::Bool(true),
+                    Some(JSXAttributeValue::StringLiteral(s)) => {
+                        AttrValue::Str(s.value.to_string())
+                    }
+                    Some(JSXAttributeValue::ExpressionContainer(c)) => c
+                        .expression
+                        .as_expression()
+                        .map(attr_from_expr)
+                        .unwrap_or(AttrValue::Opaque),
+                    _ => AttrValue::Opaque,
+                }
             };
             attrs.push((key, value));
         }
@@ -408,15 +713,15 @@ fn convert_element(jsx: &JSXElement) -> Element {
 
     let mut children = Vec::new();
     for child in &jsx.children {
-        push_child(&mut children, child);
+        push_child(&mut children, child, scope)?;
     }
 
-    Element {
+    Ok(Element {
         tag,
         type_args,
         attrs,
         children,
-    }
+    })
 }
 
 fn element_name(name: &JSXElementName) -> String {
@@ -442,9 +747,13 @@ fn jsx_member_object(obj: &oxc_ast::ast::JSXMemberExpressionObject) -> String {
     }
 }
 
-fn push_child(out: &mut Vec<Node>, child: &JSXChild) {
+fn push_child(
+    out: &mut Vec<Node>,
+    child: &JSXChild,
+    scope: &EffectScope,
+) -> Result<(), EffectError> {
     match child {
-        JSXChild::Element(e) => out.push(Node::Element(convert_element(e))),
+        JSXChild::Element(e) => out.push(Node::Element(convert_element(e, scope)?)),
         JSXChild::Text(t) => {
             let txt = t.value.trim();
             if !txt.is_empty() {
@@ -473,11 +782,12 @@ fn push_child(out: &mut Vec<Node>, child: &JSXChild) {
         }
         JSXChild::Fragment(frag) => {
             for c in &frag.children {
-                push_child(out, c);
+                push_child(out, c, scope)?;
             }
         }
         JSXChild::Spread(_) => {}
     }
+    Ok(())
 }
 
 fn attr_from_expr(expr: &Expression) -> AttrValue {
@@ -765,6 +1075,509 @@ mod tests {
             "attributes keep source order",
         );
         assert_eq!(back.imports[0].source, "Chat Feed");
+    }
+
+    // --- effect bindings (LIBHBUI_PLAN Rules 46a, 48) -------------------------
+    //
+    // Every source below goes through the real parser. Several of them are
+    // hand-written malformations, which is Rule 43's exception - **the point IS
+    // the shape**: what is being ruled out is source an authoring surface could
+    // produce, so there is nothing else to parse them from.
+
+    /// What the host grants these tests: one string-taking `navigate`, and a
+    /// second effect with a numeric and a boolean parameter, so the type check
+    /// is exercised on more than one shape.
+    fn granted() -> HostEffects {
+        let mut host = HostEffects::granting(
+            "host:effects",
+            vec![FuncSig {
+                name: "navigate".into(),
+                params: vec![FieldDecl {
+                    name: "to".into(),
+                    ty: TypeShape::String,
+                    optional: false,
+                }],
+                result: None,
+            }],
+        );
+        host.grant(
+            "host:sheets",
+            vec![FuncSig {
+                name: "dismiss".into(),
+                params: vec![
+                    FieldDecl {
+                        name: "after".into(),
+                        ty: TypeShape::S32,
+                        optional: false,
+                    },
+                    FieldDecl {
+                        name: "animated".into(),
+                        ty: TypeShape::Bool,
+                        optional: false,
+                    },
+                ],
+                result: None,
+            }],
+        );
+        host
+    }
+
+    /// The one attribute of the tree, for a source with exactly one element.
+    fn only_attr(src: &str) -> AttrValue {
+        let doc = parse_tsx_with(src, &granted()).expect("parses");
+        let Node::Element(el) = &doc.root_nodes[0] else {
+            panic!("root is an element")
+        };
+        el.attrs
+            .iter()
+            .find(|(k, _)| is_event_binding(k))
+            .map(|(_, v)| v.clone())
+            .expect("the element declares an event binding")
+    }
+
+    /// What a source is refused with.
+    fn refusal(src: &str) -> EffectError {
+        match parse_tsx_with(src, &granted()) {
+            Err(ParseError::Effect(e)) => e,
+            Err(ParseError::Syntax(d)) => panic!("the source does not even parse: {d:?}"),
+            Ok(doc) => panic!("accepted, and produced {doc:?}"),
+        }
+    }
+
+    /// **The whole authoring surface** (Rule 46a): `onTap={navigate("Chat")}`.
+    ///
+    /// The value the attribute carries is the *resolved* host name and its
+    /// lowered arguments - not the local name, not the source text, and not an
+    /// `Opaque`.
+    #[test]
+    fn an_event_binding_carries_a_named_effect() {
+        assert_eq!(
+            only_attr(
+                r#"
+                import { navigate } from "host:effects";
+                <Action id="a" onTap={navigate("Chat")} />
+                "#
+            ),
+            AttrValue::NamedEffect(NamedEffect {
+                name: "navigate".into(),
+                args: vec![crate::dag::Expr::LitStr("Chat".into())],
+            })
+        );
+
+        // An ALIAS is spent at the parse: `go` never travels. This is what
+        // "named" buys - the name in the graph is the host import's, so a
+        // reader resolves nothing and two sources that alias differently
+        // produce one value.
+        assert_eq!(
+            only_attr(
+                r#"
+                import { navigate as go } from "host:effects";
+                <Action id="a" onTap={go("Chat")} />
+                "#
+            ),
+            AttrValue::NamedEffect(NamedEffect {
+                name: "navigate".into(),
+                args: vec![crate::dag::Expr::LitStr("Chat".into())],
+            })
+        );
+
+        // The recognition rule is the attribute's NAME, not the tag and not a
+        // list: a second effect, on a different attribute, from a second
+        // namespace, needs nothing added anywhere. Its arguments lower against
+        // the DECLARED types - `0` becomes `LitS32`, not a float.
+        assert_eq!(
+            only_attr(
+                r#"
+                import { dismiss } from "host:sheets";
+                <Sheet id="a" onLongPress={dismiss(250, true)} />
+                "#
+            ),
+            AttrValue::NamedEffect(NamedEffect {
+                name: "dismiss".into(),
+                args: vec![
+                    crate::dag::Expr::LitS32(250),
+                    crate::dag::Expr::LitBool(true),
+                ],
+            })
+        );
+
+        // And an ordinary attribute is untouched by any of it.
+        let doc = parse_tsx_with(
+            r#"
+            import { navigate } from "host:effects";
+            <Action id="a" height={56} onTap={navigate("Chat")} label="Chat" />
+            "#,
+            &granted(),
+        )
+        .expect("parses");
+        let Node::Element(el) = &doc.root_nodes[0] else { panic!() };
+        assert_eq!(
+            el.attrs.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
+            vec!["id", "height", "onTap", "label"],
+            "attributes keep source order",
+        );
+        assert_eq!(el.attr("height"), Some(&AttrValue::Num(56.0)));
+        assert_eq!(el.attr("label"), Some(&AttrValue::Str("Chat".into())));
+    }
+
+    /// **Refusal 1.** An `on..` attribute whose value is not a call.
+    ///
+    /// Each of these parsed to `AttrValue::Opaque` or `AttrValue::Binding`
+    /// before the producer existed - an effect erased, and erased *silently*,
+    /// which is the failure this refusal is for. The withdrawn
+    /// `onTap={namedHandler}` spelling is in the list on purpose: it is the
+    /// most plausible wrong thing to write.
+    #[test]
+    fn an_event_binding_that_is_not_a_call_is_refused() {
+        for value in [
+            r#"onTap={goChat}"#,                 // a bare identifier
+            r#"onTap={() => navigate("Chat")}"#, // an arrow function
+            r#"onTap="Chat""#,                   // a string
+            r#"onTap"#,                          // valueless (would be `true`)
+            r#"onTap={"Chat"}"#,                 // a string in a container
+            r#"onTap={props.destination}"#,      // a data binding
+            r#"onTap={<Action/>}"#,              // an element
+            r#"onTap={navigate("Chat") && x}"#,  // a call inside an expression
+        ] {
+            let src = format!(
+                r#"
+                import {{ navigate }} from "host:effects";
+                <Action id="a" {value} />
+                "#
+            );
+            assert_eq!(
+                refusal(&src),
+                EffectError::NotACall {
+                    attr: "onTap".into()
+                },
+                "`{value}` was not refused as a non-call",
+            );
+        }
+    }
+
+    /// **Refusal 2.** A callee that does not resolve, through the import chain,
+    /// to a declared host import.
+    #[test]
+    fn a_callee_that_resolves_to_no_host_import_is_refused() {
+        // Never imported at all.
+        assert_eq!(
+            refusal(r#"<Action id="a" onTap={navigate("Chat")} />"#),
+            EffectError::Unresolved {
+                attr: "onTap".into(),
+                callee: "navigate".into(),
+            }
+        );
+        // Imported from a Script rather than granted by the host: a Script
+        // import is COMPILED and a host import is GRANTED, and only the second
+        // can be an effect (Rule 48).
+        assert_eq!(
+            refusal(
+                r#"
+                import { navigate } from "Nav Helpers";
+                <Action id="a" onTap={navigate("Chat")} />
+                "#
+            ),
+            EffectError::Unresolved {
+                attr: "onTap".into(),
+                callee: "navigate".into(),
+            }
+        );
+        // The LOCAL name is what resolves: an alias means the exported name no
+        // longer names anything in this module.
+        assert_eq!(
+            refusal(
+                r#"
+                import { navigate as go } from "host:effects";
+                <Action id="a" onTap={navigate("Chat")} />
+                "#
+            ),
+            EffectError::Unresolved {
+                attr: "onTap".into(),
+                callee: "navigate".into(),
+            }
+        );
+    }
+
+    /// **Refusal 3.** Argument count and type, against the `FuncSig`.
+    ///
+    /// This is the check that would have caught `navigate(target: S32)`
+    /// disagreeing with libhbui's string destinations by machine instead of by
+    /// reading.
+    #[test]
+    fn arguments_are_checked_against_the_declared_signature() {
+        let with = |call: &str| {
+            format!(
+                r#"
+                import {{ navigate }} from "host:effects";
+                import {{ dismiss }} from "host:sheets";
+                <Action id="a" onTap={{{call}}} />
+                "#
+            )
+        };
+        assert_eq!(
+            refusal(&with("navigate()")),
+            EffectError::ArgCount {
+                attr: "onTap".into(),
+                effect: "navigate".into(),
+                declared: 1,
+                given: 0,
+            }
+        );
+        assert_eq!(
+            refusal(&with(r#"navigate("Chat", "Threads")"#)),
+            EffectError::ArgCount {
+                attr: "onTap".into(),
+                effect: "navigate".into(),
+                declared: 1,
+                given: 2,
+            }
+        );
+        // A number where a stored symbol is declared - the exact disagreement.
+        assert_eq!(
+            refusal(&with("navigate(3)")),
+            EffectError::ArgType {
+                attr: "onTap".into(),
+                effect: "navigate".into(),
+                index: 0,
+                declared: TypeShape::String,
+            }
+        );
+        // And the reverse, on the second parameter, so the index is not
+        // always zero.
+        assert_eq!(
+            refusal(&with(r#"dismiss(250, "yes")"#)),
+            EffectError::ArgType {
+                attr: "onTap".into(),
+                effect: "dismiss".into(),
+                index: 1,
+                declared: TypeShape::Bool,
+            }
+        );
+        // A fractional literal is not an S32, and is refused rather than
+        // truncated: a silently rounded argument is a different call.
+        assert_eq!(
+            refusal(&with("dismiss(2.5, true)")),
+            EffectError::ArgType {
+                attr: "onTap".into(),
+                effect: "dismiss".into(),
+                index: 0,
+                declared: TypeShape::S32,
+            }
+        );
+        // Not a literal at all. An effect call is not an expression language;
+        // a computation is a Module, referenced opaquely (Rule 46a).
+        for arg in ["props.destination", "1 + 2", "f()", "`Chat`"] {
+            assert_eq!(
+                refusal(&with(&format!("navigate({arg})"))),
+                EffectError::ArgNotALiteral {
+                    attr: "onTap".into(),
+                    effect: "navigate".into(),
+                    index: 0,
+                },
+                "`{arg}` was not refused as a non-literal",
+            );
+        }
+    }
+
+    /// **Refusal 4.** A host namespace bound by `import * as` (or a default
+    /// import): `fx.navigate(...)` cannot reach a flat callee except as the
+    /// string `"fx.navigate"`, which is structure smuggled into a name.
+    #[test]
+    fn a_host_namespace_bound_as_a_namespace_is_refused() {
+        assert_eq!(
+            refusal(
+                r#"
+                import * as fx from "host:effects";
+                <Action id="a" onTap={fx.navigate("Chat")} />
+                "#
+            ),
+            EffectError::NotANamedImport {
+                source: "host:effects".into(),
+                local: "fx".into(),
+                kind: ImportKind::Namespace,
+            }
+        );
+        assert_eq!(
+            refusal(
+                r#"
+                import fx from "host:effects";
+                <Action id="a" onTap={fx("Chat")} />
+                "#
+            ),
+            EffectError::NotANamedImport {
+                source: "host:effects".into(),
+                local: "fx".into(),
+                kind: ImportKind::Default,
+            }
+        );
+        // The refusal is about the IMPORT, so it fires whether or not anything
+        // calls through it - a binding that could never name an effect is a
+        // mistake at the line that wrote it.
+        assert_eq!(
+            refusal(
+                r#"
+                import * as fx from "host:effects";
+                <Action id="a" />
+                "#
+            ),
+            EffectError::NotANamedImport {
+                source: "host:effects".into(),
+                local: "fx".into(),
+                kind: ImportKind::Namespace,
+            }
+        );
+        // A member-expression callee with no host import behind it is
+        // unresolved rather than accepted - the flat-callee rule holds even
+        // where no namespace import is in sight.
+        assert_eq!(
+            refusal(r#"<Action id="a" onTap={fx.navigate("Chat")} />"#),
+            EffectError::Unresolved {
+                attr: "onTap".into(),
+                callee: "fx.navigate".into(),
+            }
+        );
+    }
+
+    /// **Rule 48 at the import line.** A `host:` specifier names a granted
+    /// namespace and a name that namespace declares, or it is refused at load -
+    /// rather than producing a binding that can never fire.
+    #[test]
+    fn a_host_import_is_granted_or_refused() {
+        assert_eq!(
+            refusal(
+                r#"
+                import { navigate } from "host:telemetry";
+                <Action id="a" />
+                "#
+            ),
+            EffectError::UnknownHostNamespace {
+                source: "host:telemetry".into(),
+            }
+        );
+        assert_eq!(
+            refusal(
+                r#"
+                import { teleport } from "host:effects";
+                <Action id="a" />
+                "#
+            ),
+            EffectError::UndeclaredHostImport {
+                source: "host:effects".into(),
+                imported: "teleport".into(),
+            }
+        );
+
+        // A Script import is not touched by any of this: it has a source, it is
+        // compiled, and resolving it is the consumer's job as it always was.
+        let doc = parse_tsx_with(
+            r#"
+            import { libraryFeed } from "Library Feed";
+            <List value={libraryFeed} />
+            "#,
+            &granted(),
+        )
+        .expect("a Script import is not a host import");
+        assert_eq!(doc.imports[0].source, "Library Feed");
+    }
+
+    /// **Nothing granted is the honest default.** [`parse_tsx`] grants nothing,
+    /// so a source that calls an effect has named a capability it was not
+    /// given - and says so, rather than erasing the call.
+    #[test]
+    fn with_nothing_granted_an_effect_does_not_resolve() {
+        let src = r#"
+            import { navigate } from "host:effects";
+            <Action id="a" onTap={navigate("Chat")} />
+        "#;
+        assert_eq!(
+            parse_tsx_with(src, &HostEffects::none()),
+            Err(ParseError::Effect(EffectError::UnknownHostNamespace {
+                source: "host:effects".into(),
+            }))
+        );
+        // Through the untyped entry point the same refusal arrives as a
+        // message, so no caller silently gets a document.
+        let messages = parse_tsx(src).expect_err("refused");
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].contains("host:effects"), "{messages:?}");
+        assert!(messages[0].is_ascii(), "{messages:?}");
+
+        // And a source with no effects at all is unaffected by the rule.
+        assert!(parse_tsx(r#"<Screen name="Home"><Item /></Screen>"#).is_ok());
+    }
+
+    /// **What the parser produced is what serializes**, effects included. The
+    /// same claim `a_parsed_document_round_trips_through_serde` makes, on the
+    /// one attribute value that has a nested shape.
+    #[test]
+    fn a_parsed_effect_survives_serde() {
+        let doc = parse_tsx_with(
+            r#"
+            import { navigate } from "host:effects";
+            <Drawer id="d1"><Action id="d2" onTap={navigate("Chat")} /></Drawer>
+            "#,
+            &granted(),
+        )
+        .expect("parses");
+        let json = serde_json::to_string(&doc).expect("serialize");
+        let back: TsxDocument = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(doc, back);
+
+        let Node::Element(drawer) = &back.root_nodes[0] else { panic!() };
+        let Node::Element(row) = &drawer.children[0] else { panic!() };
+        assert_eq!(
+            row.attr("onTap"),
+            Some(&AttrValue::NamedEffect(NamedEffect {
+                name: "navigate".into(),
+                args: vec![crate::dag::Expr::LitStr("Chat".into())],
+            })),
+            "the effect did not survive the round trip",
+        );
+    }
+
+    /// Every refusal renders ASCII (Rule 39): these strings reach the editor's
+    /// live-parse status strip and panic dumps.
+    #[test]
+    fn every_effect_refusal_renders_ascii() {
+        for e in [
+            EffectError::NotACall { attr: "onTap".into() },
+            EffectError::Unresolved {
+                attr: "onTap".into(),
+                callee: "navigate".into(),
+            },
+            EffectError::ArgCount {
+                attr: "onTap".into(),
+                effect: "navigate".into(),
+                declared: 1,
+                given: 0,
+            },
+            EffectError::ArgType {
+                attr: "onTap".into(),
+                effect: "navigate".into(),
+                index: 0,
+                declared: TypeShape::String,
+            },
+            EffectError::ArgNotALiteral {
+                attr: "onTap".into(),
+                effect: "navigate".into(),
+                index: 0,
+            },
+            EffectError::NotANamedImport {
+                source: "host:effects".into(),
+                local: "fx".into(),
+                kind: ImportKind::Namespace,
+            },
+            EffectError::UnknownHostNamespace {
+                source: "host:x".into(),
+            },
+            EffectError::UndeclaredHostImport {
+                source: "host:effects".into(),
+                imported: "teleport".into(),
+            },
+        ] {
+            assert!(e.to_string().is_ascii(), "{e:?}");
+            assert!(!e.to_string().is_empty());
+        }
     }
 
     #[test]
