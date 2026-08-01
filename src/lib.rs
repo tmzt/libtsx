@@ -4,10 +4,13 @@
 //! plain owned Rust data:
 //!
 //! * [`dag`] — the serializable code-graph contract: the **element tree**
-//!   ([`Element`], [`Node`], [`AttrValue`], [`TsxDocument`]), TS interface
-//!   declarations, import edges and simple event-handler ops. Always
-//!   available, serde-only, zero parser dependencies. Consumed by
-//!   `nocap-witgen`, `highbay-build` and `libhbui`'s postcard codec.
+//!   ([`Element`], [`Node`], [`AttrValue`], [`TsxDocument`]), the
+//!   **[`Definition`]** one screen or widget source declares (one exposed
+//!   element, its stored symbol, and the interfaces/imports/handlers
+//!   alongside), TS interface declarations, import edges and simple
+//!   event-handler ops. Always available, serde-only, zero parser
+//!   dependencies. Consumed by `nocap-witgen`, `highbay-build` and `libhbui`'s
+//!   postcard codec.
 //! * [`parse_tsx`] / [`extract_interfaces`] (feature `parse`, on by default) —
 //!   the TSX parser built on oxc, which *produces* [`dag`] values and owns no
 //!   types of its own. Downstream crates that only need the graph types can
@@ -24,8 +27,10 @@ mod parse;
 mod transpile;
 
 // The element tree is `dag`'s, not `parse`'s — re-exported at the crate root
-// (where callers have always found it) with no feature gate.
-pub use dag::{AttrValue, Element, Node, TsxDocument};
+// (where callers have always found it) with no feature gate. `Definition` is
+// re-exported beside it for the same reason: it is the shape a whole screen or
+// widget source has, and naming it must not require the parser.
+pub use dag::{AttrValue, DefError, Definition, Element, Node, TsxDocument};
 
 #[cfg(feature = "parse")]
 pub use parse::{extract_interfaces, parse_app, parse_tsx};

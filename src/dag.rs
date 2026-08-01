@@ -187,6 +187,195 @@ pub struct TsxDocument {
     pub imports: Vec<ImportDecl>,
 }
 
+// --- the definition ---------------------------------------------------------
+
+/// The reserved attribute naming a definition's props shape, read on the
+/// **outer container only** (LIBHBUI_PLAN Rule 41).
+pub const RESERVED_ATTR_PROPS: &str = "props";
+
+/// The reserved attribute carrying a stored widget id (LIBHBUI_PLAN Rule 40).
+///
+/// Reserved everywhere in the dialect; special-cased (read as the definition's
+/// own identity) on the outer container only. `dag` does not interpret the
+/// value - the id type belongs to the consumer - it only reserves the name so
+/// nothing else can claim it.
+pub const RESERVED_ATTR_ID: &str = "id";
+
+/// The reserved record-key attribute, reserved the same way as
+/// [`RESERVED_ATTR_ID`] (LIBHBUI_PLAN Rule 41). A record key is opaque: hashed
+/// and compared, never interpreted, so nothing here parses it.
+pub const RESERVED_ATTR_KEY: &str = "key";
+
+/// A **definition**: the unit one screen or widget source declares - exactly
+/// one exposed [`Element`] plus the other AST nodes alongside it
+/// (LIBHBUI_PLAN Rules 17, 18).
+///
+/// **Why this type exists.** [`TsxDocument`] carries the element tree and the
+/// import edges, but not the interfaces: `parse_tsx` and `extract_interfaces`
+/// are separate entry points, so a definition's parts arrived from two places
+/// and no single type stood for the whole of one. That gap is closed here,
+/// which is where it belongs: the relevant-AST set is libtsx's to define, and
+/// growing it is a change to libtsx (Rule 21).
+///
+/// **The one-child rule is structural, not a check.** [`ui`](Definition::ui)
+/// is one `Element` and not a `Vec`, so a second exposed element has nowhere
+/// to live: the rule is unrepresentable to violate rather than rejected at
+/// runtime. Interfaces, imports and handlers are not elements, so they sit
+/// alongside without competing for that slot - which is exactly what the slot
+/// being typed `Element` (rather than the whole node list being called "the
+/// UI") buys.
+///
+/// **The symbol is stored, never derived** (Rule 9). [`symbol`](Definition::
+/// symbol) is the exported name other sources refer to this definition by -
+/// the `UserCard` in `<UserCard/>`. Nothing here reconstructs it from a
+/// display name, a title, a file name or a position, and there is deliberately
+/// no helper that would: renaming a display must not change what `<UserCard/>`
+/// resolves to. Callers supply it from wherever the authoring step recorded
+/// it.
+///
+/// Everything a definition is made of is already a `dag` type, so a definition
+/// serializes with the rest of the graph and needs no format of its own.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Definition {
+    /// The exported symbol other sources refer to this definition by. Stored,
+    /// never derived (Rule 9).
+    pub symbol: String,
+    /// The single [`Element`] this definition exposes as its UI (Rule 18) -
+    /// the outer container, with its attributes and children exactly as
+    /// authored.
+    pub ui: Element,
+    /// The `interface` declarations alongside the UI - the props shapes.
+    /// [`Definition::props_shape`] resolves the one the container names.
+    pub interfaces: Vec<InterfaceDecl>,
+    /// The typed reference edges this source declares, in source order.
+    pub imports: Vec<ImportDecl>,
+    /// The simple event handlers alongside the UI.
+    pub handlers: Vec<HandlerDecl>,
+}
+
+impl Definition {
+    /// Assemble a definition from the two halves libtsx's parser hands back:
+    /// a [`TsxDocument`] (element tree + import edges) and the interfaces
+    /// extracted from the same source.
+    ///
+    /// The document's root nodes are the loose shape - a `Vec<Node>` that can
+    /// hold any number of anything - and this is where that shape narrows to
+    /// the one element a definition exposes. An error here says the *source*
+    /// was not a definition; it is not a check on the type, which cannot hold
+    /// two elements in the first place (Rule 18).
+    ///
+    /// `handlers` starts empty: libtsx has no handler-extraction entry point
+    /// yet, and inventing one by inference is exactly the derivation Rule 30
+    /// forbids. Callers with handlers assign the field.
+    pub fn from_document(
+        symbol: impl Into<String>,
+        doc: TsxDocument,
+        interfaces: Vec<InterfaceDecl>,
+    ) -> Result<Self, DefError> {
+        let TsxDocument { root_nodes, imports } = doc;
+        let mut roots = root_nodes.into_iter();
+        let Some(first) = roots.next() else {
+            return Err(DefError::NoUi);
+        };
+        let extra = roots.count();
+        if extra > 0 {
+            // Not "take the first and drop the rest": a source with two roots
+            // has content that would silently vanish, and a definition whose
+            // UI is quietly half of what was written is worse than one that
+            // refuses to be built.
+            return Err(DefError::SeveralRoots(1 + extra));
+        }
+        let Node::Element(ui) = first else {
+            return Err(DefError::RootNotAnElement);
+        };
+        Ok(Self {
+            symbol: symbol.into(),
+            ui,
+            interfaces,
+            imports,
+            handlers: Vec::new(),
+        })
+    }
+
+    /// The props shape the outer container names, as written.
+    ///
+    /// This is one of the two attributes the outer container special-cases
+    /// (Rule 41), and the special-casing goes no further: no other element in
+    /// the tree gets its attributes interpreted here.
+    ///
+    /// `Ok(None)` means no props shape is declared. A declaration in a form
+    /// that is not a name is an error rather than a `None`, because "declared
+    /// unreadably" and "not declared" are different facts and must not arrive
+    /// as the same value (Rule 10).
+    pub fn props_name(&self) -> Result<Option<&str>, DefError> {
+        match self.ui.attr(RESERVED_ATTR_PROPS) {
+            None => Ok(None),
+            // `props="Shape"` and `props={Shape}` are the two spellings a name
+            // arrives in; both are read, neither is guessed at.
+            Some(AttrValue::Str(name)) | Some(AttrValue::Binding(name)) => Ok(Some(name.as_str())),
+            Some(_) => Err(DefError::ReservedAttrNotAName(RESERVED_ATTR_PROPS)),
+        }
+    }
+
+    /// The interface [`Definition::props_name`] names, resolved against the
+    /// interfaces declared alongside the UI.
+    ///
+    /// A name that resolves to nothing is an error, not a `None`: a props
+    /// shape the author declared and this definition cannot find is a missing
+    /// declaration, and reporting it as "no props" would hide it.
+    pub fn props_shape(&self) -> Result<Option<&InterfaceDecl>, DefError> {
+        let Some(name) = self.props_name()? else {
+            return Ok(None);
+        };
+        self.interfaces
+            .iter()
+            .find(|i| i.name == name)
+            .map(Some)
+            .ok_or_else(|| DefError::UnknownPropsShape(name.to_string()))
+    }
+}
+
+/// What can be wrong with a definition's *source*. None of these is a check on
+/// [`Definition`] itself, whose shape makes the one-child rule unrepresentable
+/// to violate (Rule 18).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DefError {
+    /// The source contributed no root node at all.
+    NoUi,
+    /// The source contributed more than one root node; a definition exposes
+    /// exactly one element (Rule 18). Carries how many were found.
+    SeveralRoots(usize),
+    /// The single root node was text or an expression, not an element.
+    RootNotAnElement,
+    /// A reserved attribute on the outer container was declared in a form that
+    /// is not a name (Rule 41).
+    ReservedAttrNotAName(&'static str),
+    /// `props` names a shape no interface alongside this definition declares.
+    UnknownPropsShape(String),
+}
+
+impl std::fmt::Display for DefError {
+    /// ASCII only - these strings reach logs and panic dumps.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoUi => write!(f, "the source declares no UI element"),
+            Self::SeveralRoots(n) => write!(
+                f,
+                "a definition exposes exactly one element, the source has {n} root nodes"
+            ),
+            Self::RootNotAnElement => write!(f, "the source's only root node is not an element"),
+            Self::ReservedAttrNotAName(attr) => {
+                write!(f, "the reserved `{attr}` attribute is not a name")
+            }
+            Self::UnknownPropsShape(name) => {
+                write!(f, "no interface named `{name}` is declared alongside")
+            }
+        }
+    }
+}
+
+impl std::error::Error for DefError {}
+
 /// One field of an interface (or one named function parameter).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FieldDecl {
@@ -420,6 +609,148 @@ mod tests {
         let json = serde_json::to_string(&doc).expect("serialize");
         let back: TsxDocument = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(doc, back);
+    }
+
+    // --- the definition (LIBHBUI_PLAN Rules 9, 17, 18, 21, 41) --------------
+
+    fn a_document() -> TsxDocument {
+        TsxDocument {
+            root_nodes: vec![Node::Element(Element {
+                tag: "Widget".into(),
+                type_args: vec![],
+                attrs: vec![("props".into(), AttrValue::Str("UserCardProps".into()))],
+                children: vec![Node::Element(Element {
+                    tag: "Content".into(),
+                    type_args: vec![],
+                    attrs: vec![],
+                    children: vec![Node::Text("{{name}}".into())],
+                })],
+            })],
+            imports: vec![ImportDecl {
+                source: "People".into(),
+                names: vec![ImportName {
+                    local: "people".into(),
+                    imported: "people".into(),
+                    kind: ImportKind::Named,
+                }],
+            }],
+        }
+    }
+
+    fn user_card_props() -> Vec<InterfaceDecl> {
+        vec![InterfaceDecl {
+            name: "UserCardProps".into(),
+            fields: vec![FieldDecl {
+                name: "name".into(),
+                ty: TypeShape::String,
+                optional: false,
+            }],
+        }]
+    }
+
+    #[test]
+    fn a_definition_is_one_element_plus_the_nodes_alongside_it() {
+        let def = Definition::from_document("UserCard", a_document(), user_card_props())
+            .expect("one root element");
+        assert_eq!(def.symbol, "UserCard");
+        assert_eq!(def.ui.tag, "Widget");
+        assert_eq!(def.ui.children.len(), 1);
+        assert_eq!(def.imports.len(), 1, "the import edge came along");
+        assert_eq!(def.interfaces.len(), 1, "so did the interface");
+        assert!(def.handlers.is_empty());
+    }
+
+    #[test]
+    fn a_source_with_two_roots_is_not_a_definition() {
+        // The type cannot hold two elements; this is the SOURCE being refused,
+        // and refused rather than silently truncated to its first root.
+        let mut doc = a_document();
+        doc.root_nodes.push(Node::Element(Element {
+            tag: "Stowaway".into(),
+            type_args: vec![],
+            attrs: vec![],
+            children: vec![],
+        }));
+        assert_eq!(
+            Definition::from_document("UserCard", doc, vec![]),
+            Err(DefError::SeveralRoots(2))
+        );
+
+        let empty = TsxDocument { root_nodes: vec![], imports: vec![] };
+        assert_eq!(
+            Definition::from_document("UserCard", empty, vec![]),
+            Err(DefError::NoUi)
+        );
+
+        let texty = TsxDocument {
+            root_nodes: vec![Node::Text("just words".into())],
+            imports: vec![],
+        };
+        assert_eq!(
+            Definition::from_document("UserCard", texty, vec![]),
+            Err(DefError::RootNotAnElement)
+        );
+    }
+
+    #[test]
+    fn the_container_names_the_props_shape() {
+        let def = Definition::from_document("UserCard", a_document(), user_card_props())
+            .expect("definition");
+        assert_eq!(def.props_name(), Ok(Some("UserCardProps")));
+        assert_eq!(
+            def.props_shape().expect("resolves").map(|i| i.name.as_str()),
+            Some("UserCardProps")
+        );
+
+        // `props={Shape}` reads the same as `props="Shape"`.
+        let mut binding = def.clone();
+        binding.ui.attrs = vec![("props".into(), AttrValue::Binding("UserCardProps".into()))];
+        assert_eq!(binding.props_name(), Ok(Some("UserCardProps")));
+
+        // Undeclared is None; declared-but-not-a-name is an error, not a None
+        // (Rule 10); declared-but-unresolvable is an error too (Rule 30).
+        let mut none = def.clone();
+        none.ui.attrs.clear();
+        assert_eq!(none.props_name(), Ok(None));
+        assert_eq!(none.props_shape().map(|o| o.is_none()), Ok(true));
+
+        let mut wrong = def.clone();
+        wrong.ui.attrs = vec![("props".into(), AttrValue::Num(3.0))];
+        assert_eq!(
+            wrong.props_name(),
+            Err(DefError::ReservedAttrNotAName("props"))
+        );
+
+        let mut dangling = def.clone();
+        dangling.interfaces.clear();
+        assert_eq!(
+            dangling.props_shape(),
+            Err(DefError::UnknownPropsShape("UserCardProps".into()))
+        );
+    }
+
+    #[test]
+    fn only_the_outer_container_is_read_for_reserved_attributes() {
+        // A CHILD carrying `props` is data, not a declaration: reading it here
+        // would be exactly the special prop handling Rule 41 confines to the
+        // container.
+        let mut def = Definition::from_document("UserCard", a_document(), user_card_props())
+            .expect("definition");
+        def.ui.attrs.clear();
+        let Node::Element(child) = &mut def.ui.children[0] else {
+            panic!("the child is an element")
+        };
+        child.attrs.push(("props".into(), AttrValue::Str("Sneaky".into())));
+        assert_eq!(def.props_name(), Ok(None));
+    }
+
+    #[test]
+    fn a_definition_round_trips_through_serde() {
+        let def = Definition::from_document("UserCard", a_document(), user_card_props())
+            .expect("definition");
+        let json = serde_json::to_string(&def).expect("serialize");
+        let back: Definition = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(def, back);
     }
 
     #[test]
