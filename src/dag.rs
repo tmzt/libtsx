@@ -254,9 +254,22 @@ pub fn is_event_binding(attr: &str) -> bool {
 /// holding an arbitrary [`Expr`] would admit an anonymous effect and lose that
 /// check; a named one cannot be written without something to resolve to.
 ///
+/// **The identity is the QUALIFIED name** (Rule 48): [`namespace`] and [`name`]
+/// together, never the bare name. A bare name is only unique inside one grant,
+/// and there is more than one grant - a provider answers for as many namespaces
+/// as the embedding declares. Dropping the namespace here would make two
+/// namespaces exporting a `frobnicate` with different meanings the same effect
+/// to every reader downstream, and a decoded tree carrying one of them would
+/// pass a grant check written against the other.
+///
 /// [`name`]: NamedEffect::name
+/// [`namespace`]: NamedEffect::namespace
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NamedEffect {
+    /// The **specifier it was imported from** - the granted host namespace, as
+    /// the source spelled it and as the provider answered for it. Half the
+    /// identity, and the half a bare name cannot recover.
+    pub namespace: String,
     /// The host import's **exported** name - the `imported` half of the import
     /// chain, so `import { frobnicate as fb }` and a call to `fb(..)` both
     /// arrive here as `frobnicate`. An alias is resolved once, at parse, rather
@@ -271,11 +284,24 @@ pub struct NamedEffect {
 /// **What an import specifier resolves to** - the one question the parse asks
 /// its embedding (LIBHBUI_PLAN Rules 48, 52).
 ///
-/// Rule 48 names three answers and this is all three. They are kept apart
-/// because the parse does different things with them: a Script and a package
-/// are *compiled* or *fetched* by somebody else and supply the parse nothing,
-/// while a host namespace is *granted* and is the only kind that can supply an
-/// effect's signature.
+/// Rule 48 names three answers and this is all three.
+///
+/// **The parse's split is not three ways, it is `Host` / `{Script, Package}` /
+/// `None`**, and saying so is the honest version. Only [`Resolution::Host`]
+/// supplies anything the parse can use - a signature to check a call against.
+/// A Script and a package are *compiled* or *fetched* by somebody else, so a
+/// call through either is refused identically, as
+/// [`EffectError::NotAHostImport`] naming the specifier; and a specifier the
+/// provider does not know at all is the third answer,
+/// [`EffectError::Unresolved`], which says "you never imported that" rather
+/// than "you imported that from something with a source behind it".
+///
+/// **The two are still distinct here because the EMBEDDING distinguishes
+/// them**, not the parse: a Script is a display name in the Highbay module
+/// system and a package is a real path, and a provider that had to collapse
+/// them would be losing a fact it owns in order to answer a question the parse
+/// does not ask. Anything the parse could do differently with a package would
+/// arrive as a payload on this variant, as it did for `Host`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Resolution<'a> {
     /// A **Script** in the Highbay module system, named by its display name.
@@ -1080,6 +1106,7 @@ mod tests {
                     // would be the leak this crate's tests exist to catch.
                     "onGrommet".into(),
                     AttrValue::NamedEffect(NamedEffect {
+                        namespace: "host:zork".into(),
                         name: "frobnicate".into(),
                         args: vec![Expr::LitStr("sprocket".into())],
                     }),

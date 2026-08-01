@@ -63,13 +63,23 @@ impl Zork {
                 "frobnicate",
                 vec![param("sprocket", TypeShape::String)],
             )],
-            grue: vec![sig(
-                "wibble",
-                vec![
-                    param("after", TypeShape::S32),
-                    param("loudly", TypeShape::Bool),
-                ],
-            )],
+            grue: vec![
+                sig(
+                    "wibble",
+                    vec![
+                        param("after", TypeShape::S32),
+                        param("loudly", TypeShape::Bool),
+                    ],
+                ),
+                // **A COLLIDING name, granted under a second namespace, with a
+                // signature identical to `host:zork`'s.** Identical on purpose:
+                // if the two differed in arity or type, two parsed effects
+                // would differ by their arguments and the namespace could be
+                // dropped without any test noticing. Here the namespace is the
+                // only thing telling them apart, which is Rule 48's "the
+                // qualified name IS the identity" made falsifiable.
+                sig("frobnicate", vec![param("sprocket", TypeShape::String)]),
+            ],
         }
     }
 }
@@ -133,17 +143,22 @@ fn refusal(src: &str) -> EffectError {
 
 // --- the provider answers all three (Rule 52) ---------------------------------
 
-/// **One provider, three answers, and the parse does something different with
-/// each.**
+/// **One provider, three answers - and the PARSE's split is
+/// `Host` / `{Script, Package}` / `None`.**
 ///
-/// This is the whole reason [`ParserHost`] is a package provider rather than an
-/// effects grant: a `Host` namespace supplies the signature an effect resolves
-/// against, while a Script and a package resolve *fine* and supply nothing -
-/// and a call through one of those is refused for a reason that names what it
-/// really is. An effects-only interface could not tell the last two apart from
-/// a name that was never imported.
+/// Stating it that way rather than "something different with each" is the point
+/// of this test, because the parse really does treat a Script and a package
+/// identically: neither supplies a signature, so a call through either is the
+/// *same* refusal with a different specifier in it. What the provider buys is
+/// still real, and it is the third class: "you imported that from something
+/// with a source behind it" is a different fact from "you never imported that",
+/// and an effects-only interface could tell neither from the other.
+///
+/// The equalities below are what make that a claim rather than a comment. Give
+/// [`Resolution::Package`] an answer the parse acts on and the package line
+/// stops matching; collapse `Host` into the others and the first one does.
 #[test]
-fn one_provider_answers_script_package_and_host() {
+fn the_parse_splits_host_from_imported_from_unimported() {
     let host = Zork::new();
     assert!(matches!(host.resolve(ZORK), Some(Resolution::Host(_))));
     assert!(matches!(host.resolve(GRUE), Some(Resolution::Host(_))));
@@ -160,10 +175,29 @@ fn one_provider_answers_script_package_and_host() {
             "#
         )),
         AttrValue::NamedEffect(NamedEffect {
+            namespace: ZORK.into(),
             name: "frobnicate".into(),
             args: vec![Expr::LitStr("sprocket".into())],
         })
     );
+
+    // The refusal a Script and a package SHARE, written once so the two
+    // assertions below can differ only in the specifier - which is the claim
+    // being made: the parse tells them apart from `Host` and from a name that
+    // was never imported, and not from each other.
+    let not_a_host_import = |source: &str| EffectError::NotAHostImport {
+        attr: "onGrommet".into(),
+        callee: "frobnicate".into(),
+        source: source.into(),
+    };
+    let calling_through = |source: &str| {
+        refusal(&format!(
+            r#"
+            import {{ frobnicate }} from "{source}";
+            <Widget id="a" onGrommet={{frobnicate("sprocket")}} />
+            "#
+        ))
+    };
 
     // A Script and a package both import cleanly - resolving them is somebody
     // else's job and always has been...
@@ -177,25 +211,18 @@ fn one_provider_answers_script_package_and_host() {
             ))
             .expect("an import with a source behind it is not the parser's business");
         assert_eq!(doc.imports[0].source, source);
-
-        // ...and neither can supply an effect. The refusal names the specifier,
-        // which is what the provider bought: "you imported that from something
-        // compiled" rather than "you never imported that".
-        assert_eq!(
-            refusal(&format!(
-                r#"
-                import {{ frobnicate }} from "{source}";
-                <Widget id="a" onGrommet={{frobnicate("sprocket")}} />
-                "#
-            )),
-            EffectError::NotAHostImport {
-                attr: "onGrommet".into(),
-                callee: "frobnicate".into(),
-                source: source.into(),
-            },
-            "a call through a {source} import was not refused as a non-host import",
-        );
     }
+
+    // ...and neither can supply an effect. The refusal names the specifier,
+    // which is what the provider bought: "you imported that from something
+    // compiled" rather than "you never imported that".
+    assert_eq!(calling_through(PLOVER), not_a_host_import(PLOVER));
+    assert_eq!(
+        calling_through(PLUGH),
+        not_a_host_import(PLUGH),
+        "a package was answered differently from a Script - `Resolution`'s doc \
+         says the parse does not tell those two apart, so one of the two is wrong",
+    );
 
     // And a name that really was never imported is the other fact, said
     // separately.
@@ -264,6 +291,7 @@ fn an_event_binding_carries_a_named_effect() {
             "#
         )),
         AttrValue::NamedEffect(NamedEffect {
+            namespace: ZORK.into(),
             name: "frobnicate".into(),
             args: vec![Expr::LitStr("sprocket".into())],
         })
@@ -280,6 +308,7 @@ fn an_event_binding_carries_a_named_effect() {
             "#
         )),
         AttrValue::NamedEffect(NamedEffect {
+            namespace: ZORK.into(),
             name: "frobnicate".into(),
             args: vec![Expr::LitStr("sprocket".into())],
         })
@@ -297,6 +326,7 @@ fn an_event_binding_carries_a_named_effect() {
             "#
         )),
         AttrValue::NamedEffect(NamedEffect {
+            namespace: GRUE.into(),
             name: "wibble".into(),
             args: vec![Expr::LitS32(250), Expr::LitBool(true)],
         })
@@ -321,6 +351,53 @@ fn an_event_binding_carries_a_named_effect() {
     );
     assert_eq!(el.attr("height"), Some(&AttrValue::Num(56.0)));
     assert_eq!(el.attr("label"), Some(&AttrValue::Str("Chat".into())));
+}
+
+/// **The effect's identity is the QUALIFIED name** (Rule 48): the namespace it
+/// was granted under, and the exported name, together.
+///
+/// [`Zork`] grants a `frobnicate` under BOTH namespaces, with the same
+/// signature, so the two calls below are indistinguishable by name, by arity
+/// and by argument. The only fact separating them is where each was imported
+/// from - and a bare name would make them one effect to every reader
+/// downstream, which is precisely how an effect from a second vocabulary passes
+/// a grant check written against the first.
+///
+/// The `assert_ne!` is the gate: drop `namespace` from [`NamedEffect`] and it is
+/// the only assertion in the file that fails.
+#[test]
+fn the_same_name_under_two_namespaces_is_two_effects() {
+    let call = |namespace: &str| {
+        only_effect(&format!(
+            r#"
+            import {{ frobnicate }} from "{namespace}";
+            <Widget id="a" onGrommet={{frobnicate("sprocket")}} />
+            "#
+        ))
+    };
+    let from_zork = call(ZORK);
+    let from_grue = call(GRUE);
+
+    assert_eq!(
+        from_zork,
+        AttrValue::NamedEffect(NamedEffect {
+            namespace: ZORK.into(),
+            name: "frobnicate".into(),
+            args: vec![Expr::LitStr("sprocket".into())],
+        })
+    );
+    assert_eq!(
+        from_grue,
+        AttrValue::NamedEffect(NamedEffect {
+            namespace: GRUE.into(),
+            name: "frobnicate".into(),
+            args: vec![Expr::LitStr("sprocket".into())],
+        })
+    );
+    assert_ne!(
+        from_zork, from_grue,
+        "two namespaces' same-named effects collapsed into one value",
+    );
 }
 
 /// **Refusal 1.** An `on..` attribute whose value is not a call.
@@ -662,6 +739,7 @@ fn a_parsed_effect_survives_serde() {
     assert_eq!(
         row.attr("onGrommet"),
         Some(&AttrValue::NamedEffect(NamedEffect {
+            namespace: ZORK.into(),
             name: "frobnicate".into(),
             args: vec![Expr::LitStr("sprocket".into())],
         })),
@@ -703,6 +781,7 @@ fn one_context_serves_parse_app_as_well_as_parse_tsx() {
     assert_eq!(
         widget.attr("onGrommet"),
         Some(&AttrValue::NamedEffect(NamedEffect {
+            namespace: ZORK.into(),
             name: "frobnicate".into(),
             args: vec![Expr::LitStr("sprocket".into())],
         })),

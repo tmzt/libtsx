@@ -413,8 +413,10 @@ fn root_element(root_nodes: Vec<Node>) -> Option<Element> {
 /// are different facts about the source, and the provider is what lets the
 /// parse tell them apart.
 struct EffectScope<'a> {
-    /// `(local, imported, signature)` for every name bound from a granted host
-    /// namespace, in source order.
+    /// `(local, namespace, signature)` for every name bound from a granted host
+    /// namespace, in source order. The namespace is kept because it is half the
+    /// effect's identity (Rule 48) and the only half a callee cannot recover:
+    /// two granted namespaces may each export a `frobnicate`.
     granted: Vec<(&'a str, &'a str, &'a FuncSig)>,
     /// `(local, specifier)` for every name bound from a Script or a package.
     foreign: Vec<(&'a str, &'a str)>,
@@ -422,8 +424,15 @@ struct EffectScope<'a> {
 
 /// What a local name was imported from.
 enum Bound<'a> {
-    /// A granted host import, and the signature that types the call.
-    Host(&'a FuncSig),
+    /// A granted host import: the namespace it was granted under, and the
+    /// signature that types the call. Both travel, because the qualified name
+    /// is the identity.
+    Host {
+        /// The specifier the grant answered for.
+        namespace: &'a str,
+        /// What it declares this name to be.
+        sig: &'a FuncSig,
+    },
     /// A Script or a package - imported, and unable to supply an effect.
     Foreign(&'a str),
 }
@@ -503,7 +512,7 @@ impl<'a> EffectScope<'a> {
                         imported: name.imported.clone(),
                     });
                 };
-                granted.push((name.local.as_str(), name.imported.as_str(), sig));
+                granted.push((name.local.as_str(), decl.source.as_str(), sig));
             }
         }
         Ok(Self { granted, foreign })
@@ -512,8 +521,8 @@ impl<'a> EffectScope<'a> {
     /// What a local name was imported from, or `None` if this module imported
     /// no such name at all.
     fn resolve(&self, local: &str) -> Option<Bound<'a>> {
-        if let Some((_, _, sig)) = self.granted.iter().find(|(name, _, _)| *name == local) {
-            return Some(Bound::Host(sig));
+        if let Some((_, namespace, sig)) = self.granted.iter().find(|(name, _, _)| *name == local) {
+            return Some(Bound::Host { namespace, sig });
         }
         self.foreign
             .iter()
@@ -558,8 +567,8 @@ fn effect_attr(
             callee: expr_path(callee).unwrap_or_else(|| "a computed callee".to_string()),
         });
     };
-    let sig = match scope.resolve(local.name.as_str()) {
-        Some(Bound::Host(sig)) => sig,
+    let (namespace, sig) = match scope.resolve(local.name.as_str()) {
+        Some(Bound::Host { namespace, sig }) => (namespace, sig),
         // Imported, and from something with a source behind it. A Script is
         // compiled and a host import is granted (Rule 48), so this names no
         // signature - and saying "not imported" about a name the source plainly
@@ -610,6 +619,10 @@ fn effect_attr(
     }
 
     Ok(AttrValue::NamedEffect(NamedEffect {
+        // The specifier the grant answered for - the other half of the
+        // qualified name, so a reader downstream can tell two namespaces'
+        // same-named effects apart (Rule 48).
+        namespace: namespace.to_string(),
         // The RESOLVED name: an alias is spent here and never travels.
         name: sig.name.clone(),
         args,
