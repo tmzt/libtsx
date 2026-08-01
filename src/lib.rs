@@ -11,8 +11,11 @@
 //!   event-handler ops. Always available, serde-only, zero parser
 //!   dependencies. Consumed by `nocap-witgen`, `highbay-build` and `libhbui`'s
 //!   postcard codec.
-//!   Effect bindings ([`NamedEffect`], [`HostEffects`]) live here too: an
-//!   `onTap={navigate("Chat")}` is graph data like everything else.
+//!   Effect bindings ([`NamedEffect`]) live here too: an
+//!   `onGrommet={frobnicate("sprocket")}` is graph data like everything else.
+//!   So does [`ParserHost`], the provider an embedding hands the parse - the
+//!   interface that keeps every name in an embedding's model out of this crate
+//!   (LIBHBUI_PLAN Rule 52).
 //! * [`parse_tsx`] / [`ParseCtx`] / [`extract_interfaces`] (feature
 //!   `parse`, on by default) - the TSX parser built on oxc, which *produces*
 //!   [`dag`] values and owns no
@@ -34,8 +37,8 @@ mod transpile;
 // re-exported beside it for the same reason: it is the shape a whole screen or
 // widget source has, and naming it must not require the parser.
 pub use dag::{
-    AttrValue, DefError, Definition, EffectError, Element, HostEffects, NamedEffect, Node,
-    TsxDocument,
+    AttrValue, DefError, Definition, EffectError, Element, NamedEffect, Node, ParserHost,
+    Resolution, TsxDocument,
 };
 
 #[cfg(feature = "parse")]

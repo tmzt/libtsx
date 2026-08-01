@@ -27,10 +27,11 @@
 //!   passed to whichever parse entry point the caller needs (Rule 49).
 
 use crate::dag::{
-    AttrValue, EffectError, Element, FieldDecl, FuncSig, HostEffects, ImportDecl, ImportKind,
-    ImportName, InterfaceDecl, NamedEffect, Node, TsxDocument, TypeShape, is_event_binding,
-    is_host_namespace,
+    AttrValue, EffectError, Element, FieldDecl, FuncSig, ImportDecl, ImportKind, ImportName,
+    InterfaceDecl, NamedEffect, Node, ParserHost, Resolution, TsxDocument, TypeShape,
+    is_event_binding, is_host_namespace,
 };
+use std::sync::Arc;
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     ArrowFunctionExpression, ExportDefaultDeclarationKind, Expression, ImportDeclarationSpecifier,
@@ -130,33 +131,59 @@ pub fn parse_tsx(source: &str) -> Result<TsxDocument, Vec<String>> {
 /// because it was a third function nobody extended, so the multi-file path
 /// could not express an effect at all.
 ///
-/// **The builder is the only way to configure one.** The fields are private and
+/// **What it holds is a provider, not a grant** (Rule 52). The context asks its
+/// [`ParserHost`] what a specifier resolves to and never enumerates the
+/// answers, which is what keeps every name in an embedding's model out of this
+/// crate.
+///
+/// **The builder is the only way to configure one.** The field is private and
 /// there is no setter, so a context is either the default (offering nothing) or
 /// one a [`ParseCtxBuilder`] produced - which is what stops a capability being
 /// enabled by a route some other entry point forgets:
 ///
 /// ```compile_fail,E0451
-/// use libtsx::{HostEffects, ParseCtx};
+/// use libtsx::ParseCtx;
 ///
-/// let ctx = ParseCtx { effects: Some(HostEffects::none()) };
+/// let ctx = ParseCtx { host: None };
 /// ```
 ///
 /// The default offers **nothing**, which is the honest one: a source calling an
 /// effect it was never given has named a capability it does not have.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Clone, Default)]
 pub struct ParseCtx {
-    /// The effect surface, or `None` for a load that does not offer one at all.
-    effects: Option<HostEffects>,
+    /// The embedding's provider, or `None` for a load that offers no host
+    /// surface at all.
+    host: Option<Arc<dyn ParserHost>>,
+}
+
+impl std::fmt::Debug for ParseCtx {
+    /// A provider is a behaviour and cannot print what it would answer, so this
+    /// says whether there is one rather than pretending to describe it.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ParseCtx")
+            .field("host", &self.host.is_some())
+            .finish()
+    }
 }
 
 /// Builds a [`ParseCtx`]. See [`ParseCtx::builder`].
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct ParseCtxBuilder {
-    effects: Option<HostEffects>,
+    host: Option<Arc<dyn ParserHost>>,
+}
+
+/// The provider [`ParseCtxBuilder::enable_effects`] installs: the surface is
+/// offered, and it resolves nothing.
+struct NoGrants;
+
+impl ParserHost for NoGrants {
+    fn resolve(&self, _specifier: &str) -> Option<Resolution<'_>> {
+        None
+    }
 }
 
 impl ParseCtxBuilder {
-    /// Offer the **effect surface**, granting nothing through it yet.
+    /// Offer the **host surface**, granting nothing through it yet.
     ///
     /// The distinction this draws is between an embedding that has no
     /// capabilities to give and one that withheld a particular capability - a
@@ -164,26 +191,26 @@ impl ParseCtxBuilder {
     /// first case and [`EffectError::UnknownHostNamespace`] in the second.
     /// Neither is a parse that quietly succeeds.
     pub fn enable_effects(mut self) -> Self {
-        self.effects.get_or_insert_with(HostEffects::none);
+        self.host.get_or_insert_with(|| Arc::new(NoGrants));
         self
     }
 
-    /// Grant these host effects, **offering the surface** in the same step.
+    /// Set the embedding's [`ParserHost`], **offering the surface** in the same
+    /// step.
     ///
-    /// A grant is the stronger statement, so it implies [`Self::enable_effects`]
-    /// rather than needing it: a caller that sets a host and forgets to enable
-    /// would otherwise have configured a capability the parse ignores, which is
-    /// the failure mode a single context exists to remove.
-    pub fn set_host(mut self, host: HostEffects) -> Self {
-        self.effects = Some(host);
+    /// A provider is the stronger statement, so it implies
+    /// [`Self::enable_effects`] rather than needing it: a caller that sets a
+    /// host and forgets to enable would otherwise have configured a capability
+    /// the parse ignores, which is the failure mode a single context exists to
+    /// remove.
+    pub fn set_host(mut self, host: impl ParserHost + 'static) -> Self {
+        self.host = Some(Arc::new(host));
         self
     }
 
     /// The configured context.
     pub fn build(self) -> ParseCtx {
-        ParseCtx {
-            effects: self.effects,
-        }
+        ParseCtx { host: self.host }
     }
 }
 
@@ -193,9 +220,9 @@ impl ParseCtx {
         ParseCtxBuilder::default()
     }
 
-    /// What a source may call, or `None` if this load offers no effects.
-    fn host(&self) -> Option<&HostEffects> {
-        self.effects.as_ref()
+    /// The embedding's provider, or `None` if this load offers no host surface.
+    fn host(&self) -> Option<&dyn ParserHost> {
+        self.host.as_deref()
     }
 
     /// [`parse_tsx`] **in this context**, with the refusal handed back typed.
@@ -364,62 +391,105 @@ fn root_element(root_nodes: Vec<Node>) -> Option<Element> {
 
 // --- the effect scope (LIBHBUI_PLAN Rules 46a, 48) ----------------------------
 
-/// The effects a module may call: its `host:` **import declarations**, checked
-/// against what the load granted.
+/// What a module's **import declarations** resolved to, asked of the
+/// embedding's [`ParserHost`] once per parse.
 ///
-/// Built once per parse, from the module's own [`ImportDecl`] edges - *where
-/// each name came from*. A local name is carried alongside the namespace it
-/// came from and the name that namespace exports, so `import { navigate as go }`
-/// resolves `go` to `navigate`'s signature and the alias is gone by the time
+/// Built from the module's own [`ImportDecl`] edges - *where each name came
+/// from*. A local name bound from a granted host namespace is carried alongside
+/// the signature that namespace declares for it, so `import { frobnicate as fb }`
+/// resolves `fb` to `frobnicate`'s signature and the alias is gone by the time
 /// anything downstream reads it.
 ///
-/// **The declaration and the signature are two things, chained here.** This
-/// struct holds the first ([`ImportDecl`]-derived bindings) and borrows the
-/// second ([`HostEffects`]'s [`FuncSig`]s); [`EffectScope::resolve`] is the
-/// chain. Nothing may shortcut from a callee straight to a signature - that
-/// would be a name typed by something it was never imported from.
+/// **The declaration and the signature are two things, chained here.** The
+/// declaration binds a local name; the signature types the call. Nothing may
+/// shortcut from a callee straight to a signature - that would be a name typed
+/// by something it was never imported from - so [`EffectScope::resolve`] walks
+/// the declaration to a specifier first and only then to what the provider
+/// declares under it.
+///
+/// **A name imported from a Script or a package is remembered too**
+/// ([`EffectScope::foreign`]). Only a host namespace can supply an effect, but
+/// "you never imported that" and "you imported that from something compiled"
+/// are different facts about the source, and the provider is what lets the
+/// parse tell them apart.
 struct EffectScope<'a> {
-    /// The grant, or `None` if the context offers no effect surface at all -
-    /// in which case `locals` is empty, because every `host:` import was
-    /// refused before it could add one.
-    host: Option<&'a HostEffects>,
-    /// `(local, namespace, imported)`, in source order.
-    locals: Vec<(String, String, String)>,
+    /// `(local, imported, signature)` for every name bound from a granted host
+    /// namespace, in source order.
+    granted: Vec<(&'a str, &'a str, &'a FuncSig)>,
+    /// `(local, specifier)` for every name bound from a Script or a package.
+    foreign: Vec<(&'a str, &'a str)>,
+}
+
+/// What a local name was imported from.
+enum Bound<'a> {
+    /// A granted host import, and the signature that types the call.
+    Host(&'a FuncSig),
+    /// A Script or a package - imported, and unable to supply an effect.
+    Foreign(&'a str),
 }
 
 impl<'a> EffectScope<'a> {
-    /// The scope a module's imports open, refusing the ways a host import can
-    /// fail to be one (Rules 48, 49).
+    /// The scope a module's imports open, refusing the ways an import can fail
+    /// to be one the parse can honour (Rules 48, 49, 52).
     ///
-    /// Non-`host:` imports are left entirely alone: whether a specifier names a
-    /// real project Script is the consumer's question, not the parser's.
-    fn build(imports: &[ImportDecl], ctx: &'a ParseCtx) -> Result<Self, EffectError> {
-        let mut locals = Vec::new();
+    /// A non-host specifier the provider does not resolve is left entirely
+    /// alone: whether it names a real project Script has never been the
+    /// parser's question, and refusing it here would break every load that has
+    /// no Script registry to answer with.
+    fn build(imports: &'a [ImportDecl], ctx: &'a ParseCtx) -> Result<Self, EffectError> {
+        let mut granted = Vec::new();
+        let mut foreign = Vec::new();
         for decl in imports {
-            if !is_host_namespace(&decl.source) {
-                continue;
-            }
-            // A load that offers no effects at all is a different fact from one
-            // that grants some other namespace, and says so: the source asked
-            // for a surface this embedding does not have.
+            // A load that offers no host surface at all is a different fact
+            // from one whose provider does not resolve this specifier, and says
+            // so: the source asked for a surface this embedding does not have.
             let Some(host) = ctx.host() else {
-                return Err(EffectError::EffectsNotOffered {
-                    source: decl.source.clone(),
-                });
+                if is_host_namespace(&decl.source) {
+                    return Err(EffectError::EffectsNotOffered {
+                        source: decl.source.clone(),
+                    });
+                }
+                continue;
             };
-            // A `host:` specifier that nothing granted is neither a Script to
-            // compile nor a capability to grant, so it is refused at load
-            // rather than producing bindings that can never fire.
-            if host.namespace(&decl.source).is_none() {
-                return Err(EffectError::UnknownHostNamespace {
-                    source: decl.source.clone(),
-                });
-            }
+            let resolved = host.resolve(&decl.source);
+            let sigs = match resolved {
+                Some(Resolution::Host(sigs)) => {
+                    // The scheme is what tells the three answers apart before
+                    // anything consults the provider, so a grant spelled
+                    // without one could never be reached by an import.
+                    if !is_host_namespace(&decl.source) {
+                        return Err(EffectError::GrantedWithoutScheme {
+                            source: decl.source.clone(),
+                        });
+                    }
+                    sigs
+                }
+                // Compiled or fetched elsewhere, and supplying the parse
+                // nothing. A `host:` specifier answered this way is not granted
+                // at all, which is the same refusal as a specifier the provider
+                // does not know: a capability that resolves to something with a
+                // source behind it is not a capability.
+                other => {
+                    if is_host_namespace(&decl.source) {
+                        return Err(EffectError::UnknownHostNamespace {
+                            source: decl.source.clone(),
+                        });
+                    }
+                    if other.is_some() {
+                        foreign.extend(
+                            decl.names
+                                .iter()
+                                .map(|name| (name.local.as_str(), decl.source.as_str())),
+                        );
+                    }
+                    continue;
+                }
+            };
             for name in &decl.names {
-                // `import * as fx` / `import fx from`: `fx.navigate(...)` is a
-                // member expression and a callee is a flat name, so the only
+                // `import * as fx` / `import fx from`: `fx.frobnicate(...)` is
+                // a member expression and a callee is a flat name, so the only
                 // way such a binding could reach one is as the string
-                // "fx.navigate" - structure smuggled into a name.
+                // "fx.frobnicate" - structure smuggled into a name.
                 if name.kind != ImportKind::Named {
                     return Err(EffectError::NotANamedImport {
                         source: decl.source.clone(),
@@ -427,30 +497,28 @@ impl<'a> EffectScope<'a> {
                         kind: name.kind,
                     });
                 }
-                if host.declares(&decl.source, &name.imported).is_none() {
+                let Some(sig) = sigs.iter().find(|sig| sig.name == name.imported) else {
                     return Err(EffectError::UndeclaredHostImport {
                         source: decl.source.clone(),
                         imported: name.imported.clone(),
                     });
-                }
-                locals.push((
-                    name.local.clone(),
-                    decl.source.clone(),
-                    name.imported.clone(),
-                ));
+                };
+                granted.push((name.local.as_str(), name.imported.as_str(), sig));
             }
         }
-        Ok(Self {
-            host: ctx.host(),
-            locals,
-        })
+        Ok(Self { granted, foreign })
     }
 
-    /// The signature a local name resolves to, through the local->imported
-    /// chain.
-    fn resolve(&self, local: &str) -> Option<&FuncSig> {
-        let (_, namespace, imported) = self.locals.iter().find(|(name, _, _)| name == local)?;
-        self.host?.declares(namespace, imported)
+    /// What a local name was imported from, or `None` if this module imported
+    /// no such name at all.
+    fn resolve(&self, local: &str) -> Option<Bound<'a>> {
+        if let Some((_, _, sig)) = self.granted.iter().find(|(name, _, _)| *name == local) {
+            return Some(Bound::Host(sig));
+        }
+        self.foreign
+            .iter()
+            .find(|(name, _)| *name == local)
+            .map(|(_, source)| Bound::Foreign(source))
     }
 }
 
@@ -483,18 +551,32 @@ fn effect_attr(
     let callee = unparen(&call.callee);
     let Expression::Identifier(local) = callee else {
         // Anything that is not a bare name cannot resolve: a member expression
-        // (`fx.navigate`) is refused here rather than flattened into a callee
+        // (`fx.frobnicate`) is refused here rather than flattened into a callee
         // string, and a computed callee has no name to resolve at all.
         return Err(EffectError::Unresolved {
             attr: attr.to_string(),
             callee: expr_path(callee).unwrap_or_else(|| "a computed callee".to_string()),
         });
     };
-    let Some(sig) = scope.resolve(local.name.as_str()) else {
-        return Err(EffectError::Unresolved {
-            attr: attr.to_string(),
-            callee: local.name.to_string(),
-        });
+    let sig = match scope.resolve(local.name.as_str()) {
+        Some(Bound::Host(sig)) => sig,
+        // Imported, and from something with a source behind it. A Script is
+        // compiled and a host import is granted (Rule 48), so this names no
+        // signature - and saying "not imported" about a name the source plainly
+        // imports would be wrong about the source.
+        Some(Bound::Foreign(source)) => {
+            return Err(EffectError::NotAHostImport {
+                attr: attr.to_string(),
+                callee: local.name.to_string(),
+                source: source.to_string(),
+            });
+        }
+        None => {
+            return Err(EffectError::Unresolved {
+                attr: attr.to_string(),
+                callee: local.name.to_string(),
+            });
+        }
     };
 
     if call.arguments.len() != sig.params.len() {
@@ -1213,527 +1295,6 @@ mod tests {
         assert_eq!(back.imports[0].source, "Chat Feed");
     }
 
-    // --- effect bindings (LIBHBUI_PLAN Rules 46a, 48) -------------------------
-    //
-    // Every source below goes through the real parser. Several of them are
-    // hand-written malformations, which is Rule 43's exception - **the point IS
-    // the shape**: what is being ruled out is source an authoring surface could
-    // produce, so there is nothing else to parse them from.
-
-    /// What the host grants these tests: one string-taking `navigate`, and a
-    /// second effect with a numeric and a boolean parameter, so the type check
-    /// is exercised on more than one shape.
-    fn granted() -> HostEffects {
-        let mut host = HostEffects::granting(
-            "host:effects",
-            vec![FuncSig {
-                name: "navigate".into(),
-                params: vec![FieldDecl {
-                    name: "to".into(),
-                    ty: TypeShape::String,
-                    optional: false,
-                }],
-                result: None,
-            }],
-        );
-        host.grant(
-            "host:sheets",
-            vec![FuncSig {
-                name: "dismiss".into(),
-                params: vec![
-                    FieldDecl {
-                        name: "after".into(),
-                        ty: TypeShape::S32,
-                        optional: false,
-                    },
-                    FieldDecl {
-                        name: "animated".into(),
-                        ty: TypeShape::Bool,
-                        optional: false,
-                    },
-                ],
-                result: None,
-            }],
-        );
-        host
-    }
-
-    /// The context those grants are offered through - one value, built the one
-    /// way there is (Rule 49).
-    fn ctx() -> ParseCtx {
-        ParseCtx::builder().set_host(granted()).build()
-    }
-
-    /// The one attribute of the tree, for a source with exactly one element.
-    fn only_attr(src: &str) -> AttrValue {
-        let doc = ctx().parse_tsx(src).expect("parses");
-        let Node::Element(el) = &doc.root_nodes[0] else {
-            panic!("root is an element")
-        };
-        el.attrs
-            .iter()
-            .find(|(k, _)| is_event_binding(k))
-            .map(|(_, v)| v.clone())
-            .expect("the element declares an event binding")
-    }
-
-    /// What a source is refused with.
-    fn refusal(src: &str) -> EffectError {
-        match ctx().parse_tsx(src) {
-            Err(ParseError::Effect(e)) => e,
-            Err(ParseError::Syntax(d)) => panic!("the source does not even parse: {d:?}"),
-            Err(other) => panic!("refused, and not for an effect: {other}"),
-            Ok(doc) => panic!("accepted, and produced {doc:?}"),
-        }
-    }
-
-    /// **The whole authoring surface** (Rule 46a): `onTap={navigate("Chat")}`.
-    ///
-    /// The value the attribute carries is the *resolved* host name and its
-    /// lowered arguments - not the local name, not the source text, and not an
-    /// `Opaque`.
-    #[test]
-    fn an_event_binding_carries_a_named_effect() {
-        assert_eq!(
-            only_attr(
-                r#"
-                import { navigate } from "host:effects";
-                <Action id="a" onTap={navigate("Chat")} />
-                "#
-            ),
-            AttrValue::NamedEffect(NamedEffect {
-                name: "navigate".into(),
-                args: vec![crate::dag::Expr::LitStr("Chat".into())],
-            })
-        );
-
-        // An ALIAS is spent at the parse: `go` never travels. This is what
-        // "named" buys - the name in the graph is the host import's, so a
-        // reader resolves nothing and two sources that alias differently
-        // produce one value.
-        assert_eq!(
-            only_attr(
-                r#"
-                import { navigate as go } from "host:effects";
-                <Action id="a" onTap={go("Chat")} />
-                "#
-            ),
-            AttrValue::NamedEffect(NamedEffect {
-                name: "navigate".into(),
-                args: vec![crate::dag::Expr::LitStr("Chat".into())],
-            })
-        );
-
-        // The recognition rule is the attribute's NAME, not the tag and not a
-        // list: a second effect, on a different attribute, from a second
-        // namespace, needs nothing added anywhere. Its arguments lower against
-        // the DECLARED types - `0` becomes `LitS32`, not a float.
-        assert_eq!(
-            only_attr(
-                r#"
-                import { dismiss } from "host:sheets";
-                <Sheet id="a" onLongPress={dismiss(250, true)} />
-                "#
-            ),
-            AttrValue::NamedEffect(NamedEffect {
-                name: "dismiss".into(),
-                args: vec![
-                    crate::dag::Expr::LitS32(250),
-                    crate::dag::Expr::LitBool(true),
-                ],
-            })
-        );
-
-        // And an ordinary attribute is untouched by any of it.
-        let doc = ctx().parse_tsx(
-            r#"
-            import { navigate } from "host:effects";
-            <Action id="a" height={56} onTap={navigate("Chat")} label="Chat" />
-            "#,
-        )
-        .expect("parses");
-        let Node::Element(el) = &doc.root_nodes[0] else { panic!() };
-        assert_eq!(
-            el.attrs.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
-            vec!["id", "height", "onTap", "label"],
-            "attributes keep source order",
-        );
-        assert_eq!(el.attr("height"), Some(&AttrValue::Num(56.0)));
-        assert_eq!(el.attr("label"), Some(&AttrValue::Str("Chat".into())));
-    }
-
-    /// **Refusal 1.** An `on..` attribute whose value is not a call.
-    ///
-    /// Each of these parsed to `AttrValue::Opaque` or `AttrValue::Binding`
-    /// before the producer existed - an effect erased, and erased *silently*,
-    /// which is the failure this refusal is for. The withdrawn
-    /// `onTap={namedHandler}` spelling is in the list on purpose: it is the
-    /// most plausible wrong thing to write.
-    #[test]
-    fn an_event_binding_that_is_not_a_call_is_refused() {
-        for value in [
-            r#"onTap={goChat}"#,                 // a bare identifier
-            r#"onTap={() => navigate("Chat")}"#, // an arrow function
-            r#"onTap="Chat""#,                   // a string
-            r#"onTap"#,                          // valueless (would be `true`)
-            r#"onTap={"Chat"}"#,                 // a string in a container
-            r#"onTap={props.destination}"#,      // a data binding
-            r#"onTap={<Action/>}"#,              // an element
-            r#"onTap={navigate("Chat") && x}"#,  // a call inside an expression
-        ] {
-            let src = format!(
-                r#"
-                import {{ navigate }} from "host:effects";
-                <Action id="a" {value} />
-                "#
-            );
-            assert_eq!(
-                refusal(&src),
-                EffectError::NotACall {
-                    attr: "onTap".into()
-                },
-                "`{value}` was not refused as a non-call",
-            );
-        }
-    }
-
-    /// **Refusal 2.** A callee that does not resolve, through the import chain,
-    /// to a declared host import.
-    #[test]
-    fn a_callee_that_resolves_to_no_host_import_is_refused() {
-        // Never imported at all.
-        assert_eq!(
-            refusal(r#"<Action id="a" onTap={navigate("Chat")} />"#),
-            EffectError::Unresolved {
-                attr: "onTap".into(),
-                callee: "navigate".into(),
-            }
-        );
-        // Imported from a Script rather than granted by the host: a Script
-        // import is COMPILED and a host import is GRANTED, and only the second
-        // can be an effect (Rule 48).
-        assert_eq!(
-            refusal(
-                r#"
-                import { navigate } from "Nav Helpers";
-                <Action id="a" onTap={navigate("Chat")} />
-                "#
-            ),
-            EffectError::Unresolved {
-                attr: "onTap".into(),
-                callee: "navigate".into(),
-            }
-        );
-        // The LOCAL name is what resolves: an alias means the exported name no
-        // longer names anything in this module.
-        assert_eq!(
-            refusal(
-                r#"
-                import { navigate as go } from "host:effects";
-                <Action id="a" onTap={navigate("Chat")} />
-                "#
-            ),
-            EffectError::Unresolved {
-                attr: "onTap".into(),
-                callee: "navigate".into(),
-            }
-        );
-    }
-
-    /// **Refusal 3.** Argument count and type, against the `FuncSig`.
-    ///
-    /// This is the check that would have caught `navigate(target: S32)`
-    /// disagreeing with libhbui's string destinations by machine instead of by
-    /// reading.
-    #[test]
-    fn arguments_are_checked_against_the_declared_signature() {
-        let with = |call: &str| {
-            format!(
-                r#"
-                import {{ navigate }} from "host:effects";
-                import {{ dismiss }} from "host:sheets";
-                <Action id="a" onTap={{{call}}} />
-                "#
-            )
-        };
-        assert_eq!(
-            refusal(&with("navigate()")),
-            EffectError::ArgCount {
-                attr: "onTap".into(),
-                effect: "navigate".into(),
-                declared: 1,
-                given: 0,
-            }
-        );
-        assert_eq!(
-            refusal(&with(r#"navigate("Chat", "Threads")"#)),
-            EffectError::ArgCount {
-                attr: "onTap".into(),
-                effect: "navigate".into(),
-                declared: 1,
-                given: 2,
-            }
-        );
-        // A number where a stored symbol is declared - the exact disagreement.
-        assert_eq!(
-            refusal(&with("navigate(3)")),
-            EffectError::ArgType {
-                attr: "onTap".into(),
-                effect: "navigate".into(),
-                index: 0,
-                declared: TypeShape::String,
-            }
-        );
-        // And the reverse, on the second parameter, so the index is not
-        // always zero.
-        assert_eq!(
-            refusal(&with(r#"dismiss(250, "yes")"#)),
-            EffectError::ArgType {
-                attr: "onTap".into(),
-                effect: "dismiss".into(),
-                index: 1,
-                declared: TypeShape::Bool,
-            }
-        );
-        // A fractional literal is not an S32, and is refused rather than
-        // truncated: a silently rounded argument is a different call.
-        assert_eq!(
-            refusal(&with("dismiss(2.5, true)")),
-            EffectError::ArgType {
-                attr: "onTap".into(),
-                effect: "dismiss".into(),
-                index: 0,
-                declared: TypeShape::S32,
-            }
-        );
-        // Not a literal at all. An effect call is not an expression language;
-        // a computation is a Module, referenced opaquely (Rule 46a).
-        for arg in ["props.destination", "1 + 2", "f()", "`Chat`"] {
-            assert_eq!(
-                refusal(&with(&format!("navigate({arg})"))),
-                EffectError::ArgNotALiteral {
-                    attr: "onTap".into(),
-                    effect: "navigate".into(),
-                    index: 0,
-                },
-                "`{arg}` was not refused as a non-literal",
-            );
-        }
-    }
-
-    /// **Refusal 4.** A host namespace bound by `import * as` (or a default
-    /// import): `fx.navigate(...)` cannot reach a flat callee except as the
-    /// string `"fx.navigate"`, which is structure smuggled into a name.
-    #[test]
-    fn a_host_namespace_bound_as_a_namespace_is_refused() {
-        assert_eq!(
-            refusal(
-                r#"
-                import * as fx from "host:effects";
-                <Action id="a" onTap={fx.navigate("Chat")} />
-                "#
-            ),
-            EffectError::NotANamedImport {
-                source: "host:effects".into(),
-                local: "fx".into(),
-                kind: ImportKind::Namespace,
-            }
-        );
-        assert_eq!(
-            refusal(
-                r#"
-                import fx from "host:effects";
-                <Action id="a" onTap={fx("Chat")} />
-                "#
-            ),
-            EffectError::NotANamedImport {
-                source: "host:effects".into(),
-                local: "fx".into(),
-                kind: ImportKind::Default,
-            }
-        );
-        // The refusal is about the IMPORT, so it fires whether or not anything
-        // calls through it - a binding that could never name an effect is a
-        // mistake at the line that wrote it.
-        assert_eq!(
-            refusal(
-                r#"
-                import * as fx from "host:effects";
-                <Action id="a" />
-                "#
-            ),
-            EffectError::NotANamedImport {
-                source: "host:effects".into(),
-                local: "fx".into(),
-                kind: ImportKind::Namespace,
-            }
-        );
-        // A member-expression callee with no host import behind it is
-        // unresolved rather than accepted - the flat-callee rule holds even
-        // where no namespace import is in sight.
-        assert_eq!(
-            refusal(r#"<Action id="a" onTap={fx.navigate("Chat")} />"#),
-            EffectError::Unresolved {
-                attr: "onTap".into(),
-                callee: "fx.navigate".into(),
-            }
-        );
-    }
-
-    /// **Rule 48 at the import line.** A `host:` specifier names a granted
-    /// namespace and a name that namespace declares, or it is refused at load -
-    /// rather than producing a binding that can never fire.
-    #[test]
-    fn a_host_import_is_granted_or_refused() {
-        assert_eq!(
-            refusal(
-                r#"
-                import { navigate } from "host:telemetry";
-                <Action id="a" />
-                "#
-            ),
-            EffectError::UnknownHostNamespace {
-                source: "host:telemetry".into(),
-            }
-        );
-        assert_eq!(
-            refusal(
-                r#"
-                import { teleport } from "host:effects";
-                <Action id="a" />
-                "#
-            ),
-            EffectError::UndeclaredHostImport {
-                source: "host:effects".into(),
-                imported: "teleport".into(),
-            }
-        );
-
-        // A Script import is not touched by any of this: it has a source, it is
-        // compiled, and resolving it is the consumer's job as it always was.
-        let doc = ctx().parse_tsx(
-            r#"
-            import { libraryFeed } from "Library Feed";
-            <List value={libraryFeed} />
-            "#,
-        )
-        .expect("a Script import is not a host import");
-        assert_eq!(doc.imports[0].source, "Library Feed");
-    }
-
-    /// **Nothing granted is the honest default.** [`parse_tsx`] grants nothing,
-    /// so a source that calls an effect has named a capability it was not
-    /// given - and says so, rather than erasing the call.
-    ///
-    /// The two "nothings" are different facts and say so separately (Rule 49):
-    /// a context with the surface *enabled* and this namespace ungranted is
-    /// [`EffectError::UnknownHostNamespace`]; the default context, which offers
-    /// no surface at all, is [`EffectError::EffectsNotOffered`].
-    #[test]
-    fn with_nothing_granted_an_effect_does_not_resolve() {
-        let src = r#"
-            import { navigate } from "host:effects";
-            <Action id="a" onTap={navigate("Chat")} />
-        "#;
-        assert_eq!(
-            ParseCtx::builder().enable_effects().build().parse_tsx(src),
-            Err(ParseError::Effect(EffectError::UnknownHostNamespace {
-                source: "host:effects".into(),
-            }))
-        );
-        assert_eq!(
-            ParseCtx::default().parse_tsx(src),
-            Err(ParseError::Effect(EffectError::EffectsNotOffered {
-                source: "host:effects".into(),
-            }))
-        );
-        // Through the untyped entry point the same refusal arrives as a
-        // message, so no caller silently gets a document.
-        let messages = parse_tsx(src).expect_err("refused");
-        assert_eq!(messages.len(), 1);
-        assert!(messages[0].contains("host:effects"), "{messages:?}");
-        assert!(messages[0].is_ascii(), "{messages:?}");
-
-        // And a source with no effects at all is unaffected by the rule.
-        assert!(parse_tsx(r#"<Screen name="Home"><Item /></Screen>"#).is_ok());
-    }
-
-    /// **What the parser produced is what serializes**, effects included. The
-    /// same claim `a_parsed_document_round_trips_through_serde` makes, on the
-    /// one attribute value that has a nested shape.
-    #[test]
-    fn a_parsed_effect_survives_serde() {
-        let doc = ctx().parse_tsx(
-            r#"
-            import { navigate } from "host:effects";
-            <Drawer id="d1"><Action id="d2" onTap={navigate("Chat")} /></Drawer>
-            "#,
-        )
-        .expect("parses");
-        let json = serde_json::to_string(&doc).expect("serialize");
-        let back: TsxDocument = serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(doc, back);
-
-        let Node::Element(drawer) = &back.root_nodes[0] else { panic!() };
-        let Node::Element(row) = &drawer.children[0] else { panic!() };
-        assert_eq!(
-            row.attr("onTap"),
-            Some(&AttrValue::NamedEffect(NamedEffect {
-                name: "navigate".into(),
-                args: vec![crate::dag::Expr::LitStr("Chat".into())],
-            })),
-            "the effect did not survive the round trip",
-        );
-    }
-
-    /// Every refusal renders ASCII (Rule 39): these strings reach the editor's
-    /// live-parse status strip and panic dumps.
-    #[test]
-    fn every_effect_refusal_renders_ascii() {
-        for e in [
-            EffectError::NotACall { attr: "onTap".into() },
-            EffectError::Unresolved {
-                attr: "onTap".into(),
-                callee: "navigate".into(),
-            },
-            EffectError::ArgCount {
-                attr: "onTap".into(),
-                effect: "navigate".into(),
-                declared: 1,
-                given: 0,
-            },
-            EffectError::ArgType {
-                attr: "onTap".into(),
-                effect: "navigate".into(),
-                index: 0,
-                declared: TypeShape::String,
-            },
-            EffectError::ArgNotALiteral {
-                attr: "onTap".into(),
-                effect: "navigate".into(),
-                index: 0,
-            },
-            EffectError::NotANamedImport {
-                source: "host:effects".into(),
-                local: "fx".into(),
-                kind: ImportKind::Namespace,
-            },
-            EffectError::UnknownHostNamespace {
-                source: "host:x".into(),
-            },
-            EffectError::UndeclaredHostImport {
-                source: "host:effects".into(),
-                imported: "teleport".into(),
-            },
-            EffectError::EffectsNotOffered {
-                source: "host:effects".into(),
-            },
-            EffectError::SpreadAttribute { tag: "Action".into() },
-        ] {
-            assert!(e.to_string().is_ascii(), "{e:?}");
-            assert!(!e.to_string().is_empty());
-        }
-    }
 
     #[test]
     fn parse_app_is_deterministic_and_reports_bad_screens() {
@@ -1751,91 +1312,5 @@ mod tests {
             parse_app("// no app root", &[r#"<Screen name="A" />"#]).unwrap_err(),
             vec!["app source has no root element".to_string()],
         );
-    }
-
-    /// **RULE 49's whole argument.** One context, configured once, serves every
-    /// entry point - so a capability enabled for [`ParseCtx::parse_tsx`] is
-    /// available to [`ParseCtx::parse_app`] without anybody extending a third
-    /// function.
-    ///
-    /// The multi-file path could not express an effect at all before this: its
-    /// predecessor called the ungranted `parse_tsx`, so a screen file's
-    /// `onTap={navigate("Chat")}` was refused however the embedding was
-    /// configured. Both halves are asserted here, because "the app parses" on
-    /// its own would also pass if the parse had simply become lenient.
-    #[test]
-    fn one_context_serves_parse_app_as_well_as_parse_tsx() {
-        let app = "<App />";
-        let screen = r#"
-            import { navigate } from "host:effects";
-            <Screen name="Home"><Action id="a" onTap={navigate("Chat")} /></Screen>
-        "#;
-
-        let doc = ctx().parse_app(app, &[screen]).expect("the grant reaches a screen file");
-        let Node::Element(root) = &doc.root_nodes[0] else {
-            panic!("the app root is an element")
-        };
-        let Node::Element(spliced) = &root.children[0] else {
-            panic!("the screen is spliced in as an element")
-        };
-        let Node::Element(action) = &spliced.children[0] else {
-            panic!("the action is the screen's child")
-        };
-        assert_eq!(
-            action.attr("onTap"),
-            Some(&AttrValue::NamedEffect(NamedEffect {
-                name: "navigate".into(),
-                args: vec![crate::dag::Expr::LitStr("Chat".into())],
-            })),
-            "the effect did not survive the splice",
-        );
-
-        // And the default context still refuses the same source, so what made
-        // the difference was the grant rather than a lenient parse.
-        assert_eq!(
-            ParseCtx::default().parse_app(app, &[screen]),
-            Err(ParseError::Effect(EffectError::EffectsNotOffered {
-                source: "host:effects".into(),
-            }))
-        );
-    }
-
-    /// **A spread attribute is refused** (Rule 46a's remaining door).
-    ///
-    /// `const handlers = { onTap: navigate("Chat") }` then
-    /// `<Action {...handlers}/>` used to parse clean and yield an `<Action>`
-    /// with **no binding**: the attribute loop only ever saw
-    /// `JSXAttributeItem::Attribute`, so a `SpreadAttribute` fell off the end
-    /// and `is_event_binding` was never consulted. That is the erasure the
-    /// `NamedEffect` producer exists to close, arriving by the one route none
-    /// of its refusals watch.
-    ///
-    /// Hand-written source, and Rule 43's exception applies - **the point IS
-    /// the shape**: what is ruled out is a spelling the authoring surface must
-    /// refuse, so there is nothing else to parse it from.
-    #[test]
-    fn a_spread_attribute_is_refused() {
-        // The erasure itself: an effect that reaches the element as nothing.
-        assert_eq!(
-            refusal(
-                r#"
-                import { navigate } from "host:effects";
-                const handlers = { onTap: navigate("Chat") };
-                <Action id="a" {...handlers} />
-                "#
-            ),
-            EffectError::SpreadAttribute { tag: "Action".into() }
-        );
-        // The refusal is about the SPREAD, not about effects: an attribute set
-        // spread from a value cannot be checked against declared props either,
-        // so it is refused with nothing granted and on a nested element too.
-        assert_eq!(
-            ParseCtx::default().parse_tsx(r#"<Screen name="Home"><Item {...props} /></Screen>"#),
-            Err(ParseError::Effect(EffectError::SpreadAttribute {
-                tag: "Item".into()
-            }))
-        );
-        // An ordinary attribute list is untouched by the rule.
-        assert!(parse_tsx(r#"<Item id="a" label="Hi" />"#).is_ok());
     }
 }

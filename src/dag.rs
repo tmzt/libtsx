@@ -19,11 +19,15 @@
 //!   restricted semantic AST that projects symmetrically across language
 //!   views and synthesizes directly to wasm. Complex Modules are *not*
 //!   represented here; they are opaque native-language units by design.
-//! * **Effect bindings** ([`NamedEffect`], [`AttrValue::NamedEffect`],
-//!   [`HostEffects`]) - `onTap={navigate("Chat")}`: an [`is_event_binding`]
-//!   attribute whose value is ONE call resolving to a granted host import.
-//!   Deliberately *not* a handler and not a body - see [`NamedEffect`] and
-//!   [`HOST_PREFIX`] (LIBHBUI_PLAN Rules 46, 46a, 48).
+//! * **Effect bindings** ([`NamedEffect`], [`AttrValue::NamedEffect`]) -
+//!   `onGrommet={frobnicate("sprocket")}`: an [`is_event_binding`] attribute whose value
+//!   is ONE call resolving to a granted host import. Deliberately *not* a
+//!   handler and not a body - see [`NamedEffect`] and [`HOST_PREFIX`]
+//!   (LIBHBUI_PLAN Rules 46, 46a, 48).
+//! * **The embedding's provider** ([`ParserHost`], [`Resolution`]) - what a
+//!   module specifier resolves to. Not graph data: it is the question the
+//!   parse asks whoever embeds it, and the reason no name from any embedding's
+//!   model appears in this crate (Rule 52).
 //!
 //! Every type here is serde-serializable and free of parser dependencies:
 //! `dag` is available with `default-features = false`, so a consumer that only
@@ -97,11 +101,12 @@ pub struct InterfaceDecl {
 /// later).
 ///
 /// **This is *where a name came from*, and nothing more.** It carries no
-/// signature: what the name may be *called as* lives in a [`FuncSig`] - in
-/// [`HostEffects`] for a granted host namespace, in [`DagModule::imports`] once
-/// a module is assembled. The two are chained, never interchangeable: a local
-/// name resolves through this declaration to a namespace and an exported name,
-/// and only then to the signature that types the call.
+/// signature: what the name may be *called as* lives in a [`FuncSig`] - behind
+/// [`Resolution::Host`] for a granted host namespace, in
+/// [`DagModule::imports`] once a module is assembled. The two are chained,
+/// never interchangeable: a local name resolves through this declaration to a
+/// namespace and an exported name, and only then to the signature that types
+/// the call.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ImportDecl {
     /// The module specifier string (`from "…"`) — a Script's display name in the
@@ -190,8 +195,12 @@ pub enum AttrValue {
     Binding(String),
     /// An expression we don't lower (element/fragment/complex expr).
     Opaque,
-    /// `onTap={navigate("Chat")}` - an **effect binding** (LIBHBUI_PLAN
-    /// Rules 46, 46a, 48).
+    /// `onGrommet={frobnicate("sprocket")}` - an **effect binding**
+    /// (LIBHBUI_PLAN Rules 46, 46a, 48).
+    ///
+    /// The names in that spelling are libtsx's own placeholders and belong to
+    /// no embedding: what an attribute or an imported name MEANS is the
+    /// embedding's model (Rule 52, [`ParserHost`]).
     ///
     /// The attribute name matched [`is_event_binding`], so the author declared
     /// an event binding; the value was one call expression resolving to a
@@ -249,9 +258,9 @@ pub fn is_event_binding(attr: &str) -> bool {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NamedEffect {
     /// The host import's **exported** name - the `imported` half of the import
-    /// chain, so `import { navigate as go }` and a call to `go(..)` both arrive
-    /// here as `navigate`. An alias is resolved once, at parse, rather than at
-    /// every reader.
+    /// chain, so `import { frobnicate as fb }` and a call to `fb(..)` both
+    /// arrive here as `frobnicate`. An alias is resolved once, at parse, rather
+    /// than at every reader.
     pub name: String,
     /// The call's arguments, in source order, lowered against the declared
     /// parameter types. Literals only - an effect is not an expression
@@ -259,72 +268,64 @@ pub struct NamedEffect {
     pub args: Vec<Expr>,
 }
 
-/// The host imports a load **grants**: namespace -> the signatures it declares
-/// (LIBHBUI_PLAN Rule 48).
+/// **What an import specifier resolves to** - the one question the parse asks
+/// its embedding (LIBHBUI_PLAN Rules 48, 52).
 ///
-/// Not graph data and deliberately not serialized. A grant is what the *host*
-/// offers a source, so it arrives from the embedding rather than out of the
-/// document - which is the difference between a Script import (compiled) and a
-/// host import (granted). `libhbui` declares the one it implements.
-///
-/// **What this does not know.** Whether a non-host specifier names a real
-/// project Script is the consumer's question, not the parser's, so a
-/// non-`host:` import is left alone here exactly as it always has been. What
-/// *is* checkable at parse - and now is - is that a `host:` specifier names a
-/// granted namespace, that its bindings are named imports of signatures the
-/// namespace declares, and that a call through one matches its signature.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct HostEffects {
-    granted: Vec<(String, Vec<FuncSig>)>,
+/// Rule 48 names three answers and this is all three. They are kept apart
+/// because the parse does different things with them: a Script and a package
+/// are *compiled* or *fetched* by somebody else and supply the parse nothing,
+/// while a host namespace is *granted* and is the only kind that can supply an
+/// effect's signature.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Resolution<'a> {
+    /// A **Script** in the Highbay module system, named by its display name.
+    /// Compiled elsewhere; nothing here reads it.
+    Script,
+    /// A real **package path**. Resolved outside the parse, exactly as it
+    /// always has been.
+    Package,
+    /// A **granted host namespace** and the signatures it declares - an import
+    /// with no source, whose qualified name *is* its identity (Rule 48).
+    ///
+    /// The only answer that supplies anything an effect call can resolve
+    /// against.
+    Host(&'a [FuncSig]),
 }
 
-impl HostEffects {
-    /// Nothing granted: every `host:` import is refused, and every effect call
-    /// is unresolved.
+/// **The parser's package provider**: what the embedding tells the parse about
+/// a module specifier (LIBHBUI_PLAN Rule 52).
+///
+/// Named for its DEFINER. The parser is the thing that needs a host, and
+/// whoever embeds the parser supplies one; a trait here named for its one
+/// current implementor would be libtsx naming its client, which is the shape
+/// that invites a dependency cycle even where there is not one yet.
+///
+/// **It is a package provider, not an effects grant.** The parser's actual
+/// question is *what does this specifier resolve to*, and one provider answers
+/// all three of Rule 48's answers ([`Resolution`]). Building it effects-first
+/// would need `set_script_resolver` next and a third setter after that - a
+/// family of setters inside the very interface introduced to stop one
+/// (Rule 49's defect one level down).
+///
+/// **libtsx knows the SHAPE, never the NAMES.** This crate knows that an
+/// `on[A-Z]*` attribute carries a named call with literal arguments, that a
+/// `host:` specifier is spelled with a scheme ([`HOST_PREFIX`]), and that
+/// arguments are checked against a [`FuncSig`] it is handed. WHICH attribute
+/// names an event, WHICH imported name is an effect, and what lives under a
+/// given host namespace are the *model*, and the model belongs to the
+/// embedding. libtsx's own tests therefore run against a mock provider
+/// granting a vocabulary no embedding uses, so a name leaking down here fails
+/// a test instead of passing unnoticed.
+pub trait ParserHost {
+    /// What this specifier resolves to, or `None` for one this provider does
+    /// not resolve at all.
     ///
-    /// The honest default rather than a lenient one. A source that calls an
-    /// effect nothing granted it has named a capability it was not given, and
-    /// that is a refusal at the point it is written.
-    pub fn none() -> Self {
-        Self::default()
-    }
-
-    /// One granted namespace and the imports it declares.
-    ///
-    /// # Panics
-    ///
-    /// If `namespace` is not spelled as a host namespace ([`HOST_PREFIX`]) - a
-    /// grant that no import could ever name is a mistake in the embedding, and
-    /// a silent one would look exactly like an effect that does not resolve.
-    pub fn granting(namespace: impl Into<String>, imports: Vec<FuncSig>) -> Self {
-        let mut host = Self::none();
-        host.grant(namespace, imports);
-        host
-    }
-
-    /// Grant another namespace. See [`HostEffects::granting`] for the panic.
-    pub fn grant(&mut self, namespace: impl Into<String>, imports: Vec<FuncSig>) {
-        let namespace = namespace.into();
-        assert!(
-            is_host_namespace(&namespace),
-            "`{namespace}` is granted as a host namespace and is not spelled as one (`{HOST_PREFIX}...`)"
-        );
-        self.granted.push((namespace, imports));
-    }
-
-    /// The signatures a granted namespace declares, or `None` if nothing
-    /// grants it.
-    pub fn namespace(&self, source: &str) -> Option<&[FuncSig]> {
-        self.granted
-            .iter()
-            .find(|(name, _)| name == source)
-            .map(|(_, sigs)| sigs.as_slice())
-    }
-
-    /// The signature a granted namespace declares under this exported name.
-    pub fn declares(&self, namespace: &str, name: &str) -> Option<&FuncSig> {
-        self.namespace(namespace)?.iter().find(|s| s.name == name)
-    }
+    /// `None` is not "refuse it": a specifier is only refused where the parse
+    /// can tell it is wrong, which is when its **scheme** says host and the
+    /// provider does not grant it. A non-host specifier the provider does not
+    /// know is left alone, because whether it names a real Script has never
+    /// been the parser's question.
+    fn resolve(&self, specifier: &str) -> Option<Resolution<'_>>;
 }
 
 /// Why an effect binding cannot mean what it says (LIBHBUI_PLAN Rules 46a, 48).
@@ -350,6 +351,35 @@ pub enum EffectError {
         attr: String,
         /// The callee as written.
         callee: String,
+    },
+    /// The callee names something this module **did** import - and imported
+    /// from a Script or a package rather than from a granted host namespace
+    /// ([`Resolution`]).
+    ///
+    /// A Script is compiled and a host import is granted (Rule 48); only the
+    /// second has a [`FuncSig`] for the call to be checked against, so this is
+    /// a different fact from [`EffectError::Unresolved`] and says so. Without
+    /// the provider it could only be reported as "not imported", which is
+    /// wrong about the source in the way most likely to waste a reader's time.
+    NotAHostImport {
+        /// The attribute that announced an effect.
+        attr: String,
+        /// The callee as written.
+        callee: String,
+        /// The specifier it was imported from.
+        source: String,
+    },
+    /// The provider resolved a specifier to a granted host namespace
+    /// ([`Resolution::Host`]) that is **not spelled as one** ([`HOST_PREFIX`]).
+    ///
+    /// A mistake in the embedding, not in the source. The scheme is what lets
+    /// the parse tell a granted host import from a Script *before* consulting
+    /// the provider, so a grant no import could ever be recognised as one is a
+    /// capability nothing can reach - and a silent one looks exactly like an
+    /// effect that does not resolve.
+    GrantedWithoutScheme {
+        /// The specifier the provider granted.
+        source: String,
     },
     /// The call supplies a different number of arguments than the signature
     /// declares.
@@ -388,10 +418,10 @@ pub enum EffectError {
     },
     /// A host namespace bound by `import * as fx` or `import fx from`.
     ///
-    /// `fx.navigate(..)` is a member expression and [`Expr::Call`]'s callee is a
-    /// flat `String`; encoding `"fx.navigate"` into it would be structure
-    /// smuggled into a name. Named imports only, until a callee carries a path
-    /// properly.
+    /// `fx.frobnicate(..)` is a member expression and [`Expr::Call`]'s callee
+    /// is a flat `String`; encoding `"fx.frobnicate"` into it would be
+    /// structure smuggled into a name. Named imports only, until a callee
+    /// carries a path properly.
     NotANamedImport {
         /// The host namespace.
         source: String,
@@ -430,7 +460,7 @@ pub enum EffectError {
     ///
     /// Refused rather than skipped, and the reason is Rule 46a's: a spread's
     /// contents are not statically known, so `{...handlers}` where
-    /// `handlers = { onTap: navigate("Chat") }` would reach an element as *no
+    /// `handlers = { onGrommet: frobnicate("x") }` would reach an element as *no
     /// attribute at all*. The attribute loop never sees an `on..` name, so
     /// every refusal above is blind to it, and the effect is erased by exactly
     /// the route the [`AttrValue::NamedEffect`] producer exists to close.
@@ -457,6 +487,18 @@ impl std::fmt::Display for EffectError {
             Self::Unresolved { attr, callee } => write!(
                 f,
                 "`{attr}` calls `{callee}`, which is not an imported host effect"
+            ),
+            Self::NotAHostImport {
+                attr,
+                callee,
+                source,
+            } => write!(
+                f,
+                "`{attr}` calls `{callee}`, imported from `{source}`, which is compiled rather than granted"
+            ),
+            Self::GrantedWithoutScheme { source } => write!(
+                f,
+                "`{source}` is granted as a host namespace and is not spelled as one (`{HOST_PREFIX}...`)"
             ),
             Self::ArgCount {
                 attr,
@@ -868,21 +910,22 @@ mod tests {
                     },
                 ],
             }],
-            // `navigate` takes the destination's STORED SYMBOL (LIBHBUI_PLAN
-            // Rule 9), so its parameter is a string. It read `S32` here until
-            // the effect producer landed, which disagreed with every real
-            // destination in the system - `navigate(0)` names nothing.
+            // A DELIBERATELY MADE-UP HOST IMPORT (Rule 52). This sample used to
+            // declare `navigate`, which is libhbui's vocabulary, in libtsx's own
+            // documentation - and a sample is what the next reader copies. The
+            // name below is obviously a placeholder precisely so nothing here
+            // reads as a statement about what a real host grants.
             //
             // WHAT IS CHECKED, AND WHAT IS NOT. The signature check lives in
             // `parse::effect_attr` and covers an effect **attribute**:
-            // `onTap={navigate("Chat")}` is resolved through its `ImportDecl`
+            // an `on..` attribute's value is resolved through its `ImportDecl`
             // to a namespace and an exported name, and its arguments checked
-            // against the `FuncSig` the host grants. Nothing checks a
+            // against the `FuncSig` the provider grants. Nothing checks a
             // `HandlerDecl` body - no pass walks `Stmt`/`Expr::Call` and looks
-            // the callee up in a signature list - so the `navigate(LitStr(..))`
-            // below agrees with this one only because the test named at the end
-            // of this comment asserts it. Every libtsx and libhbui test stayed
-            // green with the two disagreeing.
+            // the callee up in a signature list - so the call below agrees with
+            // this signature only because the test named at the end of this
+            // comment asserts it. Every libtsx and libhbui test stayed green
+            // with the two disagreeing.
             //
             // THAT IS NOT A GAP TO BE FILLED. Under Rule 46a the authoring
             // surface has no handlers at all - an effect is one call expression
@@ -896,9 +939,9 @@ mod tests {
             // `the_samples_hand_written_handler_agrees_with_the_signatures_beside_it`
             // and by nothing in the library.
             imports: vec![FuncSig {
-                name: "navigate".into(),
+                name: "exampleHostCall".into(),
                 params: vec![FieldDecl {
-                    name: "to".into(),
+                    name: "subject".into(),
                     ty: TypeShape::String,
                     optional: false,
                 }],
@@ -916,8 +959,8 @@ mod tests {
                 },
                 body: vec![
                     Stmt::Expr(Expr::Call {
-                        callee: "navigate".into(),
-                        args: vec![Expr::LitStr("Chat".into())],
+                        callee: "exampleHostCall".into(),
+                        args: vec![Expr::LitStr("an example subject".into())],
                     }),
                     Stmt::Return(Some(Expr::Bin {
                         op: BinOp::Add,
@@ -947,9 +990,9 @@ mod tests {
     /// rather than a gap. So this is **not** a handler-body checker, nor the
     /// seed of one - the sample below is the only `HandlerDecl` in existence,
     /// and this test exists because that makes it the only thing that can
-    /// disagree with itself. `sample_module` carried `navigate(target: S32)`
-    /// beside a call passing `LitStr("Chat")` with every test in the workspace
-    /// green.
+    /// disagree with itself. `sample_module` carried a signature declaring an
+    /// `S32` parameter beside a call passing a `LitStr` with every test in the
+    /// workspace green.
     ///
     /// The two "imports" it touches are different things and are used as such:
     /// the callee is a name, and [`DagModule::imports`] is a list of
@@ -1032,10 +1075,13 @@ mod tests {
                 ("loading".into(), AttrValue::Bool(true)),
                 ("style".into(), AttrValue::Opaque),
                 (
-                    "onTap".into(),
+                    // A placeholder vocabulary, deliberately (Rule 52): a
+                    // fixture in libtsx that spelled an embedding's real effect
+                    // would be the leak this crate's tests exist to catch.
+                    "onGrommet".into(),
                     AttrValue::NamedEffect(NamedEffect {
-                        name: "navigate".into(),
-                        args: vec![Expr::LitStr("Chat".into())],
+                        name: "frobnicate".into(),
+                        args: vec![Expr::LitStr("sprocket".into())],
                     }),
                 ),
             ],
@@ -1241,40 +1287,22 @@ mod tests {
         }
     }
 
-    /// A grant is what the host offers; a namespace nothing grants declares
-    /// nothing, and a granted one declares only what it was given.
+    /// **The scheme is shape, not a name** (Rule 52). It is what lets the parse
+    /// tell Rule 48's three answers apart *before* it consults a provider, and
+    /// it is the only thing about a host namespace this crate knows: what lives
+    /// under the scheme is the embedding's model.
+    ///
+    /// The near misses are the point - a display name, a relative path and a
+    /// scoped package all name something with a source behind it.
     #[test]
-    fn a_host_grant_answers_only_for_what_it_granted() {
-        let navigate = FuncSig {
-            name: "navigate".into(),
-            params: vec![FieldDecl {
-                name: "to".into(),
-                ty: TypeShape::String,
-                optional: false,
-            }],
-            result: None,
-        };
-        let host = HostEffects::granting("host:effects", vec![navigate.clone()]);
-        assert_eq!(host.declares("host:effects", "navigate"), Some(&navigate));
-        assert_eq!(host.declares("host:effects", "teleport"), None);
-        assert_eq!(host.declares("host:other", "navigate"), None);
-        assert_eq!(host.namespace("host:other"), None);
-        assert_eq!(HostEffects::none().declares("host:effects", "navigate"), None);
-
-        // The specifier form is what tells a host namespace from a Script's
-        // display name or a package path (Rule 48).
-        assert!(is_host_namespace("host:effects"));
+    fn a_host_namespace_is_told_apart_by_its_scheme() {
+        assert!(is_host_namespace("host:zork"));
+        assert!(is_host_namespace("host:anything-at-all"));
         assert!(!is_host_namespace("Library Feed"));
         assert!(!is_host_namespace("./widgets/UserCard"));
         assert!(!is_host_namespace("@highbay/effects"));
-    }
-
-    /// A grant no import could ever name is a mistake in the embedding, and a
-    /// silent one is indistinguishable from an effect that does not resolve.
-    #[test]
-    #[should_panic(expected = "is granted as a host namespace")]
-    fn granting_a_namespace_that_is_not_one_is_a_mistake() {
-        HostEffects::granting("Library Feed", vec![]);
+        assert!(!is_host_namespace("hosted:effects"));
+        assert!(!is_host_namespace(""));
     }
 
     #[test]
