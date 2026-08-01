@@ -6,16 +6,32 @@
 //! API: consumers get plain, serde-serializable Rust data.
 //!
 //! Scope (deliberately minimal, forward-compatible):
+//! * **The element tree** — [`Element`], [`Node`], [`AttrValue`] and the
+//!   whole-document [`TsxDocument`] that holds it. The authored UI itself:
+//!   tag, type arguments, attributes in source order, children in source
+//!   order.
 //! * **TS `interface` declarations** — name, fields, optionality, nested
 //!   shapes ([`InterfaceDecl`], [`TypeShape`]). These are the Props shapes
 //!   that project into WIT records and generated forms.
+//! * **`import` edges** ([`ImportDecl`]) — the typed references a module makes
+//!   to the providers it consumes.
 //! * **Simple event-handler ops** ([`HandlerDecl`], [`Stmt`], [`Expr`]) — the
 //!   restricted semantic AST that projects symmetrically across language
 //!   views and synthesizes directly to wasm. Complex Modules are *not*
 //!   represented here; they are opaque native-language units by design.
 //!
-//! The parser upgrade that *produces* these values from TSX source is a later
-//! phase; this module is types + serde only.
+//! Every type here is serde-serializable and free of parser dependencies:
+//! `dag` is available with `default-features = false`, so a consumer that only
+//! reads and writes the graph never links oxc. The oxc-backed [`crate::parse`]
+//! module *produces* these values; it does not own any of them.
+//!
+//! **Why the element tree lives here and not in `parse`.** It is the same
+//! reason [`ImportDecl`] does: what the parser yields is graph data, and a
+//! graph type that only exists when the parser feature is on is a graph type
+//! half the stack cannot name. The serialized Highbay format *is* this module
+//! in postcard form (LIBHBUI_PLAN Rule 20), and a definition exposes exactly
+//! one [`Element`] as its UI (Rule 18) — both of which require the element
+//! tree to be a `dag` type, not a parse-result type.
 
 use serde::{Deserialize, Serialize};
 
@@ -87,6 +103,88 @@ pub enum ImportKind {
     Default,
     /// `import * as local from "src"`.
     Namespace,
+}
+
+/// A parsed JSX element with ordered attributes and children — **the authored
+/// UI itself**, and the one node kind a definition exposes as its UI
+/// (LIBHBUI_PLAN Rule 18).
+///
+/// Nothing here is filtered or normalized on the way in: attributes keep source
+/// order, children keep source order, and a generic element keeps its type
+/// arguments. A serialization of an `Element` is therefore the element as
+/// authored, which is what makes graph -> TSX a real direction rather than an
+/// aspiration.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Element {
+    /// The tag name (e.g. `List`, `Content`, `A.B` for member tags).
+    pub tag: String,
+    /// The element's **type arguments** — the `Message` in `<List<Message>>`
+    /// (TypeScript's generic JSX form, TS 2.9+), in source order. Empty for the
+    /// ordinary non-generic spelling, which is every element that does not
+    /// write one.
+    ///
+    /// Lowered through the same [`TypeShape`] mapping an `interface` field's
+    /// type takes, so `<List<Message>>` is `[TypeShape::Named("Message")]` and
+    /// `<List<string>>` is `[TypeShape::String]` — one type vocabulary, not a
+    /// second one for the type-argument position.
+    ///
+    /// **Why this is parsed rather than ignored.** A generic element's type
+    /// argument is the author saying what flows through it; dropping it here
+    /// means it exists in the source and nowhere else, which is the whole
+    /// failure mode `Element` is supposed to prevent. Consumers that do not
+    /// model generics simply see an empty `Vec`.
+    pub type_args: Vec<TypeShape>,
+    /// Attributes in source order. Ordered (not a map) for deterministic
+    /// downstream serialization.
+    pub attrs: Vec<(String, AttrValue)>,
+    /// Child nodes in source order.
+    pub children: Vec<Node>,
+}
+
+impl Element {
+    /// Look up an attribute value by name (first match).
+    pub fn attr(&self, name: &str) -> Option<&AttrValue> {
+        self.attrs.iter().find(|(k, _)| k == name).map(|(_, v)| v)
+    }
+}
+
+/// A JSX attribute value.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum AttrValue {
+    /// `attr="text"` or `attr={"text"}`.
+    Str(String),
+    /// `attr={42}`.
+    Num(f64),
+    /// `attr={true}` or a bare `attr` (valueless → `true`).
+    Bool(bool),
+    /// `attr={ident}` / `attr={props.items}` — a data-binding path.
+    Binding(String),
+    /// An expression we don't lower (element/fragment/complex expr).
+    Opaque,
+}
+
+/// A node in a parsed JSX tree.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum Node {
+    /// A nested element.
+    Element(Element),
+    /// Literal text (JSX text, or a `{"string literal"}` child). Carries the
+    /// verbatim text, including any `{{ }}` Markdown-templating placeholders
+    /// which the highbay_ui `<Content>` layer interprets.
+    Text(String),
+    /// A `{binding}` expression child — a data-binding path.
+    Expr(String),
+}
+
+/// A parsed, fully-owned TSX document (no oxc arena references): the element
+/// tree a source file contributes, plus the typed reference edges it declares.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TsxDocument {
+    pub root_nodes: Vec<Node>,
+    /// Top-level `import … from "…"` declarations, in source order — the typed
+    /// reference edges from this module to the providers it consumes (empty for
+    /// a bare `<JSX/>` document). See [`ImportDecl`].
+    pub imports: Vec<ImportDecl>,
 }
 
 /// One field of an interface (or one named function parameter).
@@ -274,6 +372,54 @@ mod tests {
         let json = serde_json::to_string(&imp).expect("serialize");
         let back: ImportDecl = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(imp, back);
+    }
+
+    /// The element tree is graph data, so it serializes like the rest of the
+    /// graph: tag, type arguments, attributes and children all survive, in
+    /// order. Every `AttrValue` variant and every `Node` variant appears here
+    /// so a variant added without a serde derive fails loudly.
+    #[test]
+    fn element_tree_round_trips_through_serde() {
+        let tree = Element {
+            tag: "List".into(),
+            type_args: vec![TypeShape::Named("Message".into()), TypeShape::String],
+            attrs: vec![
+                ("value".into(), AttrValue::Binding("chatFeed".into())),
+                ("window".into(), AttrValue::Num(24.0)),
+                ("title".into(), AttrValue::Str("Chat".into())),
+                ("loading".into(), AttrValue::Bool(true)),
+                ("style".into(), AttrValue::Opaque),
+            ],
+            children: vec![
+                Node::Element(Element {
+                    tag: "Item".into(),
+                    type_args: vec![],
+                    attrs: vec![],
+                    children: vec![Node::Text("{{sender}}".into())],
+                }),
+                Node::Text("plain".into()),
+                Node::Expr("user.email".into()),
+            ],
+        };
+        let json = serde_json::to_string(&tree).expect("serialize");
+        let back: Element = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(tree, back);
+
+        // And as a whole document, alongside its import edges.
+        let doc = TsxDocument {
+            root_nodes: vec![Node::Element(tree)],
+            imports: vec![ImportDecl {
+                source: "Chat Feed".into(),
+                names: vec![ImportName {
+                    local: "chatFeed".into(),
+                    imported: "chatFeed".into(),
+                    kind: ImportKind::Named,
+                }],
+            }],
+        };
+        let json = serde_json::to_string(&doc).expect("serialize");
+        let back: TsxDocument = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(doc, back);
     }
 
     #[test]

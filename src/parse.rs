@@ -1,18 +1,27 @@
 //! The oxc-backed TSX parser (feature `parse`).
 //!
-//! Lowers TSX source into a fully-owned, oxc-free tree ([`TsxDocument`]) plus
-//! extracts TypeScript `interface` declarations into the owned
-//! [`crate::dag`] code-graph types ([`extract_interfaces`]).
+//! Lowers TSX source into a fully-owned, oxc-free tree
+//! ([`crate::dag::TsxDocument`]) plus extracts TypeScript `interface`
+//! declarations into the owned [`crate::dag`] code-graph types
+//! ([`extract_interfaces`]).
 //!
 //! Design constraints (PLAN.md §4, Phase 7):
 //! * **No `oxc_*` type appears in this module's public API** — callers get
 //!   plain owned Rust data.
+//! * **This module owns no data types.** Everything it produces —
+//!   [`Element`], [`Node`], [`AttrValue`], [`TsxDocument`], [`InterfaceDecl`],
+//!   [`ImportDecl`] — is defined in [`crate::dag`] and is available without
+//!   the `parse` feature. The parser is a *producer* of graph values, not the
+//!   home of any.
 //! * **Deterministic output** — JSX attributes keep source order (a `Vec`,
 //!   not a `HashMap`) so downstream node-graph serialization is stable.
 //! * Expression children (`{binding}`) and string-literal children are
 //!   captured (the old proof-of-concept dropped them).
 
-use crate::dag::{FieldDecl, ImportDecl, ImportKind, ImportName, InterfaceDecl, TypeShape};
+use crate::dag::{
+    AttrValue, Element, FieldDecl, ImportDecl, ImportKind, ImportName, InterfaceDecl, Node,
+    TsxDocument, TypeShape,
+};
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     ArrowFunctionExpression, ExportDefaultDeclarationKind, Expression, ImportDeclarationSpecifier,
@@ -21,79 +30,6 @@ use oxc_ast::ast::{
 };
 use oxc_parser::Parser;
 use oxc_span::SourceType;
-
-/// A parsed JSX element with ordered attributes and children.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Element {
-    /// The tag name (e.g. `List`, `Content`, `A.B` for member tags).
-    pub tag: String,
-    /// The element's **type arguments** — the `Message` in `<List<Message>>`
-    /// (TypeScript's generic JSX form, TS 2.9+), in source order. Empty for the
-    /// ordinary non-generic spelling, which is every element that does not
-    /// write one.
-    ///
-    /// Lowered through the same [`TypeShape`] mapping an `interface` field's
-    /// type takes, so `<List<Message>>` is `[TypeShape::Named("Message")]` and
-    /// `<List<string>>` is `[TypeShape::String]` — one type vocabulary, not a
-    /// second one for the type-argument position.
-    ///
-    /// **Why this is parsed rather than ignored.** A generic element's type
-    /// argument is the author saying what flows through it; dropping it here
-    /// means it exists in the source and nowhere else, which is the whole
-    /// failure mode `Element` is supposed to prevent. Consumers that do not
-    /// model generics simply see an empty `Vec`.
-    pub type_args: Vec<TypeShape>,
-    /// Attributes in source order. Ordered (not a map) for deterministic
-    /// downstream serialization.
-    pub attrs: Vec<(String, AttrValue)>,
-    /// Child nodes in source order.
-    pub children: Vec<Node>,
-}
-
-impl Element {
-    /// Look up an attribute value by name (first match).
-    pub fn attr(&self, name: &str) -> Option<&AttrValue> {
-        self.attrs.iter().find(|(k, _)| k == name).map(|(_, v)| v)
-    }
-}
-
-/// A JSX attribute value.
-#[derive(Debug, Clone, PartialEq)]
-pub enum AttrValue {
-    /// `attr="text"` or `attr={"text"}`.
-    Str(String),
-    /// `attr={42}`.
-    Num(f64),
-    /// `attr={true}` or a bare `attr` (valueless → `true`).
-    Bool(bool),
-    /// `attr={ident}` / `attr={props.items}` — a data-binding path.
-    Binding(String),
-    /// An expression we don't lower (element/fragment/complex expr).
-    Opaque,
-}
-
-/// A node in a parsed JSX tree.
-#[derive(Debug, Clone, PartialEq)]
-pub enum Node {
-    /// A nested element.
-    Element(Element),
-    /// Literal text (JSX text, or a `{"string literal"}` child). Carries the
-    /// verbatim text, including any `{{ }}` Markdown-templating placeholders
-    /// which the highbay_ui `<Content>` layer interprets.
-    Text(String),
-    /// A `{binding}` expression child — a data-binding path.
-    Expr(String),
-}
-
-/// A parsed, fully-owned TSX document (no oxc arena references).
-#[derive(Debug, Clone, PartialEq)]
-pub struct TsxDocument {
-    pub root_nodes: Vec<Node>,
-    /// Top-level `import … from "…"` declarations, in source order — the typed
-    /// reference edges from this module to the providers it consumes (empty for
-    /// a bare `<JSX/>` document). See [`ImportDecl`].
-    pub imports: Vec<ImportDecl>,
-}
 
 /// Parse TSX source into an owned [`TsxDocument`].
 ///
@@ -783,6 +719,52 @@ mod tests {
         let Node::Element(app_el) = &doc.root_nodes[0] else { panic!() };
         assert_eq!(app_el.attr("depth"), Some(&AttrValue::Num(2.0)));
         assert_eq!(app_el.children.len(), 1);
+    }
+
+    /// **What the parser produced is what serializes.** A document parsed from
+    /// a screen-shaped source survives a serde round trip unchanged, which is
+    /// the property downstream postcard encoding rests on: attributes in
+    /// order, children in order, type arguments intact, imports intact.
+    ///
+    /// This is checked against *parsed* input rather than a hand-built tree
+    /// because a hand-built tree can only contain what its author remembered
+    /// to put in it; a parse of real source shape carries whatever the parser
+    /// actually emits, including anything added later.
+    #[test]
+    fn a_parsed_document_round_trips_through_serde() {
+        let src = r#"
+            import { chatFeed } from "Chat Feed";
+
+            <Screen name="Chat" icon="chat" section="Chats">
+                <Column>
+                    <List<Message> value={chatFeed} window={24} live>
+                        <Item>
+                            <Content>{"{{sender}}"}</Content>
+                            {user.email}
+                        </Item>
+                    </List>
+                    <MessageInput placeholder="Message #baychat-general" />
+                </Column>
+            </Screen>
+        "#;
+        let doc = parse_tsx(src).expect("screen parses");
+        let json = serde_json::to_string(&doc).expect("serialize");
+        let back: TsxDocument = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(doc, back, "a parsed document did not survive serde");
+
+        // Not vacuous: the document really does carry the tree, the generic
+        // type argument and the import edge that make the assertion mean
+        // something.
+        let Node::Element(screen) = &back.root_nodes[0] else { panic!("root is an element") };
+        let Node::Element(column) = &screen.children[0] else { panic!() };
+        let Node::Element(list) = &column.children[0] else { panic!() };
+        assert_eq!(list.type_args, vec![TypeShape::Named("Message".into())]);
+        assert_eq!(
+            list.attrs.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
+            vec!["value", "window", "live"],
+            "attributes keep source order",
+        );
+        assert_eq!(back.imports[0].source, "Chat Feed");
     }
 
     #[test]
