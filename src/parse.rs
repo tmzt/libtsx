@@ -19,9 +19,12 @@
 //!   captured (the old proof-of-concept dropped them).
 //! * **Effect bindings are produced here, not inferred later.** An
 //!   [`is_event_binding`] attribute's value is parsed as one call resolving to
-//!   a granted host import and emitted as [`AttrValue::NamedEffect`]
-//!   ([`parse_tsx_with`]); there is no pass that later decides an
-//!   [`AttrValue::Opaque`] was really an effect (LIBHBUI_PLAN Rules 46a, 48).
+//!   a granted host import and emitted as [`AttrValue::NamedEffect`]; there is
+//!   no pass that later decides an [`AttrValue::Opaque`] was really an effect
+//!   (LIBHBUI_PLAN Rules 46a, 48).
+//! * **Configuration is a context, not a second entry point.** What a load
+//!   offers a source is [`ParseCtx`], built through [`ParseCtx::builder`] and
+//!   passed to whichever parse entry point the caller needs (Rule 49).
 
 use crate::dag::{
     AttrValue, EffectError, Element, FieldDecl, FuncSig, HostEffects, ImportDecl, ImportKind,
@@ -39,11 +42,13 @@ use oxc_span::SourceType;
 
 /// Everything a parse can refuse.
 ///
-/// Two kinds, kept apart because they are different facts: oxc could not read
-/// the source, or it read it and the source declared something that cannot mean
-/// what it says. [`parse_tsx`] flattens both into the `Vec<String>` its callers
-/// have always taken; [`parse_tsx_with`] hands the second back **typed**, which
-/// is what lets a refusal be asserted on rather than string-matched.
+/// Three kinds, kept apart because they are different facts: oxc could not read
+/// the source, it read it and the source declared something that cannot mean
+/// what it says, or a file that had to supply a root element did not. The free
+/// [`parse_tsx`] / [`parse_app`] flatten all of them into the `Vec<String>`
+/// their callers have always taken; [`ParseCtx::parse_tsx`] and
+/// [`ParseCtx::parse_app`] hand them back **typed**, which is what lets a
+/// refusal be asserted on rather than string-matched.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ParseError {
     /// oxc's diagnostics, rendered for a human (see [`parse_tsx`]).
@@ -51,6 +56,12 @@ pub enum ParseError {
     /// An effect binding or a host import that cannot mean what it says
     /// (LIBHBUI_PLAN Rules 46a, 48).
     Effect(EffectError),
+    /// A source [`ParseCtx::parse_app`] required a root JSX element from and
+    /// did not get one.
+    NoRootElement {
+        /// Which screen, or `None` for the app-level file.
+        screen: Option<usize>,
+    },
 }
 
 impl ParseError {
@@ -59,7 +70,7 @@ impl ParseError {
     pub fn messages(self) -> Vec<String> {
         match self {
             Self::Syntax(messages) => messages,
-            Self::Effect(e) => vec![e.to_string()],
+            other => vec![other.to_string()],
         }
     }
 }
@@ -76,6 +87,10 @@ impl std::fmt::Display for ParseError {
         match self {
             Self::Syntax(messages) => write!(f, "{}", messages.join("; ")),
             Self::Effect(e) => write!(f, "{e}"),
+            Self::NoRootElement { screen: None } => write!(f, "app source has no root element"),
+            Self::NoRootElement { screen: Some(i) } => {
+                write!(f, "screen source {i} has no root element")
+            }
         }
     }
 }
@@ -99,143 +114,299 @@ impl std::error::Error for ParseError {}
 /// accepted — it is invalid TS and oxc rejects it (use the `const … ;
 /// export default …` split, which is what Highbay writes).
 pub fn parse_tsx(source: &str) -> Result<TsxDocument, Vec<String>> {
-    parse_tsx_with(source, &HostEffects::none()).map_err(ParseError::messages)
+    ParseCtx::default()
+        .parse_tsx(source)
+        .map_err(ParseError::messages)
 }
 
-/// [`parse_tsx`] against a **host grant**: the effects this load offers the
-/// source (LIBHBUI_PLAN Rule 48).
+/// **How a parse is configured** - what this load offers the source
+/// (LIBHBUI_PLAN Rule 49).
 ///
-/// An `on..` attribute ([`is_event_binding`]) is parsed as one call resolving
-/// through the module's import chain to a signature `host` declares, and
-/// becomes [`AttrValue::NamedEffect`]. Nothing about that is deferred: an
-/// attribute that announced an effect and cannot carry one is refused **here**,
-/// with a typed [`EffectError`], rather than surviving as an
-/// [`AttrValue::Opaque`] that silently does nothing (Rule 46a).
+/// One value, built once and passed to whichever entry point a caller needs, so
+/// a capability enabled here is available *wherever parsing happens*. The shape
+/// it replaces was a function per capability - `parse_tsx_with(src, &host)`
+/// beside `parse_tsx(src)` - and the cost of that shape had already been paid:
+/// [`ParseCtx::parse_app`]'s predecessor granted nothing, not by decision but
+/// because it was a third function nobody extended, so the multi-file path
+/// could not express an effect at all.
 ///
-/// [`parse_tsx`] is this with nothing granted, which is the honest default: a
-/// source calling an effect it was never given has named a capability it does
-/// not have.
-pub fn parse_tsx_with(source: &str, host: &HostEffects) -> Result<TsxDocument, ParseError> {
-    let allocator = Allocator::default();
-    let ret = Parser::new(&allocator, source, SourceType::tsx()).parse();
+/// **The builder is the only way to configure one.** The fields are private and
+/// there is no setter, so a context is either the default (offering nothing) or
+/// one a [`ParseCtxBuilder`] produced - which is what stops a capability being
+/// enabled by a route some other entry point forgets:
+///
+/// ```compile_fail,E0451
+/// use libtsx::{HostEffects, ParseCtx};
+///
+/// let ctx = ParseCtx { effects: Some(HostEffects::none()) };
+/// ```
+///
+/// The default offers **nothing**, which is the honest one: a source calling an
+/// effect it was never given has named a capability it does not have.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ParseCtx {
+    /// The effect surface, or `None` for a load that does not offer one at all.
+    effects: Option<HostEffects>,
+}
 
-    if !ret.diagnostics.is_empty() {
-        return Err(ParseError::Syntax(
-            ret.diagnostics
-                .into_iter()
-                // `{e}`, not `{e:?}`. These strings are USER-FACING -- the IDE's
-                // live-parse status strip renders them verbatim -- and the Debug
-                // form spells the whole struct, so a typo appeared in the editor as
-                // `Parse error: OxcDiagnostic { inner: OxcDiagnosticInner {
-                // message: "Unexpected token", l...`, truncated mid-field. Display
-                // is the rendered diagnostic oxc means a human to read.
-                .map(|e| e.to_string())
-                .collect(),
-        ));
+/// Builds a [`ParseCtx`]. See [`ParseCtx::builder`].
+#[derive(Debug, Clone, Default)]
+pub struct ParseCtxBuilder {
+    effects: Option<HostEffects>,
+}
+
+impl ParseCtxBuilder {
+    /// Offer the **effect surface**, granting nothing through it yet.
+    ///
+    /// The distinction this draws is between an embedding that has no
+    /// capabilities to give and one that withheld a particular capability - a
+    /// source importing `host:x` gets [`EffectError::EffectsNotOffered`] in the
+    /// first case and [`EffectError::UnknownHostNamespace`] in the second.
+    /// Neither is a parse that quietly succeeds.
+    pub fn enable_effects(mut self) -> Self {
+        self.effects.get_or_insert_with(HostEffects::none);
+        self
     }
 
-    // Pass 0: the import edges, and the effect scope they open. This runs
-    // BEFORE any element is converted, because an effect name resolves against
-    // the whole module's imports rather than the ones written above the element
-    // that calls it - and because a scope built as the elements go by would
-    // depend on statement order for its answers.
-    let mut imports = Vec::new();
-    for stmt in &ret.program.body {
-        if let Statement::ImportDeclaration(decl) = stmt {
-            imports.push(convert_import(decl));
+    /// Grant these host effects, **offering the surface** in the same step.
+    ///
+    /// A grant is the stronger statement, so it implies [`Self::enable_effects`]
+    /// rather than needing it: a caller that sets a host and forgets to enable
+    /// would otherwise have configured a capability the parse ignores, which is
+    /// the failure mode a single context exists to remove.
+    pub fn set_host(mut self, host: HostEffects) -> Self {
+        self.effects = Some(host);
+        self
+    }
+
+    /// The configured context.
+    pub fn build(self) -> ParseCtx {
+        ParseCtx {
+            effects: self.effects,
         }
     }
-    let scope = EffectScope::build(&imports, host)?;
+}
 
-    let mut root_nodes = Vec::new();
-    // Pass 1: bare JSX statements and a table of
-    // `const Name = () => (<JSX/>)` arrow components (for export-default-by-name).
-    let mut arrow_components: Vec<(&str, &JSXElement)> = Vec::new();
-    for stmt in &ret.program.body {
-        match stmt {
-            Statement::ExpressionStatement(expr_stmt) => match &expr_stmt.expression {
-                Expression::JSXElement(jsx) => {
-                    root_nodes.push(Node::Element(convert_element(jsx, &scope)?))
-                }
-                Expression::JSXFragment(frag) => {
-                    for child in &frag.children {
-                        push_child(&mut root_nodes, child, &scope)?;
+impl ParseCtx {
+    /// Start configuring a context.
+    pub fn builder() -> ParseCtxBuilder {
+        ParseCtxBuilder::default()
+    }
+
+    /// What a source may call, or `None` if this load offers no effects.
+    fn host(&self) -> Option<&HostEffects> {
+        self.effects.as_ref()
+    }
+
+    /// [`parse_tsx`] **in this context**, with the refusal handed back typed.
+    ///
+    /// An `on..` attribute ([`is_event_binding`]) is parsed as one call
+    /// resolving through the module's import chain to a signature this context
+    /// grants, and becomes [`AttrValue::NamedEffect`]. Nothing about that is
+    /// deferred: an attribute that announced an effect and cannot carry one is
+    /// refused **here**, with a typed [`EffectError`], rather than surviving as
+    /// an [`AttrValue::Opaque`] that silently does nothing (Rule 46a).
+    pub fn parse_tsx(&self, source: &str) -> Result<TsxDocument, ParseError> {
+        let allocator = Allocator::default();
+        let ret = Parser::new(&allocator, source, SourceType::tsx()).parse();
+
+        if !ret.diagnostics.is_empty() {
+            return Err(ParseError::Syntax(
+                ret.diagnostics
+                    .into_iter()
+                    // `{e}`, not `{e:?}`. These strings are USER-FACING -- the IDE's
+                    // live-parse status strip renders them verbatim -- and the Debug
+                    // form spells the whole struct, so a typo appeared in the editor as
+                    // `Parse error: OxcDiagnostic { inner: OxcDiagnosticInner {
+                    // message: "Unexpected token", l...`, truncated mid-field. Display
+                    // is the rendered diagnostic oxc means a human to read.
+                    .map(|e| e.to_string())
+                    .collect(),
+            ));
+        }
+
+        // Pass 0: the import edges, and the effect scope they open. This runs
+        // BEFORE any element is converted, because an effect name resolves against
+        // the whole module's imports rather than the ones written above the element
+        // that calls it - and because a scope built as the elements go by would
+        // depend on statement order for its answers.
+        let mut imports = Vec::new();
+        for stmt in &ret.program.body {
+            if let Statement::ImportDeclaration(decl) = stmt {
+                imports.push(convert_import(decl));
+            }
+        }
+        let scope = EffectScope::build(&imports, self)?;
+
+        let mut root_nodes = Vec::new();
+        // Pass 1: bare JSX statements and a table of
+        // `const Name = () => (<JSX/>)` arrow components (for export-default-by-name).
+        let mut arrow_components: Vec<(&str, &JSXElement)> = Vec::new();
+        for stmt in &ret.program.body {
+            match stmt {
+                Statement::ExpressionStatement(expr_stmt) => match &expr_stmt.expression {
+                    Expression::JSXElement(jsx) => {
+                        root_nodes.push(Node::Element(convert_element(jsx, &scope)?))
                     }
-                }
-                _ => {}
-            },
-            Statement::VariableDeclaration(var) => {
-                for d in &var.declarations {
-                    if let (Some(name), Some(Expression::ArrowFunctionExpression(arrow))) =
-                        (d.id.get_binding_identifier(), d.init.as_ref())
-                    {
-                        if let Some(jsx) = arrow_root_jsx(arrow) {
-                            arrow_components.push((name.name.as_str(), jsx));
+                    Expression::JSXFragment(frag) => {
+                        for child in &frag.children {
+                            push_child(&mut root_nodes, child, &scope)?;
+                        }
+                    }
+                    _ => {}
+                },
+                Statement::VariableDeclaration(var) => {
+                    for d in &var.declarations {
+                        if let (Some(name), Some(Expression::ArrowFunctionExpression(arrow))) =
+                            (d.id.get_binding_identifier(), d.init.as_ref())
+                        {
+                            if let Some(jsx) = arrow_root_jsx(arrow) {
+                                arrow_components.push((name.name.as_str(), jsx));
+                            }
                         }
                     }
                 }
+                _ => {}
             }
-            _ => {}
         }
-    }
 
-    // Pass 2: the export-default component — an inline arrow, or a reference to a
-    // `const` arrow component collected above. Its JSX is the module's root.
-    for stmt in &ret.program.body {
-        if let Statement::ExportDefaultDeclaration(decl) = stmt {
-            let jsx = match &decl.declaration {
-                ExportDefaultDeclarationKind::ArrowFunctionExpression(arrow) => arrow_root_jsx(arrow),
-                ExportDefaultDeclarationKind::Identifier(id) => arrow_components
-                    .iter()
-                    .find(|(n, _)| *n == id.name.as_str())
-                    .map(|(_, jsx)| *jsx),
-                _ => None,
-            };
-            if let Some(jsx) = jsx {
+        // Pass 2: the export-default component — an inline arrow, or a reference to a
+        // `const` arrow component collected above. Its JSX is the module's root.
+        for stmt in &ret.program.body {
+            if let Statement::ExportDefaultDeclaration(decl) = stmt {
+                let jsx = match &decl.declaration {
+                    ExportDefaultDeclarationKind::ArrowFunctionExpression(arrow) => arrow_root_jsx(arrow),
+                    ExportDefaultDeclarationKind::Identifier(id) => arrow_components
+                        .iter()
+                        .find(|(n, _)| *n == id.name.as_str())
+                        .map(|(_, jsx)| *jsx),
+                    _ => None,
+                };
+                if let Some(jsx) = jsx {
+                    root_nodes.push(Node::Element(convert_element(jsx, &scope)?));
+                }
+            }
+        }
+
+        // Lenient fallback: a module with a single `const` arrow component and no
+        // export/bare-JSX still yields its JSX (so a mid-edit missing `export default`
+        // doesn't blank the preview).
+        if root_nodes.is_empty() {
+            if let Some((_, jsx)) = arrow_components.first() {
                 root_nodes.push(Node::Element(convert_element(jsx, &scope)?));
             }
         }
+
+        Ok(TsxDocument { root_nodes, imports })
     }
 
-    // Lenient fallback: a module with a single `const` arrow component and no
-    // export/bare-JSX still yields its JSX (so a mid-edit missing `export default`
-    // doesn't blank the preview).
-    if root_nodes.is_empty() {
-        if let Some((_, jsx)) = arrow_components.first() {
-            root_nodes.push(Node::Element(convert_element(jsx, &scope)?));
+    /// Parse a **multi-file app** into one combined [`TsxDocument`]: the
+    /// app-level file (`app_src`) supplies the root element (its tag +
+    /// attributes - e.g. `<App>` and any app-level props), and each entry of
+    /// `screens` is a per-screen source file whose own root element is spliced
+    /// in as a child of that root, in the given order.
+    ///
+    /// This is the boundary for Highbay's multi-file app model (EDITOR_PLAN
+    /// §7): the hidden app-level file holds the screen registry/structure while
+    /// each screen is its own document, and the combined graph is derived from
+    /// both. Keeping the splice here (rather than in the consumer) keeps every
+    /// `oxc_*` type quarantined - callers get the same owned [`TsxDocument`] as
+    /// [`ParseCtx::parse_tsx`].
+    ///
+    /// The returned document has exactly one root node: the app root element
+    /// with the screen root elements as its children (the app file's own
+    /// children are replaced by the screen elements - the screen files are the
+    /// content authority). A screen source with no root element, or an app
+    /// source with no root element, is a [`ParseError::NoRootElement`].
+    ///
+    /// **The context is what it grants**, and that is the whole reason it
+    /// exists: every file here parses in *this* context, so an effect the
+    /// embedding offered is available in a screen file. Its predecessor was a
+    /// third free function that granted nothing - not by decision, but because
+    /// nobody extended it - and the multi-file path could not express an effect
+    /// at all (Rule 49).
+    pub fn parse_app(&self, app_src: &str, screens: &[&str]) -> Result<TsxDocument, ParseError> {
+        let app_doc = self.parse_tsx(app_src)?;
+        let mut imports = app_doc.imports;
+        let app_el = root_element(app_doc.root_nodes)
+            .ok_or(ParseError::NoRootElement { screen: None })?;
+
+        let mut children = Vec::with_capacity(screens.len());
+        for (i, src) in screens.iter().enumerate() {
+            let mut doc = self.parse_tsx(src)?;
+            imports.append(&mut doc.imports);
+            let el = root_element(doc.root_nodes).ok_or(ParseError::NoRootElement {
+                screen: Some(i),
+            })?;
+            children.push(Node::Element(el));
         }
-    }
 
-    Ok(TsxDocument { root_nodes, imports })
+        let combined = Element {
+            tag: app_el.tag,
+            type_args: app_el.type_args,
+            attrs: app_el.attrs,
+            children,
+        };
+        Ok(TsxDocument {
+            root_nodes: vec![Node::Element(combined)],
+            imports,
+        })
+    }
+}
+
+/// The first root node that is an element.
+fn root_element(root_nodes: Vec<Node>) -> Option<Element> {
+    root_nodes.into_iter().find_map(|n| match n {
+        Node::Element(e) => Some(e),
+        _ => None,
+    })
 }
 
 // --- the effect scope (LIBHBUI_PLAN Rules 46a, 48) ----------------------------
 
-/// The effects a module may call: its **host** imports, checked against what
-/// the load granted.
+/// The effects a module may call: its `host:` **import declarations**, checked
+/// against what the load granted.
 ///
-/// Built once per parse, from the module's own import edges. A local name is
-/// carried alongside the namespace it came from and the name that namespace
-/// exports, so `import { navigate as go }` resolves `go` to `navigate`'s
-/// signature and the alias is gone by the time anything downstream reads it.
+/// Built once per parse, from the module's own [`ImportDecl`] edges - *where
+/// each name came from*. A local name is carried alongside the namespace it
+/// came from and the name that namespace exports, so `import { navigate as go }`
+/// resolves `go` to `navigate`'s signature and the alias is gone by the time
+/// anything downstream reads it.
+///
+/// **The declaration and the signature are two things, chained here.** This
+/// struct holds the first ([`ImportDecl`]-derived bindings) and borrows the
+/// second ([`HostEffects`]'s [`FuncSig`]s); [`EffectScope::resolve`] is the
+/// chain. Nothing may shortcut from a callee straight to a signature - that
+/// would be a name typed by something it was never imported from.
 struct EffectScope<'a> {
-    host: &'a HostEffects,
+    /// The grant, or `None` if the context offers no effect surface at all -
+    /// in which case `locals` is empty, because every `host:` import was
+    /// refused before it could add one.
+    host: Option<&'a HostEffects>,
     /// `(local, namespace, imported)`, in source order.
     locals: Vec<(String, String, String)>,
 }
 
 impl<'a> EffectScope<'a> {
     /// The scope a module's imports open, refusing the ways a host import can
-    /// fail to be one (Rule 48).
+    /// fail to be one (Rules 48, 49).
     ///
     /// Non-`host:` imports are left entirely alone: whether a specifier names a
     /// real project Script is the consumer's question, not the parser's.
-    fn build(imports: &[ImportDecl], host: &'a HostEffects) -> Result<Self, EffectError> {
+    fn build(imports: &[ImportDecl], ctx: &'a ParseCtx) -> Result<Self, EffectError> {
         let mut locals = Vec::new();
         for decl in imports {
             if !is_host_namespace(&decl.source) {
                 continue;
             }
+            // A load that offers no effects at all is a different fact from one
+            // that grants some other namespace, and says so: the source asked
+            // for a surface this embedding does not have.
+            let Some(host) = ctx.host() else {
+                return Err(EffectError::EffectsNotOffered {
+                    source: decl.source.clone(),
+                });
+            };
             // A `host:` specifier that nothing granted is neither a Script to
             // compile nor a capability to grant, so it is refused at load
             // rather than producing bindings that can never fire.
@@ -269,14 +440,17 @@ impl<'a> EffectScope<'a> {
                 ));
             }
         }
-        Ok(Self { host, locals })
+        Ok(Self {
+            host: ctx.host(),
+            locals,
+        })
     }
 
     /// The signature a local name resolves to, through the local->imported
     /// chain.
     fn resolve(&self, local: &str) -> Option<&FuncSig> {
         let (_, namespace, imported) = self.locals.iter().find(|(name, _, _)| name == local)?;
-        self.host.declares(namespace, imported)
+        self.host?.declares(namespace, imported)
     }
 }
 
@@ -478,61 +652,17 @@ fn convert_import(decl: &oxc_ast::ast::ImportDeclaration) -> ImportDecl {
     ImportDecl { source: decl.source.value.to_string(), names }
 }
 
-/// Parse a **multi-file app** into one combined [`TsxDocument`]: the app-level
-/// file (`app_src`) supplies the root element (its tag + attributes — e.g.
-/// `<App>` and any app-level props), and each entry of `screens` is a per-screen
-/// source file whose own root element is spliced in as a child of that root, in
-/// the given order.
+/// [`ParseCtx::parse_app`] in the default context - a multi-file app parsed
+/// with **nothing granted**.
 ///
-/// This is the boundary for Highbay's multi-file app model (EDITOR_PLAN §7): the
-/// hidden app-level file holds the screen registry/structure while each screen is
-/// its own document, and the combined graph is derived from both. Keeping the
-/// splice here (rather than in the consumer) keeps every `oxc_*` type quarantined
-/// — callers get the same owned [`TsxDocument`] as [`parse_tsx`].
-///
-/// The returned document has exactly one root node: the app root element with the
-/// screen root elements as its children (the app file's own children are
-/// replaced by the screen elements — the screen files are the content authority).
-/// A screen source with no root element, or an app source with no root element,
-/// is an error.
-///
-/// Nothing is granted (see [`parse_tsx_with`]): the multi-file app path has no
-/// effect surface yet, and inventing one here would be a grant no embedding
-/// asked for.
+/// The convenience form, exactly as [`parse_tsx`] is: it exists so no caller
+/// that never wanted a capability has to name a context. A caller that does
+/// want one builds it ([`ParseCtx::builder`]) and calls the method, which is
+/// the same context [`ParseCtx::parse_tsx`] takes.
 pub fn parse_app(app_src: &str, screens: &[&str]) -> Result<TsxDocument, Vec<String>> {
-    let app_doc = parse_tsx(app_src)?;
-    let mut imports = app_doc.imports;
-    let app_el = app_doc
-        .root_nodes
-        .into_iter()
-        .find_map(|n| match n {
-            Node::Element(e) => Some(e),
-            _ => None,
-        })
-        .ok_or_else(|| vec!["app source has no root element".to_string()])?;
-
-    let mut children = Vec::with_capacity(screens.len());
-    for (i, src) in screens.iter().enumerate() {
-        let mut doc = parse_tsx(src)?;
-        imports.append(&mut doc.imports);
-        let el = doc
-            .root_nodes
-            .into_iter()
-            .find_map(|n| match n {
-                Node::Element(e) => Some(e),
-                _ => None,
-            })
-            .ok_or_else(|| vec![format!("screen source {i} has no root element")])?;
-        children.push(Node::Element(el));
-    }
-
-    let combined = Element {
-        tag: app_el.tag,
-        type_args: app_el.type_args,
-        attrs: app_el.attrs,
-        children,
-    };
-    Ok(TsxDocument { root_nodes: vec![Node::Element(combined)], imports })
+    ParseCtx::default()
+        .parse_app(app_src, screens)
+        .map_err(ParseError::messages)
 }
 
 /// Extract every top-level TypeScript `interface` into an owned
@@ -679,36 +809,42 @@ fn convert_element(jsx: &JSXElement, scope: &EffectScope) -> Result<Element, Eff
 
     let mut attrs = Vec::new();
     for attr in &jsx.opening_element.attributes {
-        if let JSXAttributeItem::Attribute(a) = attr {
-            let key = match &a.name {
-                JSXAttributeName::Identifier(i) => i.name.to_string(),
-                JSXAttributeName::NamespacedName(n) => {
-                    format!("{}:{}", n.namespace.name, n.name.name)
-                }
-            };
-            // **Detection and carriage are one step** (Rule 46a): the name
-            // announces an event binding, so the value is lowered as an effect
-            // right here. There is no later pass that reinterprets an
-            // `AttrValue::Opaque`, which is exactly why an `on..` attribute can
-            // never quietly become one.
-            let value = if is_event_binding(&key) {
-                effect_attr(&key, a.value.as_ref(), scope)?
-            } else {
-                match &a.value {
-                    None => AttrValue::Bool(true),
-                    Some(JSXAttributeValue::StringLiteral(s)) => {
-                        AttrValue::Str(s.value.to_string())
-                    }
-                    Some(JSXAttributeValue::ExpressionContainer(c)) => c
-                        .expression
-                        .as_expression()
-                        .map(attr_from_expr)
-                        .unwrap_or(AttrValue::Opaque),
-                    _ => AttrValue::Opaque,
-                }
-            };
-            attrs.push((key, value));
-        }
+        // A SPREAD is refused, not skipped. `{...handlers}` where
+        // `handlers = { onTap: navigate("Chat") }` reaches an element as no
+        // attribute at all: the loop below never sees an `on..` NAME, so
+        // `is_event_binding` is never consulted and every effect refusal is
+        // blind to it - the erasure Rule 46a closed, by the one route it does
+        // not watch. It could not be honoured even if it resolved: a spread
+        // attribute set cannot be checked against declared props.
+        let JSXAttributeItem::Attribute(a) = attr else {
+            return Err(EffectError::SpreadAttribute { tag });
+        };
+        let key = match &a.name {
+            JSXAttributeName::Identifier(i) => i.name.to_string(),
+            JSXAttributeName::NamespacedName(n) => {
+                format!("{}:{}", n.namespace.name, n.name.name)
+            }
+        };
+        // **Detection and carriage are one step** (Rule 46a): the name
+        // announces an event binding, so the value is lowered as an effect
+        // right here. There is no later pass that reinterprets an
+        // `AttrValue::Opaque`, which is exactly why an `on..` attribute can
+        // never quietly become one.
+        let value = if is_event_binding(&key) {
+            effect_attr(&key, a.value.as_ref(), scope)?
+        } else {
+            match &a.value {
+                None => AttrValue::Bool(true),
+                Some(JSXAttributeValue::StringLiteral(s)) => AttrValue::Str(s.value.to_string()),
+                Some(JSXAttributeValue::ExpressionContainer(c)) => c
+                    .expression
+                    .as_expression()
+                    .map(attr_from_expr)
+                    .unwrap_or(AttrValue::Opaque),
+                _ => AttrValue::Opaque,
+            }
+        };
+        attrs.push((key, value));
     }
 
     let mut children = Vec::new();
@@ -1122,9 +1258,15 @@ mod tests {
         host
     }
 
+    /// The context those grants are offered through - one value, built the one
+    /// way there is (Rule 49).
+    fn ctx() -> ParseCtx {
+        ParseCtx::builder().set_host(granted()).build()
+    }
+
     /// The one attribute of the tree, for a source with exactly one element.
     fn only_attr(src: &str) -> AttrValue {
-        let doc = parse_tsx_with(src, &granted()).expect("parses");
+        let doc = ctx().parse_tsx(src).expect("parses");
         let Node::Element(el) = &doc.root_nodes[0] else {
             panic!("root is an element")
         };
@@ -1137,9 +1279,10 @@ mod tests {
 
     /// What a source is refused with.
     fn refusal(src: &str) -> EffectError {
-        match parse_tsx_with(src, &granted()) {
+        match ctx().parse_tsx(src) {
             Err(ParseError::Effect(e)) => e,
             Err(ParseError::Syntax(d)) => panic!("the source does not even parse: {d:?}"),
+            Err(other) => panic!("refused, and not for an effect: {other}"),
             Ok(doc) => panic!("accepted, and produced {doc:?}"),
         }
     }
@@ -1202,12 +1345,11 @@ mod tests {
         );
 
         // And an ordinary attribute is untouched by any of it.
-        let doc = parse_tsx_with(
+        let doc = ctx().parse_tsx(
             r#"
             import { navigate } from "host:effects";
             <Action id="a" height={56} onTap={navigate("Chat")} label="Chat" />
             "#,
-            &granted(),
         )
         .expect("parses");
         let Node::Element(el) = &doc.root_nodes[0] else { panic!() };
@@ -1469,12 +1611,11 @@ mod tests {
 
         // A Script import is not touched by any of this: it has a source, it is
         // compiled, and resolving it is the consumer's job as it always was.
-        let doc = parse_tsx_with(
+        let doc = ctx().parse_tsx(
             r#"
             import { libraryFeed } from "Library Feed";
             <List value={libraryFeed} />
             "#,
-            &granted(),
         )
         .expect("a Script import is not a host import");
         assert_eq!(doc.imports[0].source, "Library Feed");
@@ -1483,6 +1624,11 @@ mod tests {
     /// **Nothing granted is the honest default.** [`parse_tsx`] grants nothing,
     /// so a source that calls an effect has named a capability it was not
     /// given - and says so, rather than erasing the call.
+    ///
+    /// The two "nothings" are different facts and say so separately (Rule 49):
+    /// a context with the surface *enabled* and this namespace ungranted is
+    /// [`EffectError::UnknownHostNamespace`]; the default context, which offers
+    /// no surface at all, is [`EffectError::EffectsNotOffered`].
     #[test]
     fn with_nothing_granted_an_effect_does_not_resolve() {
         let src = r#"
@@ -1490,8 +1636,14 @@ mod tests {
             <Action id="a" onTap={navigate("Chat")} />
         "#;
         assert_eq!(
-            parse_tsx_with(src, &HostEffects::none()),
+            ParseCtx::builder().enable_effects().build().parse_tsx(src),
             Err(ParseError::Effect(EffectError::UnknownHostNamespace {
+                source: "host:effects".into(),
+            }))
+        );
+        assert_eq!(
+            ParseCtx::default().parse_tsx(src),
+            Err(ParseError::Effect(EffectError::EffectsNotOffered {
                 source: "host:effects".into(),
             }))
         );
@@ -1511,12 +1663,11 @@ mod tests {
     /// one attribute value that has a nested shape.
     #[test]
     fn a_parsed_effect_survives_serde() {
-        let doc = parse_tsx_with(
+        let doc = ctx().parse_tsx(
             r#"
             import { navigate } from "host:effects";
             <Drawer id="d1"><Action id="d2" onTap={navigate("Chat")} /></Drawer>
             "#,
-            &granted(),
         )
         .expect("parses");
         let json = serde_json::to_string(&doc).expect("serialize");
@@ -1574,6 +1725,10 @@ mod tests {
                 source: "host:effects".into(),
                 imported: "teleport".into(),
             },
+            EffectError::EffectsNotOffered {
+                source: "host:effects".into(),
+            },
+            EffectError::SpreadAttribute { tag: "Action".into() },
         ] {
             assert!(e.to_string().is_ascii(), "{e:?}");
             assert!(!e.to_string().is_empty());
@@ -1586,7 +1741,101 @@ mod tests {
         let a = parse_app(app, &[r#"<Screen name="A" />"#]).unwrap();
         let b = parse_app(app, &[r#"<Screen name="A" />"#]).unwrap();
         assert_eq!(a, b);
-        // A screen file with no root element is a reported error, not a panic.
-        assert!(parse_app(app, &["   // just a comment"]).is_err());
+        // A screen file with no root element is a reported error, not a panic,
+        // and it says WHICH file - the typed refusal carries the index.
+        assert_eq!(
+            ParseCtx::default().parse_app(app, &["   // just a comment"]),
+            Err(ParseError::NoRootElement { screen: Some(0) })
+        );
+        assert_eq!(
+            parse_app("// no app root", &[r#"<Screen name="A" />"#]).unwrap_err(),
+            vec!["app source has no root element".to_string()],
+        );
+    }
+
+    /// **RULE 49's whole argument.** One context, configured once, serves every
+    /// entry point - so a capability enabled for [`ParseCtx::parse_tsx`] is
+    /// available to [`ParseCtx::parse_app`] without anybody extending a third
+    /// function.
+    ///
+    /// The multi-file path could not express an effect at all before this: its
+    /// predecessor called the ungranted `parse_tsx`, so a screen file's
+    /// `onTap={navigate("Chat")}` was refused however the embedding was
+    /// configured. Both halves are asserted here, because "the app parses" on
+    /// its own would also pass if the parse had simply become lenient.
+    #[test]
+    fn one_context_serves_parse_app_as_well_as_parse_tsx() {
+        let app = "<App />";
+        let screen = r#"
+            import { navigate } from "host:effects";
+            <Screen name="Home"><Action id="a" onTap={navigate("Chat")} /></Screen>
+        "#;
+
+        let doc = ctx().parse_app(app, &[screen]).expect("the grant reaches a screen file");
+        let Node::Element(root) = &doc.root_nodes[0] else {
+            panic!("the app root is an element")
+        };
+        let Node::Element(spliced) = &root.children[0] else {
+            panic!("the screen is spliced in as an element")
+        };
+        let Node::Element(action) = &spliced.children[0] else {
+            panic!("the action is the screen's child")
+        };
+        assert_eq!(
+            action.attr("onTap"),
+            Some(&AttrValue::NamedEffect(NamedEffect {
+                name: "navigate".into(),
+                args: vec![crate::dag::Expr::LitStr("Chat".into())],
+            })),
+            "the effect did not survive the splice",
+        );
+
+        // And the default context still refuses the same source, so what made
+        // the difference was the grant rather than a lenient parse.
+        assert_eq!(
+            ParseCtx::default().parse_app(app, &[screen]),
+            Err(ParseError::Effect(EffectError::EffectsNotOffered {
+                source: "host:effects".into(),
+            }))
+        );
+    }
+
+    /// **A spread attribute is refused** (Rule 46a's remaining door).
+    ///
+    /// `const handlers = { onTap: navigate("Chat") }` then
+    /// `<Action {...handlers}/>` used to parse clean and yield an `<Action>`
+    /// with **no binding**: the attribute loop only ever saw
+    /// `JSXAttributeItem::Attribute`, so a `SpreadAttribute` fell off the end
+    /// and `is_event_binding` was never consulted. That is the erasure the
+    /// `NamedEffect` producer exists to close, arriving by the one route none
+    /// of its refusals watch.
+    ///
+    /// Hand-written source, and Rule 43's exception applies - **the point IS
+    /// the shape**: what is ruled out is a spelling the authoring surface must
+    /// refuse, so there is nothing else to parse it from.
+    #[test]
+    fn a_spread_attribute_is_refused() {
+        // The erasure itself: an effect that reaches the element as nothing.
+        assert_eq!(
+            refusal(
+                r#"
+                import { navigate } from "host:effects";
+                const handlers = { onTap: navigate("Chat") };
+                <Action id="a" {...handlers} />
+                "#
+            ),
+            EffectError::SpreadAttribute { tag: "Action".into() }
+        );
+        // The refusal is about the SPREAD, not about effects: an attribute set
+        // spread from a value cannot be checked against declared props either,
+        // so it is refused with nothing granted and on a nested element too.
+        assert_eq!(
+            ParseCtx::default().parse_tsx(r#"<Screen name="Home"><Item {...props} /></Screen>"#),
+            Err(ParseError::Effect(EffectError::SpreadAttribute {
+                tag: "Item".into()
+            }))
+        );
+        // An ordinary attribute list is untouched by the rule.
+        assert!(parse_tsx(r#"<Item id="a" label="Hi" />"#).is_ok());
     }
 }

@@ -58,9 +58,26 @@ pub struct DagModule {
     pub name: String,
     /// TS `interface` declarations (Props shapes).
     pub interfaces: Vec<InterfaceDecl>,
-    /// Host functions the handlers may call (nav edges, actions, nocap ops).
+    /// Host import **signatures**: what may be called, and with which
+    /// parameters (nav edges, actions, nocap ops).
+    ///
+    /// **Not the same concept as [`ImportDecl`], despite the shared word.**
+    /// An [`ImportDecl`] is the authored `import` statement - *where a name
+    /// came from*: a specifier plus bindings with `local`/`imported`/`kind`.
+    /// This is *what a name may be called as*. An effect needs BOTH: the
+    /// declaration binds the local name, this types the call. Resolving a call
+    /// against the wrong one is a defect, not a shortcut - see
+    /// `parse::EffectScope`, which walks the declaration to a namespace and an
+    /// exported name and only then asks the grant for the signature.
     pub imports: Vec<FuncSig>,
-    /// Event handlers (simple semantic-AST bodies).
+    /// Event handlers.
+    ///
+    /// **Empty in everything the authoring surface produces, and that is
+    /// correct rather than a gap** (LIBHBUI_PLAN Rule 46a): an effect is one
+    /// call expression in an `on[A-Z]*` attribute, so there is no handler to
+    /// declare. `HandlerDecl`, `Stmt`, `Return`, `If` and `Set` are a codec
+    /// shape the format carries; nothing parses one, and
+    /// `Definition::from_document` writes `handlers: Vec::new()`.
     pub handlers: Vec<HandlerDecl>,
 }
 
@@ -78,6 +95,13 @@ pub struct InterfaceDecl {
 /// on and under what local name); resolving it to a concrete provider is the
 /// consumer's job (highbay_ui's provider registry today; a real module runtime
 /// later).
+///
+/// **This is *where a name came from*, and nothing more.** It carries no
+/// signature: what the name may be *called as* lives in a [`FuncSig`] - in
+/// [`HostEffects`] for a granted host namespace, in [`DagModule::imports`] once
+/// a module is assembled. The two are chained, never interchangeable: a local
+/// name resolves through this declaration to a namespace and an exported name,
+/// and only then to the signature that types the call.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ImportDecl {
     /// The module specifier string (`from "…"`) — a Script's display name in the
@@ -389,6 +413,36 @@ pub enum EffectError {
         /// The exported name the import asked for.
         imported: String,
     },
+    /// The source imports a `host:` namespace and the parse context does not
+    /// offer the effect surface at all (Rule 49's `enable_effects`).
+    ///
+    /// Distinct from [`EffectError::UnknownHostNamespace`], which is a load
+    /// that offers effects and does not grant *this* one. The two say different
+    /// things to whoever reads the message - one is a capability the embedding
+    /// withheld, the other is an embedding that has no capabilities to give -
+    /// and collapsing them was how the default context's refusal came to blame
+    /// the source for a decision the caller made.
+    EffectsNotOffered {
+        /// The specifier as written.
+        source: String,
+    },
+    /// A JSX **spread attribute** - `<Action {...handlers}/>`.
+    ///
+    /// Refused rather than skipped, and the reason is Rule 46a's: a spread's
+    /// contents are not statically known, so `{...handlers}` where
+    /// `handlers = { onTap: navigate("Chat") }` would reach an element as *no
+    /// attribute at all*. The attribute loop never sees an `on..` name, so
+    /// every refusal above is blind to it, and the effect is erased by exactly
+    /// the route the [`AttrValue::NamedEffect`] producer exists to close.
+    ///
+    /// It could not be honoured even if it were resolvable: an attribute set
+    /// spread from a value cannot be checked against declared props, so
+    /// accepting one would be a second, unchecked way to give an element
+    /// attributes.
+    SpreadAttribute {
+        /// The tag it was written on.
+        tag: String,
+    },
 }
 
 impl std::fmt::Display for EffectError {
@@ -445,6 +499,14 @@ impl std::fmt::Display for EffectError {
             Self::UndeclaredHostImport { source, imported } => write!(
                 f,
                 "the host namespace `{source}` declares no `{imported}`"
+            ),
+            Self::EffectsNotOffered { source } => write!(
+                f,
+                "`{source}` is a host namespace and this load does not offer effects"
+            ),
+            Self::SpreadAttribute { tag } => write!(
+                f,
+                "<{tag}> spreads its attributes, and a spread cannot be resolved to declared props or checked for an effect"
             ),
         }
     }
@@ -809,10 +871,30 @@ mod tests {
             // `navigate` takes the destination's STORED SYMBOL (LIBHBUI_PLAN
             // Rule 9), so its parameter is a string. It read `S32` here until
             // the effect producer landed, which disagreed with every real
-            // destination in the system - `navigate(0)` names nothing - and
-            // nothing could see it, because no call was ever checked against a
-            // signature. Now one is, so the sample and the calls below agree by
-            // machine rather than by reading.
+            // destination in the system - `navigate(0)` names nothing.
+            //
+            // WHAT IS CHECKED, AND WHAT IS NOT. The signature check lives in
+            // `parse::effect_attr` and covers an effect **attribute**:
+            // `onTap={navigate("Chat")}` is resolved through its `ImportDecl`
+            // to a namespace and an exported name, and its arguments checked
+            // against the `FuncSig` the host grants. Nothing checks a
+            // `HandlerDecl` body - no pass walks `Stmt`/`Expr::Call` and looks
+            // the callee up in a signature list - so the `navigate(LitStr(..))`
+            // below agrees with this one only because the test named at the end
+            // of this comment asserts it. Every libtsx and libhbui test stayed
+            // green with the two disagreeing.
+            //
+            // THAT IS NOT A GAP TO BE FILLED. Under Rule 46a the authoring
+            // surface has no handlers at all - an effect is one call expression
+            // in an `on[A-Z]*` attribute - so `HandlerDecl` is a codec shape
+            // and THIS FIXTURE IS ITS ONLY WRITER anywhere. A handler-body
+            // checker would have nothing to check, and building one would be
+            // building for a model this project does not have.
+            //
+            // So the consistency of the hand-written pair below is a FIXTURE
+            // property, asserted by
+            // `the_samples_hand_written_handler_agrees_with_the_signatures_beside_it`
+            // and by nothing in the library.
             imports: vec![FuncSig {
                 name: "navigate".into(),
                 params: vec![FieldDecl {
@@ -853,6 +935,71 @@ mod tests {
         let json = serde_json::to_string(&node).expect("serialize");
         let back: DagNode = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(node, back);
+    }
+
+    /// **A FIXTURE CHECK, and only that.** It walks the one hand-written
+    /// [`HandlerDecl`] in libtsx's own [`sample_module`] and asserts its call
+    /// agrees with the [`FuncSig`] written beside it.
+    ///
+    /// **The authoring model has no handlers** (LIBHBUI_PLAN Rule 46a): an
+    /// effect is one call expression in an `on[A-Z]*` attribute, nothing parses
+    /// a `HandlerDecl`, and `Definition::handlers` staying empty is correct
+    /// rather than a gap. So this is **not** a handler-body checker, nor the
+    /// seed of one - the sample below is the only `HandlerDecl` in existence,
+    /// and this test exists because that makes it the only thing that can
+    /// disagree with itself. `sample_module` carried `navigate(target: S32)`
+    /// beside a call passing `LitStr("Chat")` with every test in the workspace
+    /// green.
+    ///
+    /// The two "imports" it touches are different things and are used as such:
+    /// the callee is a name, and [`DagModule::imports`] is a list of
+    /// **signatures**. There is no [`ImportDecl`] here at all - a fixture
+    /// module skips the statement that would bind the name.
+    #[test]
+    fn the_samples_hand_written_handler_agrees_with_the_signatures_beside_it() {
+        let module = sample_module();
+        let mut checked = 0;
+        for handler in &module.handlers {
+            for stmt in &handler.body {
+                let Stmt::Expr(Expr::Call { callee, args }) = stmt else {
+                    continue;
+                };
+                let sig = module
+                    .imports
+                    .iter()
+                    .find(|s| &s.name == callee)
+                    .unwrap_or_else(|| {
+                        panic!("`{callee}` is called and no host signature declares it")
+                    });
+                assert_eq!(
+                    args.len(),
+                    sig.params.len(),
+                    "`{callee}` is called with {} arguments and declares {}",
+                    args.len(),
+                    sig.params.len(),
+                );
+                for (arg, param) in args.iter().zip(&sig.params) {
+                    let holds = matches!(
+                        (arg, &param.ty),
+                        (Expr::LitStr(_), TypeShape::String)
+                            | (Expr::LitBool(_), TypeShape::Bool)
+                            | (Expr::LitS32(_), TypeShape::S32)
+                            | (Expr::LitS64(_), TypeShape::S64)
+                            | (Expr::LitF32(_), TypeShape::F32)
+                            | (Expr::LitF64(_), TypeShape::F64)
+                    );
+                    assert!(
+                        holds,
+                        "`{callee}` passes {arg:?} where `{}` is declared {:?}",
+                        param.name, param.ty,
+                    );
+                }
+                checked += 1;
+            }
+        }
+        // Not a count reaching a path - a guard against the walk finding
+        // nothing and the test passing by walking an empty body.
+        assert_eq!(checked, 1, "the sample declares exactly one host call");
     }
 
     #[test]

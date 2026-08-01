@@ -13,7 +13,7 @@
 //!   postcard codec.
 //!   Effect bindings ([`NamedEffect`], [`HostEffects`]) live here too: an
 //!   `onTap={navigate("Chat")}` is graph data like everything else.
-//! * [`parse_tsx`] / [`parse_tsx_with`] / [`extract_interfaces`] (feature
+//! * [`parse_tsx`] / [`ParseCtx`] / [`extract_interfaces`] (feature
 //!   `parse`, on by default) - the TSX parser built on oxc, which *produces*
 //!   [`dag`] values and owns no
 //!   types of its own. Downstream crates that only need the graph types can
@@ -39,7 +39,9 @@ pub use dag::{
 };
 
 #[cfg(feature = "parse")]
-pub use parse::{ParseError, extract_interfaces, parse_app, parse_tsx, parse_tsx_with};
+pub use parse::{
+    ParseCtx, ParseCtxBuilder, ParseError, extract_interfaces, parse_app, parse_tsx,
+};
 
 #[cfg(feature = "parse")]
 pub use transpile::transpile_ts;
