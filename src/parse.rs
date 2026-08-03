@@ -1003,6 +1003,15 @@ fn push_child(
                             }
                         }
                     }
+                    Expression::ArrowFunctionExpression(arrow) => {
+                        // A list render function is authored as
+                        // `{(item) => <Item>...</Item>}`. The retained tree
+                        // carries the returned JSX; the parameter remains
+                        // available to its binding-valued props.
+                        if let Some(jsx) = arrow_root_jsx(arrow) {
+                            out.push(Node::Element(convert_element(jsx, scope)?));
+                        }
+                    }
                     other => {
                         if let Some(path) = expr_path(other) {
                             out.push(Node::Expr(path));
