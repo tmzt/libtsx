@@ -4,9 +4,15 @@
 //! attributes, type arguments, and child nodes in source order. The output may differ
 //! in formatting from the original source, but the semantic structure is identical.
 //!
-//! Comments are **not** preserved — the [`Node`] enum carries only Element, Text, and
-//! Expr variants, so comment information is lost during parsing. The emitted source
-//! is therefore smaller than many authored sources.
+//! Comments **are** preserved, when the parse that produced the document was asked
+//! to keep them ([`crate::ParseCtxBuilder::retain_comments`]). A [`Node::Comment`]
+//! holds the comment verbatim, delimiters included, so emitting one is a copy: the
+//! only thing this module decides is the punctuation AROUND it, which differs by
+//! position (a comment at the top level of the module is written as-is; a comment
+//! among JSX children has to be wrapped in the `{ }` that JSX requires).
+//!
+//! A document from a parse that did NOT retain comments carries none, and emits
+//! none - which is the publish path, and is why no `.hbdef` can contain one.
 
 use crate::dag::{
     AttrValue, Element, ImportDecl, InterfaceDecl, Node,
@@ -33,12 +39,30 @@ pub fn emit_tsx_document(doc: &TsxDocument) -> String {
         out.push('\n');
     }
 
-    // Emit root nodes
+    // Emit root nodes. `Position::Module` because these are statements of the
+    // module, not children of an element - which is the whole of what a
+    // comment's punctuation depends on.
     for node in &doc.root_nodes {
-        emit_node(&mut out, node, 0);
+        emit_node(&mut out, node, 0, Position::Module);
     }
 
     out
+}
+
+/// Where a node is being emitted, which is what decides how a comment is
+/// punctuated.
+///
+/// The two are not interchangeable and getting it wrong is silent: `// note`
+/// written among JSX children is not a comment at all, it is TEXT, and would
+/// re-parse as a [`Node::Text`] that then draws. Making the caller state the
+/// position is what stops that being a judgement call at each of the two call
+/// sites.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Position {
+    /// A statement of the module: comments are written as authored.
+    Module,
+    /// A child of a JSX element: comments must be wrapped in `{ }`.
+    JsxChild,
 }
 
 /// Emit an import declaration.
@@ -64,8 +88,8 @@ fn emit_import(out: &mut String, import: &ImportDecl) {
     out.push_str("\";");
 }
 
-/// Emit a node (Element, Text, or Expr) with the given indentation level.
-fn emit_node(out: &mut String, node: &Node, indent: usize) {
+/// Emit a node with the given indentation level, punctuated for `position`.
+fn emit_node(out: &mut String, node: &Node, indent: usize, position: Position) {
     match node {
         Node::Element(elem) => {
             emit_element(out, elem, indent);
@@ -87,7 +111,40 @@ fn emit_node(out: &mut String, node: &Node, indent: usize) {
             out.push('}');
             out.push('\n');
         }
+        Node::Comment(text) => emit_comment(out, text, indent, position),
     }
+}
+
+/// Emit a comment - the text VERBATIM, with only the punctuation its position
+/// requires added around it.
+///
+/// Nothing here rewrites the comment: a `//` stays a `//` and a `/* */` stays a
+/// `/* */`, because the parse stored what was authored and re-deriving a
+/// delimiter is how `parse -> emit -> parse` stops being the identity (see
+/// [`Node::Comment`]).
+///
+/// Among JSX children the wrapping `{ }` is not cosmetic - it is what makes the
+/// text a comment rather than rendered text - and a LINE comment additionally
+/// needs the closing brace on the next line, because `//` runs to end of line
+/// and `{// note}` comments out the brace that was meant to close the
+/// container.
+fn emit_comment(out: &mut String, text: &str, indent: usize, position: Position) {
+    emit_indent(out, indent);
+    match position {
+        Position::Module => {
+            out.push_str(text);
+        }
+        Position::JsxChild => {
+            out.push('{');
+            out.push_str(text);
+            if text.starts_with("//") {
+                out.push('\n');
+                emit_indent(out, indent);
+            }
+            out.push('}');
+        }
+    }
+    out.push('\n');
 }
 
 /// Emit an element with the given indentation level.
@@ -125,7 +182,7 @@ fn emit_element(out: &mut String, elem: &Element, indent: usize) {
 
         // Emit children with increased indentation
         for child in &elem.children {
-            emit_node(out, child, indent + 1);
+            emit_node(out, child, indent + 1, Position::JsxChild);
         }
 
         // Emit closing tag
@@ -487,11 +544,62 @@ mod roundtrip_tests {
         }
     }
 
+    /// How many comment nodes a document carries, at every depth.
+    fn comments_in(nodes: &[Node]) -> usize {
+        nodes
+            .iter()
+            .map(|n| match n {
+                Node::Comment(_) => 1,
+                Node::Element(e) => comments_in(&e.children),
+                Node::Text(_) | Node::Expr(_) => 0,
+            })
+            .sum()
+    }
+
+    /// How many comments the SOURCE has, counted without the parser.
+    ///
+    /// An independent measure on purpose: "the retained count equals what the
+    /// parse retained" is not a claim about anything. Every fixture in the
+    /// corpus comments with `//` at the head of a line, so a line scan is a
+    /// second opinion the parser cannot influence - and if a fixture ever grows
+    /// a block comment or a `//` inside a string, this disagrees loudly rather
+    /// than quietly measuring the wrong thing.
+    fn line_comments(source: &str) -> usize {
+        source
+            .lines()
+            .filter(|l| l.trim_start().starts_with("//"))
+            .count()
+    }
+
+    /// The round trip, in BOTH parses of the same source: the one that retains
+    /// comments and the one that does not.
+    ///
+    /// Both, every time, because they are the two production paths and they
+    /// must not diverge in anything but comments: the publish path parses
+    /// without them (so no `.hbdef` can carry one) and the editor path parses
+    /// with them (so the source it shows is the source that was written).
     fn roundtrip_test(tsx_source: &str, test_name: &str) {
-        eprintln!("Testing roundtrip for: {}", test_name);
+        roundtrip_once(tsx_source, test_name, false);
+
+        let retained = roundtrip_once(tsx_source, test_name, true);
+        let authored = line_comments(tsx_source);
+        assert_eq!(
+            retained, authored,
+            "{test_name}: the source has {authored} comment lines and the retaining parse kept {retained}"
+        );
+    }
+
+    /// One round trip, in one context. Answers how many comments survived it.
+    fn roundtrip_once(tsx_source: &str, test_name: &str, retain: bool) -> usize {
+        eprintln!("Testing roundtrip for: {} (retain_comments={retain})", test_name);
 
         // Create a context with a host that grants effects
-        let ctx = ParseCtx::builder().set_host(TestHost).build();
+        let builder = ParseCtx::builder().set_host(TestHost);
+        let ctx = if retain {
+            builder.retain_comments().build()
+        } else {
+            builder.build()
+        };
 
         // Parse the original source
         let doc1 = match ctx.parse_tsx(tsx_source) {
@@ -545,7 +653,19 @@ mod roundtrip_tests {
             panic!("Round-trip failed for {}: DAGs not equal", test_name);
         }
 
+        let comments = comments_in(&doc1.root_nodes);
+        if !retain {
+            // The publish guarantee, asserted rather than assumed: a parse that
+            // was not asked for comments constructs the variant nowhere, so
+            // nothing downstream of it needs a filter.
+            assert_eq!(
+                comments, 0,
+                "{test_name}: a parse without retain_comments produced {comments} comment nodes"
+            );
+        }
+
         eprintln!("Round-trip successful for: {}", test_name);
+        comments
     }
 
     #[test]
@@ -594,5 +714,147 @@ mod roundtrip_tests {
     fn roundtrip_libhbui_chat() {
         let source = include_str!("../tests/fixtures/libhbui_chat.tsx");
         roundtrip_test(source, "crates/libhbui/fixtures/chat.tsx");
+    }
+
+    // --- the shapes the corpus does not have ---------------------------------
+    //
+    // Every fixture above comments the same way: `//` at the head of a line,
+    // above the code. That is the corpus Highbay actually writes, and it would
+    // leave three shapes untested - a comment among JSX CHILDREN, a comment
+    // between two elements, and a BLOCK comment - each of which the emitter
+    // punctuates differently and any of which a future source may use.
+
+    /// The retaining context, spelled once.
+    fn retaining() -> ParseCtx {
+        ParseCtx::builder().set_host(TestHost).retain_comments().build()
+    }
+
+    /// The comments of a document, in order, at every depth.
+    fn comment_texts(nodes: &[Node]) -> Vec<String> {
+        let mut out = Vec::new();
+        fn walk(nodes: &[Node], out: &mut Vec<String>) {
+            for n in nodes {
+                match n {
+                    Node::Comment(t) => out.push(t.clone()),
+                    Node::Element(e) => walk(&e.children, out),
+                    Node::Text(_) | Node::Expr(_) => {}
+                }
+            }
+        }
+        walk(nodes, &mut out);
+        out
+    }
+
+    #[test]
+    fn a_block_comment_among_jsx_children_survives_the_round_trip() {
+        // `{/* ... */}` is the only way JSX can hold a comment among children:
+        // bare `// note` there is TEXT, and would draw.
+        const SOURCE: &str = r#"
+<Screen>
+    {/* above the column */}
+    <Column>
+        <Item />
+        {/* between two items */}
+        <Item />
+    </Column>
+</Screen>
+"#;
+        let ctx = retaining();
+        let doc = ctx.parse_tsx(SOURCE).expect("parse");
+        assert_eq!(
+            comment_texts(&doc.root_nodes),
+            vec![
+                "/* above the column */",
+                "/* between two items */",
+            ],
+            "both child comments are retained, verbatim and in authored order"
+        );
+
+        let emitted = emit_tsx_document(&doc);
+        let back = ctx.parse_tsx(&emitted).unwrap_or_else(|e| {
+            panic!("re-parsing the emitted source failed: {e}\n{emitted}")
+        });
+        assert_eq!(doc, back, "emitted source:\n{emitted}");
+    }
+
+    #[test]
+    fn a_line_comment_among_jsx_children_survives_the_round_trip() {
+        // A `//` comment inside a JSX expression container is legal, and it is
+        // the one shape where the emitter cannot just wrap the text in braces:
+        // `{// note}` comments out its own closing brace, so the brace has to
+        // go on the next line. This is that case, end to end.
+        const SOURCE: &str = "
+<Screen>
+    {// a line comment, in braces
+    }
+    <Column />
+</Screen>
+";
+        let ctx = retaining();
+        let doc = ctx.parse_tsx(SOURCE).expect("parse");
+        assert_eq!(
+            comment_texts(&doc.root_nodes),
+            vec!["// a line comment, in braces"]
+        );
+
+        let emitted = emit_tsx_document(&doc);
+        assert!(
+            !emitted.contains("// a line comment, in braces}"),
+            "the closing brace must not be inside the line comment:\n{emitted}"
+        );
+        let back = ctx.parse_tsx(&emitted).unwrap_or_else(|e| {
+            panic!("re-parsing the emitted source failed: {e}\n{emitted}")
+        });
+        assert_eq!(doc, back, "emitted source:\n{emitted}");
+    }
+
+    #[test]
+    fn a_comment_between_two_root_statements_keeps_its_place() {
+        const SOURCE: &str = r#"
+// above the import
+import { navigate } from "host:effects";
+// below the import, above the screen
+<Screen />
+"#;
+        let ctx = retaining();
+        let doc = ctx.parse_tsx(SOURCE).expect("parse");
+        assert_eq!(
+            comment_texts(&doc.root_nodes),
+            vec!["// above the import", "// below the import, above the screen"],
+        );
+        // Both are BEFORE the element, because both were written before it -
+        // the import is not a root node, so it does not separate them.
+        assert!(
+            matches!(doc.root_nodes.last(), Some(Node::Element(e)) if e.tag == "Screen"),
+            "the element is still the last root: {:?}",
+            doc.root_nodes
+        );
+
+        let emitted = emit_tsx_document(&doc);
+        let back = ctx.parse_tsx(&emitted).expect("re-parse");
+        assert_eq!(doc, back, "emitted source:\n{emitted}");
+    }
+
+    #[test]
+    fn without_retention_the_same_sources_carry_no_comment_at_all() {
+        // The publish guarantee. Not "the comments are filtered out
+        // downstream" - the variant is never constructed, so there is no
+        // downstream filter to forget.
+        const SOURCES: [&str; 2] = [
+            "// a header\n<Screen>\n{/* a child */}\n<Column />\n</Screen>\n",
+            "// only a header\n<Screen />\n",
+        ];
+        let ctx = ParseCtx::builder().set_host(TestHost).build();
+        for source in SOURCES {
+            let doc = ctx.parse_tsx(source).expect("parse");
+            assert_eq!(
+                comment_texts(&doc.root_nodes),
+                Vec::<String>::new(),
+                "the default context retained a comment from:\n{source}"
+            );
+        }
+        // And the free function, which is that same default context.
+        let doc = crate::parse_tsx(SOURCES[0]).expect("parse");
+        assert_eq!(comment_texts(&doc.root_nodes), Vec::<String>::new());
     }
 }

@@ -593,6 +593,46 @@ pub enum Node {
     Text(String),
     /// A `{binding}` expression child — a data-binding path.
     Expr(String),
+    /// An authored **comment**, verbatim, delimiters included: `// like this`
+    /// or `/* like this */`.
+    ///
+    /// # It contributes no ink and no box
+    ///
+    /// A comment is the one node kind that must reach the graph and *never*
+    /// reach a frame. Every walker that lays out, draws, hit-tests, counts rows
+    /// or projects to the ECS skips it, and that is asserted mechanically
+    /// rather than by inspection: `libhbui/tests/comments_are_invisible.rs`
+    /// parses one source twice - once retaining comments and once not - and
+    /// requires the two `DrawList`s to be byte-identical. A walker that turned
+    /// a comment into a layout node, or worse rendered it as text, diverges the
+    /// two lists.
+    ///
+    /// # Retained only when the parse was asked to
+    ///
+    /// [`crate::ParseCtxBuilder::retain_comments`] is off by default, so the
+    /// PUBLISH path (which never asks) produces documents that cannot contain
+    /// this variant at all. The editor path asks, because the source it shows
+    /// is emitted from the graph ([`crate::emit_tsx_document`]) and a
+    /// comment-free graph would emit a gutted file: `data/projects/default/
+    /// screens/home.tsx` is 23 of 52 lines comment.
+    ///
+    /// # Why verbatim, delimiters and all
+    ///
+    /// So that emit is a copy and the round trip is exact. The alternative -
+    /// storing the content and re-deriving a delimiter - has to decide whether
+    /// a block comment becomes one line comment or several, whether adjacent
+    /// line comments were one comment or two, and where a blank line went; each
+    /// of those decisions is a way for `parse -> emit -> parse` to stop being
+    /// the identity. One authored comment is one `Comment`, spelled the way it
+    /// was written.
+    ///
+    /// # Position in the enum is load-bearing
+    ///
+    /// LAST, and it must stay last. `libhbui::codec` serializes this enum with
+    /// postcard, which writes a variant's INDEX; appending is the only change
+    /// that leaves the existing three indices where previously-encoded data
+    /// expects them.
+    Comment(String),
 }
 
 /// A parsed, fully-owned TSX document (no oxc arena references): the element
@@ -686,13 +726,26 @@ impl Definition {
     /// `handlers` starts empty: libtsx has no handler-extraction entry point
     /// yet, and inventing one by inference is exactly the derivation Rule 30
     /// forbids. Callers with handlers assign the field.
+    ///
+    /// **A [`Node::Comment`] root is skipped, not counted.** A source whose
+    /// header comment was retained is still one definition - it exposes one
+    /// element - so counting the comments as extra roots would refuse a source
+    /// that is exactly what this constructor is for. What that costs is
+    /// stated rather than hidden: a `Definition` has no slot for a comment and
+    /// this drops them. It is the honest place for that loss, because a
+    /// `Definition` is the PUBLISHED unit and the publish path parses with
+    /// [`crate::ParseCtxBuilder::retain_comments`] off - so on that path there
+    /// is nothing here to drop. The path that keeps comments keeps them on the
+    /// [`TsxDocument`], which is what [`crate::emit_tsx_document`] reads.
     pub fn from_document(
         symbol: impl Into<String>,
         doc: TsxDocument,
         interfaces: Vec<InterfaceDecl>,
     ) -> Result<Self, DefError> {
         let TsxDocument { root_nodes, imports } = doc;
-        let mut roots = root_nodes.into_iter();
+        let mut roots = root_nodes
+            .into_iter()
+            .filter(|n| !matches!(n, Node::Comment(_)));
         let Some(first) = roots.next() else {
             return Err(DefError::NoUi);
         };
@@ -1222,6 +1275,45 @@ mod tests {
         assert_eq!(
             Definition::from_document("UserCard", texty, vec![]),
             Err(DefError::RootNotAnElement)
+        );
+    }
+
+    #[test]
+    fn a_retained_comment_is_not_a_second_root() {
+        // A source whose header comment was kept is still ONE definition: it
+        // exposes one element. Counting the comments as roots would refuse
+        // exactly the sources this constructor exists for - every authored
+        // Highbay screen has a header block.
+        let mut doc = a_document();
+        doc.root_nodes.insert(0, Node::Comment("// the header".into()));
+        doc.root_nodes.push(Node::Comment("// a trailing note".into()));
+
+        let def = Definition::from_document("UserCard", doc, vec![]).expect("still one definition");
+        assert_eq!(def.ui.tag, "Widget", "the element is the one that was found");
+
+        // Two elements is still two, comments or no comments.
+        let mut two = a_document();
+        two.root_nodes.insert(0, Node::Comment("// the header".into()));
+        two.root_nodes.push(Node::Element(Element {
+            tag: "Stowaway".into(),
+            type_args: vec![],
+            attrs: vec![],
+            children: vec![],
+        }));
+        assert_eq!(
+            Definition::from_document("UserCard", two, vec![]),
+            Err(DefError::SeveralRoots(2)),
+            "the count is of ELEMENTS, so the comment neither adds to it nor hides a second root"
+        );
+
+        // And a document that is only comments has no UI at all.
+        let only = TsxDocument {
+            root_nodes: vec![Node::Comment("// nothing but a note".into())],
+            imports: vec![],
+        };
+        assert_eq!(
+            Definition::from_document("UserCard", only, vec![]),
+            Err(DefError::NoUi)
         );
     }
 

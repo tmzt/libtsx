@@ -39,7 +39,7 @@ use oxc_ast::ast::{
     ModuleExportName, PropertyKey, Statement, TSSignature, TSType,
 };
 use oxc_parser::Parser;
-use oxc_span::SourceType;
+use oxc_span::{SourceType, Span};
 
 /// Everything a parse can refuse.
 ///
@@ -136,16 +136,22 @@ pub fn parse_tsx(source: &str) -> Result<TsxDocument, Vec<String>> {
 /// answers, which is what keeps every name in an embedding's model out of this
 /// crate.
 ///
-/// **The builder is the only way to configure one.** The field is private and
-/// there is no setter, so a context is either the default (offering nothing) or
+/// **The builder is the only way to configure one.** Every field is private and
+/// none has a setter, so a context is either the default (offering nothing) or
 /// one a [`ParseCtxBuilder`] produced - which is what stops a capability being
 /// enabled by a route some other entry point forgets:
 ///
-/// ```compile_fail,E0451
+/// ```compile_fail
 /// use libtsx::ParseCtx;
 ///
-/// let ctx = ParseCtx { host: None };
+/// let ctx = ParseCtx { host: None, retain_comments: true };
 /// ```
+///
+/// (`compile_fail` without an error code: rustc reports a *private field* as
+/// E0451 when one field is private and as an uncoded "cannot construct with
+/// struct literal syntax" once there are two, so pinning the code would make
+/// this doctest fail the next time a capability is added - which is the
+/// opposite of what it is here to defend.)
 ///
 /// The default offers **nothing**, which is the honest one: a source calling an
 /// effect it was never given has named a capability it does not have.
@@ -154,6 +160,9 @@ pub struct ParseCtx {
     /// The embedding's provider, or `None` for a load that offers no host
     /// surface at all.
     host: Option<Arc<dyn ParserHost>>,
+    /// Whether authored comments survive as [`Node::Comment`]. See
+    /// [`ParseCtxBuilder::retain_comments`].
+    retain_comments: bool,
 }
 
 impl std::fmt::Debug for ParseCtx {
@@ -162,6 +171,7 @@ impl std::fmt::Debug for ParseCtx {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ParseCtx")
             .field("host", &self.host.is_some())
+            .field("retain_comments", &self.retain_comments)
             .finish()
     }
 }
@@ -170,6 +180,7 @@ impl std::fmt::Debug for ParseCtx {
 #[derive(Clone, Default)]
 pub struct ParseCtxBuilder {
     host: Option<Arc<dyn ParserHost>>,
+    retain_comments: bool,
 }
 
 /// The provider [`ParseCtxBuilder::enable_effects`] installs: the surface is
@@ -208,9 +219,51 @@ impl ParseCtxBuilder {
         self
     }
 
+    /// Keep the source's **comments**, as [`Node::Comment`] nodes in the tree
+    /// they were written in.
+    ///
+    /// **Off by default, and that default is the load-bearing half.** Highbay
+    /// has two parses of the same file with two different jobs:
+    ///
+    /// * The **publish** path lowers a source to a node-graph that ships. It
+    ///   does not ask for comments, so no published `.hbdef` and no
+    ///   `NodeGraph` can contain a [`Node::Comment`] at all - not by a filter
+    ///   somewhere downstream that could be forgotten, but because the variant
+    ///   is never constructed on that path.
+    /// * The **editor** path shows the author their source, and that source is
+    ///   emitted from the graph ([`crate::emit_tsx_document`]) rather than read
+    ///   off disk. It asks, because a comment-free graph emits a gutted file:
+    ///   `data/projects/default/screens/home.tsx` is 23 comment lines out of
+    ///   52, and `data/projects/baychat/screens/chat.tsx` is 45 out of 82.
+    ///
+    /// This is a switch on the ONE context rather than a second entry point,
+    /// for the reason [`ParseCtx`] exists at all (Rule 49): a capability
+    /// spelled as its own function is a capability the next entry point does
+    /// not have.
+    ///
+    /// # What is retained, and what is not
+    ///
+    /// Retained: every comment at the top level of the module (before or
+    /// between the imports, the interfaces and the JSX), and every
+    /// `{/* comment */}` written as a JSX child. Each becomes one
+    /// [`Node::Comment`] holding the comment VERBATIM, delimiters included, in
+    /// its authored position.
+    ///
+    /// Not retained: a comment written *inside* an expression - between an
+    /// attribute and its value, or inside a list render arrow's parentheses.
+    /// Those sit in places the element tree has no node for, and inventing one
+    /// would mean the graph carrying a position it cannot re-emit.
+    pub fn retain_comments(mut self) -> Self {
+        self.retain_comments = true;
+        self
+    }
+
     /// The configured context.
     pub fn build(self) -> ParseCtx {
-        ParseCtx { host: self.host }
+        ParseCtx {
+            host: self.host,
+            retain_comments: self.retain_comments,
+        }
     }
 }
 
@@ -263,9 +316,21 @@ impl ParseCtx {
                 imports.push(convert_import(decl));
             }
         }
-        let scope = EffectScope::build(&imports, self)?;
+        let low = Lowering {
+            scope: EffectScope::build(&imports, self)?,
+            comments: self
+                .retain_comments
+                .then(|| Comments::of(source, &ret.program.comments)),
+        };
 
-        let mut root_nodes = Vec::new();
+        // Every root node, paired with WHERE IN THE SOURCE it began, and every
+        // span the element tree took ownership of. Both are for the comment
+        // merge below and cost nothing when it does not run: a comment inside
+        // one of the owned spans belongs to the tree (`push_child` already
+        // placed it), and the position is what puts the loose ones back in
+        // authored order without reordering anything else.
+        let mut roots: Vec<(u32, Node)> = Vec::new();
+        let mut owned: Vec<Span> = Vec::new();
         // Pass 1: bare JSX statements and a table of
         // `const Name = () => (<JSX/>)` arrow components (for export-default-by-name).
         let mut arrow_components: Vec<(&str, &JSXElement)> = Vec::new();
@@ -273,12 +338,16 @@ impl ParseCtx {
             match stmt {
                 Statement::ExpressionStatement(expr_stmt) => match &expr_stmt.expression {
                     Expression::JSXElement(jsx) => {
-                        root_nodes.push(Node::Element(convert_element(jsx, &scope)?))
+                        owned.push(jsx.span);
+                        roots.push((jsx.span.start, Node::Element(convert_element(jsx, &low)?)));
                     }
                     Expression::JSXFragment(frag) => {
+                        owned.push(frag.span);
+                        let mut kids = Vec::new();
                         for child in &frag.children {
-                            push_child(&mut root_nodes, child, &scope)?;
+                            push_child(&mut kids, child, &low)?;
                         }
+                        roots.extend(kids.into_iter().map(|n| (frag.span.start, n)));
                     }
                     _ => {}
                 },
@@ -310,7 +379,8 @@ impl ParseCtx {
                     _ => None,
                 };
                 if let Some(jsx) = jsx {
-                    root_nodes.push(Node::Element(convert_element(jsx, &scope)?));
+                    owned.push(jsx.span);
+                    roots.push((jsx.span.start, Node::Element(convert_element(jsx, &low)?)));
                 }
             }
         }
@@ -318,11 +388,17 @@ impl ParseCtx {
         // Lenient fallback: a module with a single `const` arrow component and no
         // export/bare-JSX still yields its JSX (so a mid-edit missing `export default`
         // doesn't blank the preview).
-        if root_nodes.is_empty() {
+        if roots.is_empty() {
             if let Some((_, jsx)) = arrow_components.first() {
-                root_nodes.push(Node::Element(convert_element(jsx, &scope)?));
+                owned.push(jsx.span);
+                roots.push((jsx.span.start, Node::Element(convert_element(jsx, &low)?)));
             }
         }
+
+        let root_nodes = match &low.comments {
+            None => roots.into_iter().map(|(_, node)| node).collect(),
+            Some(comments) => comments.merge_roots(roots, &owned),
+        };
 
         Ok(TsxDocument { root_nodes, imports })
     }
@@ -345,6 +421,15 @@ impl ParseCtx {
     /// children are replaced by the screen elements - the screen files are the
     /// content authority). A screen source with no root element, or an app
     /// source with no root element, is a [`ParseError::NoRootElement`].
+    ///
+    /// **Top-level comments do not survive the splice**, even under
+    /// [`ParseCtxBuilder::retain_comments`]: "exactly one root node" is this
+    /// method's contract, and a header comment has no element to hang off once
+    /// several files have been combined into one. That is not a loss on any
+    /// path that matters - this is the PUBLISH shape, whose parse does not
+    /// retain comments in the first place, and the editor's source comes from
+    /// one file's own [`ParseCtx::parse_tsx`]. Comments written as JSX children
+    /// are inside a screen's root element and travel with it.
     ///
     /// **The context is what it grants**, and that is the whole reason it
     /// exists: every file here parses in *this* context, so an effect the
@@ -382,11 +467,106 @@ impl ParseCtx {
 }
 
 /// The first root node that is an element.
+///
+/// A [`Node::Comment`] root is skipped rather than refused: a source whose
+/// header comment was retained still has a root element, and the wildcard here
+/// says so deliberately.
 fn root_element(root_nodes: Vec<Node>) -> Option<Element> {
     root_nodes.into_iter().find_map(|n| match n {
         Node::Element(e) => Some(e),
         _ => None,
     })
+}
+
+// --- what the JSX lowering carries -------------------------------------------
+
+/// The two things every element conversion needs: what the module's imports
+/// resolved to, and (when this parse retains them) where its comments are.
+///
+/// One value rather than two parameters, for the reason [`ParseCtx`] is one
+/// value rather than a function per capability: a lowering that grew a third
+/// thing to carry would otherwise grow a third parameter on every recursive
+/// call, and the one call site that forgot it would be the one that silently
+/// dropped what it carried.
+struct Lowering<'a> {
+    /// What each imported name was imported from (Rules 46a, 48).
+    scope: EffectScope<'a>,
+    /// The source's comments, or `None` when this parse does not retain them.
+    comments: Option<Comments<'a>>,
+}
+
+/// Where the source's comments are, so a lowering can place them.
+///
+/// Holds SPANS and the source, never extracted strings: a comment's text is
+/// `source[span]` verbatim, delimiters included, which is what makes emit a
+/// copy rather than a reconstruction (see [`Node::Comment`]).
+struct Comments<'a> {
+    /// The source the spans index into.
+    source: &'a str,
+    /// Every comment's span, in source order (oxc collects them lexically).
+    spans: Vec<Span>,
+}
+
+impl<'a> Comments<'a> {
+    fn of(source: &'a str, comments: &[oxc_ast::Comment]) -> Self {
+        Self {
+            source,
+            spans: comments.iter().map(|c| c.span).collect(),
+        }
+    }
+
+    /// The comment at `span`, verbatim.
+    fn text(&self, span: Span) -> &'a str {
+        &self.source[span.start as usize..span.end as usize]
+    }
+
+    /// Every comment written inside `outer` - the shape a `{/* comment */}`
+    /// child is read with, where `outer` is the expression container's own
+    /// span.
+    fn within(&self, outer: Span) -> impl Iterator<Item = &'a str> + '_ {
+        self.spans
+            .iter()
+            .filter(move |s| outer.start <= s.start && s.end <= outer.end)
+            .map(|s| self.text(*s))
+    }
+
+    /// The root node list: every root the passes produced, with the comments
+    /// that are NOT inside the element tree put back where they were written.
+    ///
+    /// `roots` carries each node's source position and `owned` the spans the
+    /// element tree took over. A comment inside an owned span was already
+    /// placed as a child by [`push_child`] and must not be added twice.
+    ///
+    /// **Nothing here reorders the roots.** They are emitted in the order the
+    /// passes produced them, and each loose comment goes before the first root
+    /// that starts after it. Sorting by position would have been tidier and
+    /// would have changed the node order of a module with both a bare JSX
+    /// statement and an export-default component - a document shape difference
+    /// caused by asking for comments, which is exactly what a retention switch
+    /// must not do.
+    fn merge_roots(&self, roots: Vec<(u32, Node)>, owned: &[Span]) -> Vec<Node> {
+        let loose: Vec<Span> = self
+            .spans
+            .iter()
+            .copied()
+            .filter(|s| !owned.iter().any(|o| o.start <= s.start && s.end <= o.end))
+            .collect();
+        let mut out = Vec::with_capacity(roots.len() + loose.len());
+        let mut next = loose.iter();
+        let mut pending = next.next();
+        for (start, node) in roots {
+            while let Some(span) = pending.filter(|s| s.start < start) {
+                out.push(Node::Comment(self.text(*span).to_string()));
+                pending = next.next();
+            }
+            out.push(node);
+        }
+        while let Some(span) = pending {
+            out.push(Node::Comment(self.text(*span).to_string()));
+            pending = next.next();
+        }
+        out
+    }
 }
 
 // --- the effect scope (LIBHBUI_PLAN Rules 46a, 48) ----------------------------
@@ -890,7 +1070,7 @@ fn reference_shape(r: &oxc_ast::ast::TSTypeReference) -> TypeShape {
     TypeShape::Named(name)
 }
 
-fn convert_element(jsx: &JSXElement, scope: &EffectScope) -> Result<Element, EffectError> {
+fn convert_element(jsx: &JSXElement, low: &Lowering) -> Result<Element, EffectError> {
     let tag = element_name(&jsx.opening_element.name);
 
     // `<List<Message> …>` — the opening tag's type arguments, through the same
@@ -926,7 +1106,7 @@ fn convert_element(jsx: &JSXElement, scope: &EffectScope) -> Result<Element, Eff
         // `AttrValue::Opaque`, which is exactly why an `on..` attribute can
         // never quietly become one.
         let value = if is_event_binding(&key) {
-            effect_attr(&key, a.value.as_ref(), scope)?
+            effect_attr(&key, a.value.as_ref(), &low.scope)?
         } else {
             match &a.value {
                 None => AttrValue::Bool(true),
@@ -944,7 +1124,7 @@ fn convert_element(jsx: &JSXElement, scope: &EffectScope) -> Result<Element, Eff
 
     let mut children = Vec::new();
     for child in &jsx.children {
-        push_child(&mut children, child, scope)?;
+        push_child(&mut children, child, low)?;
     }
 
     Ok(Element {
@@ -981,10 +1161,10 @@ fn jsx_member_object(obj: &oxc_ast::ast::JSXMemberExpressionObject) -> String {
 fn push_child(
     out: &mut Vec<Node>,
     child: &JSXChild,
-    scope: &EffectScope,
+    low: &Lowering,
 ) -> Result<(), EffectError> {
     match child {
-        JSXChild::Element(e) => out.push(Node::Element(convert_element(e, scope)?)),
+        JSXChild::Element(e) => out.push(Node::Element(convert_element(e, low)?)),
         JSXChild::Text(t) => {
             let txt = t.value.trim();
             if !txt.is_empty() {
@@ -1009,7 +1189,7 @@ fn push_child(
                         // carries the returned JSX; the parameter remains
                         // available to its binding-valued props.
                         if let Some(jsx) = arrow_root_jsx(arrow) {
-                            out.push(Node::Element(convert_element(jsx, scope)?));
+                            out.push(Node::Element(convert_element(jsx, low)?));
                         }
                     }
                     other => {
@@ -1018,11 +1198,19 @@ fn push_child(
                         }
                     }
                 }
+            } else if let Some(comments) = &low.comments {
+                // An expression container holding NO expression is how JSX
+                // spells a comment among children: `{/* like this */}`. The
+                // container is the only node oxc leaves behind, so the text is
+                // read out of the source by span.
+                for text in comments.within(c.span) {
+                    out.push(Node::Comment(text.to_string()));
+                }
             }
         }
         JSXChild::Fragment(frag) => {
             for c in &frag.children {
-                push_child(out, c, scope)?;
+                push_child(out, c, low)?;
             }
         }
         JSXChild::Spread(_) => {}
