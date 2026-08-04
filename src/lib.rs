@@ -26,6 +26,8 @@
 
 pub mod dag;
 
+pub mod emit;
+
 #[cfg(feature = "parse")]
 mod parse;
 
@@ -40,6 +42,8 @@ pub use dag::{
     AttrValue, DefError, Definition, EffectError, Element, NamedEffect, Node, ParserHost,
     Resolution, TsxDocument,
 };
+
+pub use emit::emit_tsx_document;
 
 #[cfg(feature = "parse")]
 pub use parse::{
