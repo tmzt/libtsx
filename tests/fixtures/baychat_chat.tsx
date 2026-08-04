@@ -1,62 +1,24 @@
-// Baychat's chat screen, in libhbui's dialect.
+// Baychat's chat screen, in libhbui's dialect. Sized for 540 x 1158, the
+// canvas the committed device review frames use.
 //
-// PORTED from crates/libhbui/fixtures/chat.tsx, which is the screen that
-// already renders correctly (hbui-baychat-chat.png). Every id, box and paint
-// value below is the fixture's, reused rather than re-derived, so the two files
-// name the same widgets and cannot drift into two sets of values that merely
-// look alike. Where this file differs from the fixture it is because the
-// SHIPPED project requires it, and every such difference is listed at the foot
-// of this comment.
+// Ids, boxes and paints are REUSED from crates/libhbui/fixtures/chat.tsx rather
+// than re-derived, so the two files name the same widgets and cannot drift into
+// two sets of values that merely look alike.
 //
-// Every element carries a stored 32-hex `id` (Rules 40, 41): 24 hex digits of
-// widget identity, then `ffffffff`, which is `u32::MAX` in the row half and
-// means "not a row" (`...00000000` is row ZERO and is refused as
-// `DeclaredIdIsARow`). They are authored and never derived - an ordinal is
-// position-derived identity, and small values sit in the low-entropy region
-// where the instance-derivation mixer was shown to collapse two widgets into
-// one.
+// Three constraints shape this file and none of them are guessable from the
+// markup, so they are written down here:
 //
-// Every box and every fill is DECLARED, because libhbui infers nothing from a
-// tag name (Rule 30): `<Item>` is not a row unless it says `direction="row"`,
-// and `<Avatar>` is not a circle unless it says `shape="circle"`. The
-// vocabularies are `libhbui::layout::AttrBoxes` and `libhbui::draw::AttrPaints`.
+//  1. `<Screen>` takes exactly one child (R4, `check_screen_children`), which
+//     is why a `<Column>` wraps everything.
+//  2. Every `<Content>` under the screen's content child is projected as a LIST
+//     ROW. That is why the app bar title is a `<Title>` - a `<Content>` there
+//     would become row 0 of the thread.
+//  3. Row projection is POSITIONAL over `<Content>` document order: headline,
+//     supporting text, then timestamp. That order is forced, which is why the
+//     timestamp sits below the bubble rather than in `<Head>`.
 //
-// Sized for 540 x 1158 - the canvas the committed device review frames use.
-//
-// ASCII only (Rule 39): the baked atlas is ASCII Roboto plus a Material Symbols
-// icon subset, and an em-dash renders as an invisible space.
-//
-// WHAT DIFFERS FROM THE FIXTURE, AND WHY
-//
-//  1. The six literal `<Row>`s become ONE `<ChatFeedEntry>` template under
-//     `<List<Message> value={chatFeed} window={24}>`. The fixture is a
-//     hand-written transcript; this is the bound list the project ships. The
-//     `<Item>` remains the repeated row template and its arrow child passes
-//     `item` to the composed entry. The entry's presentation lives in
-//     `widgets/chat_feed_entry.tsx`.
-//  2. The fixture's `<Thread>` IS this `<List>` - the list has to be the
-//     screen's own content child or `AppModel` never resolves the binding - so
-//     the thread's id and its box/paint ride on the `<List>`.
-//  3. `<Screen>` takes exactly one child (R4, `check_screen_children`), so a
-//     `<Column>` wraps what the fixture hangs directly off the screen. It is the
-//     one element here with no fixture counterpart and therefore a fresh id.
-//  4. The app bar title is a `<Title>`, not the fixture's `<Content>`. Every
-//     `<Content>` under a screen's content child is projected as a LIST ROW, so
-//     a `<Content>` in the app bar would make "Chat" row 0 of the thread.
-//  5. The row's timestamp moved OUT of `<Head>` and below the bubble. The row
-//     projection is positional over `<Content>` document order - first is the
-//     headline, second the supporting text, third the timestamp - so
-//     sender/text/time is forced, while the fixture's head row reads
-//     sender/time/text.
-//  6. The bubble is always `surface-container-high`. The fixture paints "You"
-//     bubbles `primary`; one template cannot vary its fill per row.
-//  7. The composer is a `<MessageInput>` widget call. Its TSX definition owns
-//     the fixture's nested `<TextEntry>` and circular send `<Action>`; libhbui
-//     expands that stored definition before layout, so input lands on the
-//     primitive field rather than on the composition boundary.
-//  8. `onTap={navigate("Profile")}` hangs on a new `<Action>` wrapping the app
-//     bar's trailing icon, because the fixture's only `<Action>` was the send
-//     button dropped in (7). It is the second element here with a fresh id.
+// One template cannot vary its fill per row, so every bubble is
+// `surface-container-high`.
 
 import { navigate, toggleDrawer } from "host:effects";
 import { chatFeed } from "Chat Feed";
