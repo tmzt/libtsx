@@ -588,8 +588,10 @@ pub enum Node {
     /// A nested element.
     Element(Element),
     /// Literal text (JSX text, or a `{"string literal"}` child). Carries the
-    /// verbatim text, including any `{{ }}` Markdown-templating placeholders
-    /// which the highbay_ui `<Content>` layer interprets.
+    /// verbatim text, including any `{{ }}` Markdown-templating placeholders.
+    /// Reading those is [`crate::template::substitute`], which lives beside
+    /// this node for the reason its module doc gives: the placeholders are
+    /// part of this variant's content, so the scan is not any one renderer's.
     Text(String),
     /// A `{binding}` expression child — a data-binding path.
     Expr(String),

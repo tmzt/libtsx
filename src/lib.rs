@@ -16,6 +16,10 @@
 //!   So does [`ParserHost`], the provider an embedding hands the parse - the
 //!   interface that keeps every name in an embedding's model out of this crate
 //!   (LIBHBUI_PLAN Rule 52).
+//! * [`template`] — the `{{ }}` placeholder scan ([`substitute`],
+//!   [`placeholders`]). It is here because [`Node::Text`] carries the
+//!   placeholders verbatim and says so, and because the two crates that read
+//!   them are siblings over this one — see the module doc.
 //! * [`parse_tsx`] / [`ParseCtx`] / [`extract_interfaces`] (feature
 //!   `parse`, on by default) - the TSX parser built on oxc, which *produces*
 //!   [`dag`] values and owns no
@@ -27,6 +31,8 @@
 pub mod dag;
 
 pub mod emit;
+
+pub mod template;
 
 #[cfg(feature = "parse")]
 mod parse;
@@ -44,6 +50,10 @@ pub use dag::{
 };
 
 pub use emit::emit_tsx_document;
+
+// The `{{ }}` scan, at the crate root beside the tree it scans - a caller that
+// can name `Node::Text` can name what reads its placeholders.
+pub use template::{placeholders, substitute};
 
 #[cfg(feature = "parse")]
 pub use parse::{
