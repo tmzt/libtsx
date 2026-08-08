@@ -59,10 +59,32 @@ struct Zork {
 impl Zork {
     fn new() -> Self {
         Self {
-            zork: vec![sig(
-                "frobnicate",
-                vec![param("sprocket", TypeShape::String)],
-            )],
+            zork: vec![
+                sig("frobnicate", vec![param("sprocket", TypeShape::String)]),
+                // **A signature with an OPTIONAL trailing parameter**, so
+                // optionality is a fact of the grant here rather than a rule
+                // the parser guesses. One required, one optional: the only
+                // arities it can be satisfied by are 1 and 2.
+                sig(
+                    "bletch",
+                    vec![
+                        param("sprocket", TypeShape::String),
+                        optional("grue", TypeShape::String),
+                    ],
+                ),
+                // ...and the mirror, an optional parameter BEFORE a required
+                // one. A positional call cannot skip it, so this signature is
+                // satisfied only by 2 arguments - the property that makes "what
+                // is left unfilled must be optional" the right check and "count
+                // the trailing optionals" the wrong one.
+                sig(
+                    "zorkmid",
+                    vec![
+                        optional("sprocket", TypeShape::String),
+                        param("grue", TypeShape::String),
+                    ],
+                ),
+            ],
             grue: vec![
                 sig(
                     "wibble",
@@ -109,6 +131,15 @@ fn param(name: &str, ty: TypeShape) -> FieldDecl {
         name: name.into(),
         ty,
         optional: false,
+    }
+}
+
+/// A parameter a call may omit (`FieldDecl::optional`).
+fn optional(name: &str, ty: TypeShape) -> FieldDecl {
+    FieldDecl {
+        name: name.into(),
+        ty,
+        optional: true,
     }
 }
 
@@ -494,6 +525,7 @@ fn arguments_are_checked_against_the_declared_signature() {
             attr: "onGrommet".into(),
             effect: "frobnicate".into(),
             declared: 1,
+            required: 1,
             given: 0,
         }
     );
@@ -503,6 +535,7 @@ fn arguments_are_checked_against_the_declared_signature() {
             attr: "onGrommet".into(),
             effect: "frobnicate".into(),
             declared: 1,
+            required: 1,
             given: 2,
         }
     );
@@ -538,9 +571,24 @@ fn arguments_are_checked_against_the_declared_signature() {
             declared: TypeShape::S32,
         }
     );
-    // Not a literal at all. An effect call is not an expression language; a
-    // computation is a Module, referenced opaquely (Rule 46a).
-    for arg in ["props.destination", "1 + 2", "f()", "`sprocket`"] {
+    // Neither a literal nor a binding path: every one of these COMPUTES. An
+    // effect call is not an expression language; a computation is a Module,
+    // referenced opaquely (Rule 46a).
+    //
+    // `props.destination` is deliberately NOT in this list any more - it is a
+    // path, it is now admitted, and the test below is what it moved to. The
+    // line Rule 46a draws is between naming and computing, and a member chain
+    // was only ever on the wrong side of it by accident of implementation.
+    for arg in [
+        "1 + 2",
+        "f()",
+        "`sprocket`",
+        "() => 1",
+        "{ id: 1 }",
+        "[1]",
+        "row[i]",
+        "!flag",
+    ] {
         assert_eq!(
             refusal(&with(&format!("frobnicate({arg})"))),
             EffectError::ArgNotALiteral {
@@ -551,6 +599,150 @@ fn arguments_are_checked_against_the_declared_signature() {
             "`{arg}` was not refused as a non-literal",
         );
     }
+}
+
+/// **A BINDING PATH is an argument.** An identifier or a static member chain
+/// lowers to [`Expr::Get`] - the same distinct first-class form
+/// `AttrValue::Binding` is for an ordinary attribute - so an effect fired from
+/// inside a repeated template can be handed that instance's own field.
+///
+/// Rule 46a is unmoved: the test above still refuses everything that computes.
+/// What this pins is that a *path* was never a computation, and that the value
+/// it lowers to is the pre-existing `Get` variant rather than a new one, so no
+/// encoded shape changed to admit it.
+#[test]
+fn a_binding_path_is_an_effect_argument_and_lowers_to_a_path_read() {
+    let effect = |call: &str| -> NamedEffect {
+        let doc = ctx()
+            .parse_tsx(&format!(
+                r#"
+                import {{ frobnicate }} from "{ZORK}";
+                <Widget id="a" onGrommet={{{call}}} />
+                "#
+            ))
+            .expect("a binding path is an argument");
+        let Some(Node::Element(el)) = doc.root_nodes.first() else {
+            panic!("one element");
+        };
+        match el.attr("onGrommet") {
+            Some(AttrValue::NamedEffect(e)) => e.clone(),
+            other => panic!("{other:?}"),
+        }
+    };
+
+    assert_eq!(
+        effect("frobnicate(id)").args,
+        vec![Expr::Get { path: "id".into() }],
+        "a bare identifier is the row's own field",
+    );
+    assert_eq!(
+        effect("frobnicate(props.user.name)").args,
+        vec![Expr::Get {
+            path: "props.user.name".into()
+        }],
+        "a static member chain keeps its whole path",
+    );
+
+    // A binding is admitted against a parameter of ANY declared type, because
+    // nothing in reach knows what the path resolves to: `wibble`'s first
+    // parameter is an `S32`, and `250` is checked against it while `after` is
+    // not.
+    let doc = ctx()
+        .parse_tsx(&format!(
+            r#"
+            import {{ wibble }} from "{GRUE}";
+            <Widget id="a" onGrommet={{wibble(after, true)}} />
+            "#
+        ))
+        .expect("a binding against a numeric parameter");
+    let Some(Node::Element(el)) = doc.root_nodes.first() else {
+        panic!("one element");
+    };
+    let Some(AttrValue::NamedEffect(effect)) = el.attr("onGrommet") else {
+        panic!("an effect");
+    };
+    assert_eq!(
+        effect.args,
+        vec![
+            Expr::Get {
+                path: "after".into()
+            },
+            Expr::LitBool(true)
+        ],
+    );
+}
+
+/// **An optional parameter may be omitted; a required one may not** - both
+/// directions, against a grant that declares one of each.
+///
+/// `FieldDecl::optional` was parsed and then read by nobody in the argument
+/// check, so every parameter was effectively required and a signature could not
+/// offer an argument a call was free to leave out.
+#[test]
+fn an_optional_parameter_may_be_omitted_and_a_required_one_may_not() {
+    let with = |call: &str| {
+        format!(
+            r#"
+            import {{ bletch, zorkmid }} from "{ZORK}";
+            <Widget id="a" onGrommet={{{call}}} />
+            "#
+        )
+    };
+
+    // One required, one optional: 1 and 2 arguments both satisfy it.
+    assert!(
+        ctx().parse_tsx(&with(r#"bletch("sprocket")"#)).is_ok(),
+        "the optional parameter may be omitted",
+    );
+    assert!(
+        ctx().parse_tsx(&with(r#"bletch("sprocket", "grue")"#)).is_ok(),
+        "and may be supplied",
+    );
+    assert!(
+        ctx().parse_tsx(&with("bletch(\"sprocket\", id)")).is_ok(),
+        "including as a binding path",
+    );
+    // Zero does not: the REQUIRED parameter is unfilled.
+    assert_eq!(
+        refusal(&with("bletch()")),
+        EffectError::ArgCount {
+            attr: "onGrommet".into(),
+            effect: "bletch".into(),
+            declared: 2,
+            required: 1,
+            given: 0,
+        }
+    );
+    // Nor does three: an optional parameter is one a call may leave out, not a
+    // licence to pass more than the signature declares.
+    assert_eq!(
+        refusal(&with(r#"bletch("a", "b", "c")"#)),
+        EffectError::ArgCount {
+            attr: "onGrommet".into(),
+            effect: "bletch".into(),
+            declared: 2,
+            required: 1,
+            given: 3,
+        }
+    );
+
+    // The optional parameter FIRST. A positional call cannot skip it, so one
+    // argument leaves the required second one unfilled and is refused - the
+    // answer a "count the trailing optionals" rule would get wrong.
+    assert_eq!(
+        refusal(&with(r#"zorkmid("sprocket")"#)),
+        EffectError::ArgCount {
+            attr: "onGrommet".into(),
+            effect: "zorkmid".into(),
+            declared: 2,
+            required: 1,
+            given: 1,
+        }
+    );
+    assert!(
+        ctx().parse_tsx(&with(r#"zorkmid("sprocket", "grue")"#)).is_ok(),
+        "both supplied is the only arity that fills it",
+    );
 }
 
 /// **Refusal 4.** A host namespace bound by `import * as` (or a default
@@ -856,6 +1048,7 @@ fn every_effect_refusal_renders_ascii() {
             attr: "onGrommet".into(),
             effect: "frobnicate".into(),
             declared: 1,
+            required: 1,
             given: 0,
         },
         EffectError::ArgType {

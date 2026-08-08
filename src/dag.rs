@@ -276,8 +276,15 @@ pub struct NamedEffect {
     /// than at every reader.
     pub name: String,
     /// The call's arguments, in source order, lowered against the declared
-    /// parameter types. Literals only - an effect is not an expression
-    /// language (Rule 46a).
+    /// parameter types.
+    ///
+    /// **Literals and binding paths**, and nothing else - an effect is not an
+    /// expression language (Rule 46a). A literal arrives as the `Expr::Lit*`
+    /// its declared parameter type chose; a binding path (`{id}`,
+    /// `{props.user.name}`) arrives as [`Expr::Get`], which is the existing
+    /// path-read variant and not a new one, so a decoder that never met a
+    /// binding argument still knows the shape it arrives in. Everything that
+    /// computes is [`EffectError::ArgNotALiteral`].
     pub args: Vec<Expr>,
 }
 
@@ -407,15 +414,29 @@ pub enum EffectError {
         /// The specifier the provider granted.
         source: String,
     },
-    /// The call supplies a different number of arguments than the signature
-    /// declares.
+    /// The call supplies a number of arguments the signature cannot be
+    /// satisfied by: more than it declares, or too few to fill every
+    /// **non-optional** parameter.
+    ///
+    /// **Optionality is modelled** ([`FieldDecl::optional`]): arguments fill
+    /// parameters positionally, and a call is refused when any parameter left
+    /// unfilled is required. So a signature declaring `(to: string, id?:
+    /// string)` accepts one argument or two and refuses zero or three, and
+    /// [`required`] is what says which of those it was.
+    ///
+    /// [`required`]: EffectError::ArgCount::required
     ArgCount {
         /// The attribute that announced an effect.
         attr: String,
         /// The host import's exported name.
         effect: String,
-        /// How many parameters the signature declares.
+        /// How many parameters the signature declares in total.
         declared: usize,
+        /// How many of them are **not** optional - the fewest arguments a call
+        /// can supply. Equal to `declared` for a signature with no optional
+        /// parameters, which is every signature that existed before optionality
+        /// was modelled.
+        required: usize,
         /// How many arguments the call supplies.
         given: usize,
     },
@@ -431,9 +452,19 @@ pub enum EffectError {
         /// The parameter type the signature declares.
         declared: TypeShape,
     },
-    /// An argument is not a literal at all. An effect call is not an
-    /// expression language: anything wanting a computation is a Module,
-    /// referenced opaquely (Rule 46a).
+    /// An argument is neither a literal nor a **binding path**. An effect call
+    /// is not an expression language: anything wanting a computation is a
+    /// Module, referenced opaquely (Rule 46a).
+    ///
+    /// **A binding path is not an expression, and is admitted** - `{id}`,
+    /// `{props.user.name}` lower to [`Expr::Get`], the same distinct
+    /// first-class form [`AttrValue::Binding`] already is for an ordinary
+    /// attribute. What stays refused is everything that computes: a call, an
+    /// arithmetic expression, a template literal, an arrow function, an object
+    /// or array literal. That line is the whole of Rule 46a and it has not
+    /// moved; what moved is that a *path* was never on the computing side of
+    /// it, and treating it as one meant a row's own key could not be handed to
+    /// an effect at all.
     ArgNotALiteral {
         /// The attribute that announced an effect.
         attr: String,
@@ -530,10 +561,11 @@ impl std::fmt::Display for EffectError {
                 attr,
                 effect,
                 declared,
+                required,
                 given,
             } => write!(
                 f,
-                "`{attr}` calls `{effect}` with {given} arguments and it declares {declared}"
+                "`{attr}` calls `{effect}` with {given} arguments and it declares {declared}, of which {required} are required"
             ),
             Self::ArgType {
                 attr,

@@ -768,12 +768,24 @@ fn effect_attr(
         }
     };
 
-    if call.arguments.len() != sig.params.len() {
+    // **Arguments fill parameters positionally, and every parameter left
+    // unfilled must be optional** ([`FieldDecl::optional`], which used to be
+    // read by nobody here - see [`lower_arg`]'s doc for what that cost).
+    //
+    // Stated as "what is left over is optional" rather than as a count of
+    // trailing optionals on purpose: it needs no rule about where an optional
+    // parameter may appear in a signature. A signature declaring `(a?: T, b:
+    // U)` handed one argument fills `a` and leaves `b` - required - unfilled,
+    // so it is refused, which is the only honest answer for a positional call.
+    let given = call.arguments.len();
+    let required = sig.params.iter().filter(|p| !p.optional).count();
+    if given > sig.params.len() || sig.params[given.min(sig.params.len())..].iter().any(|p| !p.optional) {
         return Err(EffectError::ArgCount {
             attr: attr.to_string(),
             effect: sig.name.clone(),
             declared: sig.params.len(),
-            given: call.arguments.len(),
+            required,
+            given,
         });
     }
     let mut args = Vec::with_capacity(sig.params.len());
@@ -811,19 +823,41 @@ fn effect_attr(
 
 /// Why an argument could not be lowered.
 enum ArgFail {
-    /// Not a literal at all - an identifier, a member expression, a call. An
-    /// effect call is not an expression language (Rule 46a); a computation
-    /// belongs in a Module.
+    /// Neither a literal nor a binding path - a call, an arithmetic
+    /// expression, a template literal, an arrow function, an object or array
+    /// literal. An effect call is not an expression language (Rule 46a); a
+    /// computation belongs in a Module.
     NotALiteral,
     /// A literal the declared parameter type cannot hold.
     WrongType,
 }
 
-/// Lower one literal argument **against its declared type**, so the signature
-/// decides what a number becomes rather than the parser guessing (Rule 48).
+/// Lower one argument **against its declared type**, so the signature decides
+/// what a number becomes rather than the parser guessing (Rule 48).
 ///
-/// Every parameter is supplied: optionality of a host import's parameter is not
-/// modelled, and an omitted argument is an [`EffectError::ArgCount`].
+/// Two forms are admitted, and they are two forms rather than one:
+///
+/// * a **literal**, checked against the declared [`TypeShape`];
+/// * a **binding path** - `{id}`, `{props.user.name}` - lowered to
+///   [`crate::dag::Expr::Get`], the same distinct first-class form
+///   [`AttrValue::Binding`] is for an ordinary attribute
+///   ([`EffectError::ArgNotALiteral`] records why that is not a widening of
+///   Rule 46a).
+///
+/// **A binding is NOT type-checked, and cannot be here.** A path names
+/// something in the runtime scope the element is rendered in - a list row's
+/// own fields, the enclosing definition's props - and this function is handed
+/// one module's text and a signature. Nothing in reach knows what `{id}` is.
+/// So a binding is admitted against any declared parameter type and the check
+/// that it *fits* belongs to whoever resolves the path, which is a different
+/// layer and a later one. What is bought is that the path survives at all; what
+/// is not bought is a promise about its type, and pretending otherwise would be
+/// the more expensive of the two mistakes.
+///
+/// **Optionality is modelled by the caller**, not here: [`effect_attr`] fills
+/// parameters positionally and refuses a call that leaves a non-optional one
+/// unfilled, so this is only ever asked about an argument that was actually
+/// written.
 fn lower_arg(expr: &Expression, declared: &TypeShape) -> Result<crate::dag::Expr, ArgFail> {
     use crate::dag::Expr as E;
     match expr {
@@ -849,7 +883,14 @@ fn lower_arg(expr: &Expression, declared: &TypeShape) -> Result<crate::dag::Expr
             TypeShape::F64 => Ok(E::LitF64(n.value)),
             _ => Err(ArgFail::WrongType),
         },
-        _ => Err(ArgFail::NotALiteral),
+        // A BINDING PATH. `expr_path` recovers an identifier or a static member
+        // chain and NOTHING else, which is exactly the line: a call
+        // (`Id({id})`), a computed member (`row[i]`), an arithmetic expression
+        // and a template literal all answer `None` here and stay refused.
+        other => match expr_path(other) {
+            Some(path) => Ok(E::Get { path }),
+            None => Err(ArgFail::NotALiteral),
+        },
     }
 }
 
@@ -964,6 +1005,7 @@ pub fn extract_interfaces(source: &str) -> Result<Vec<InterfaceDecl>, Vec<String
     }
 
     let mut interfaces = Vec::new();
+    let mut errors = Vec::new();
     for stmt in &ret.program.body {
         // `interface Foo {}` and `export interface Foo {}` both surface here.
         let decl = match stmt {
@@ -975,21 +1017,34 @@ pub fn extract_interfaces(source: &str) -> Result<Vec<InterfaceDecl>, Vec<String
             _ => None,
         };
         if let Some(decl) = decl {
-            interfaces.push(convert_interface(decl));
+            match convert_interface(decl) {
+                Ok(iface) => interfaces.push(iface),
+                // Every refused declaration is reported, not the first: an
+                // author fixing one union should not have to re-run to find the
+                // next, and the diagnostics above are a list for the same
+                // reason.
+                Err(why) => errors.push(format!("interface `{}`: {why}", decl.id.name)),
+            }
         }
     }
 
-    Ok(interfaces)
-}
-
-fn convert_interface(decl: &oxc_ast::ast::TSInterfaceDeclaration) -> InterfaceDecl {
-    InterfaceDecl {
-        name: decl.id.name.to_string(),
-        fields: signatures_to_fields(&decl.body.body),
+    if errors.is_empty() {
+        Ok(interfaces)
+    } else {
+        Err(errors)
     }
 }
 
-fn signatures_to_fields(sigs: &[TSSignature]) -> Vec<FieldDecl> {
+fn convert_interface(
+    decl: &oxc_ast::ast::TSInterfaceDeclaration,
+) -> Result<InterfaceDecl, String> {
+    Ok(InterfaceDecl {
+        name: decl.id.name.to_string(),
+        fields: signatures_to_fields(&decl.body.body)?,
+    })
+}
+
+fn signatures_to_fields(sigs: &[TSSignature]) -> Result<Vec<FieldDecl>, String> {
     let mut fields = Vec::new();
     for sig in sigs {
         if let TSSignature::TSPropertySignature(prop) = sig {
@@ -998,11 +1053,12 @@ fn signatures_to_fields(sigs: &[TSSignature]) -> Vec<FieldDecl> {
                 PropertyKey::StringLiteral(s) => s.value.to_string(),
                 _ => continue,
             };
-            let ty = prop
-                .type_annotation
-                .as_ref()
-                .map(|ann| type_shape(&ann.type_annotation))
-                .unwrap_or(TypeShape::String);
+            let ty = match &prop.type_annotation {
+                Some(ann) => {
+                    type_shape(&ann.type_annotation).map_err(|why| format!("`{name}`: {why}"))?
+                }
+                None => TypeShape::String,
+            };
             fields.push(FieldDecl {
                 name,
                 ty,
@@ -1010,64 +1066,85 @@ fn signatures_to_fields(sigs: &[TSSignature]) -> Vec<FieldDecl> {
             });
         }
     }
-    fields
+    Ok(fields)
 }
 
-/// Map a `TSType` onto the owned [`TypeShape`] vocabulary.
-fn type_shape(ty: &TSType) -> TypeShape {
-    match ty {
+/// Map a `TSType` onto the owned [`TypeShape`] vocabulary, or say why it has no
+/// place in it.
+///
+/// **Fallible because one case cannot be answered**, not because the mapping is
+/// risky: [`TypeShape`] has no sum type, so a union of two real types is a
+/// declaration this vocabulary cannot hold. Everything else it does not model
+/// becomes [`TypeShape::Named`] and stays a *reference* - which is honest,
+/// because a named reference is exactly what an unmodelled type is - while a
+/// discarded union member would be a declaration silently replaced by a
+/// different one.
+fn type_shape(ty: &TSType) -> Result<TypeShape, String> {
+    Ok(match ty {
         TSType::TSBooleanKeyword(_) => TypeShape::Bool,
         // TS `number` lowers to F64 by default (see dag::TypeShape docs).
         TSType::TSNumberKeyword(_) => TypeShape::F64,
         TSType::TSBigIntKeyword(_) => TypeShape::S64,
         TSType::TSStringKeyword(_) => TypeShape::String,
-        TSType::TSArrayType(arr) => TypeShape::List(Box::new(type_shape(&arr.element_type))),
-        TSType::TSParenthesizedType(p) => type_shape(&p.type_annotation),
-        TSType::TSTypeLiteral(lit) => TypeShape::Record(signatures_to_fields(&lit.members)),
-        TSType::TSUnionType(u) => union_shape(u),
-        TSType::TSTypeReference(r) => reference_shape(r),
+        TSType::TSArrayType(arr) => TypeShape::List(Box::new(type_shape(&arr.element_type)?)),
+        TSType::TSParenthesizedType(p) => type_shape(&p.type_annotation)?,
+        TSType::TSTypeLiteral(lit) => TypeShape::Record(signatures_to_fields(&lit.members)?),
+        TSType::TSUnionType(u) => union_shape(u)?,
+        TSType::TSTypeReference(r) => reference_shape(r)?,
         // Anything else we don't model becomes an opaque named reference.
         _ => TypeShape::Named("unknown".to_string()),
-    }
+    })
 }
 
-/// `T | undefined` / `T | null` → `Option<T>`; other unions collapse to the
-/// first non-nullish member (best-effort — the semantic AST is deliberately
-/// minimal).
-fn union_shape(u: &oxc_ast::ast::TSUnionType) -> TypeShape {
+/// `T | undefined` / `T | null` -> `Option<T>`; **any other union is refused.**
+///
+/// # It used to collapse, and that is the defect this replaces
+///
+/// The rule was "other unions collapse to the first non-nullish member
+/// (best-effort)", so `Id | Blank` parsed as `Id` and `Blank` disappeared with
+/// no diagnostic anywhere. That is worse than unsupported: the author declared
+/// a sum type, the parse answered with one arm of it, and every reader
+/// downstream - the property sheet, the daemon's column planner, the seed
+/// generator - saw a complete declaration that was not the one written.
+///
+/// [`TypeShape`] models products (`Record`) and options and has no sum, so
+/// there is no arm to lower this to. Refusing says so at the one place that
+/// knows; admitting it needs a `TypeShape` variant, and that is a serialized IR
+/// change (see DRAFT_APP_PLAN.md's finding on it), not a parser change.
+fn union_shape(u: &oxc_ast::ast::TSUnionType) -> Result<TypeShape, String> {
     let mut nullish = false;
-    let mut inner: Option<&TSType> = None;
+    let mut members: Vec<&TSType> = Vec::new();
     for t in &u.types {
         match t {
             TSType::TSUndefinedKeyword(_) | TSType::TSNullKeyword(_) => nullish = true,
-            other => {
-                if inner.is_none() {
-                    inner = Some(other);
-                }
-            }
+            other => members.push(other),
         }
     }
-    match (inner, nullish) {
-        (Some(t), true) => TypeShape::Option(Box::new(type_shape(t))),
-        (Some(t), false) => type_shape(t),
-        (None, _) => TypeShape::Named("unknown".to_string()),
+    match (members.len(), nullish) {
+        (1, true) => Ok(TypeShape::Option(Box::new(type_shape(members[0])?))),
+        (1, false) => type_shape(members[0]),
+        // `undefined | null` alone: nullish and nothing to be optional ABOUT.
+        (0, _) => Ok(TypeShape::Named("unknown".to_string())),
+        (n, _) => Err(format!(
+            "a union of {n} types is not modelled - the semantic AST has no sum type, only `T | undefined` / `T | null` (which is an Option)"
+        )),
     }
 }
 
 /// `Array<T>` → `List<T>`; anything else named → `Named`.
-fn reference_shape(r: &oxc_ast::ast::TSTypeReference) -> TypeShape {
+fn reference_shape(r: &oxc_ast::ast::TSTypeReference) -> Result<TypeShape, String> {
     let name = match &r.type_name {
         oxc_ast::ast::TSTypeName::IdentifierReference(id) => id.name.to_string(),
-        _ => return TypeShape::Named("unknown".to_string()),
+        _ => return Ok(TypeShape::Named("unknown".to_string())),
     };
     if name == "Array" {
         if let Some(args) = &r.type_arguments {
             if let Some(first) = args.params.first() {
-                return TypeShape::List(Box::new(type_shape(first)));
+                return Ok(TypeShape::List(Box::new(type_shape(first)?)));
             }
         }
     }
-    TypeShape::Named(name)
+    Ok(TypeShape::Named(name))
 }
 
 fn convert_element(jsx: &JSXElement, low: &Lowering) -> Result<Element, EffectError> {
@@ -1079,7 +1156,21 @@ fn convert_element(jsx: &JSXElement, low: &Lowering) -> Result<Element, EffectEr
         .opening_element
         .type_arguments
         .as_ref()
-        .map(|args| args.params.iter().map(type_shape).collect())
+        .map(|args| {
+            args.params
+                .iter()
+                // A type ARGUMENT that this vocabulary cannot hold (a union -
+                // see `union_shape`) becomes the same `unknown` reference every
+                // other unmodelled type in this position becomes. It is not
+                // silently accepted: a type argument resolves through
+                // `declared_type_arg` against the source's own declarations, and
+                // `highbay_data::compile::check_type_args` refuses one that
+                // names an interface nothing declares - which `unknown` cannot
+                // be. The interface-FIELD position has no such downstream check,
+                // which is why that one is a hard refusal here.
+                .map(|p| type_shape(p).unwrap_or(TypeShape::Named("unknown".to_string())))
+                .collect()
+        })
         .unwrap_or_default();
 
     let mut attrs = Vec::new();
@@ -1353,6 +1444,55 @@ mod tests {
         let ifaces = extract_interfaces("export interface P { ok: boolean; }").expect("parse");
         assert_eq!(ifaces.len(), 1);
         assert_eq!(ifaces[0].fields[0].ty, TypeShape::Bool);
+    }
+
+    /// **A union of two real types is REFUSED, not collapsed** - the defect
+    /// [`union_shape`] documents. `Id | Blank` used to parse as `Id`, so a
+    /// declared sum type reached every reader as one arm of itself with no
+    /// diagnostic anywhere.
+    ///
+    /// The refusal names the interface and the field, because the whole point is
+    /// that an author can find it.
+    #[test]
+    fn a_union_of_two_real_types_is_refused_rather_than_collapsed() {
+        let errors = extract_interfaces("interface Route { record: Id | Blank; }")
+            .expect_err("a sum type has no place in this vocabulary");
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("Route"), "{errors:?}");
+        assert!(errors[0].contains("record"), "{errors:?}");
+        assert!(errors[0].contains("sum type"), "{errors:?}");
+        assert!(errors[0].is_ascii(), "{errors:?}");
+
+        // ...and the nullish forms are untouched: they are an Option, which this
+        // vocabulary does model.
+        for src in [
+            "interface P { a: string | undefined; }",
+            "interface P { a: string | null; }",
+            "interface P { a?: string | undefined | null; }",
+        ] {
+            let ifaces = extract_interfaces(src).expect(src);
+            assert_eq!(
+                ifaces[0].fields[0].ty,
+                TypeShape::Option(Box::new(TypeShape::String)),
+                "{src}",
+            );
+        }
+
+        // A nested union is refused through the containers too - a record field
+        // and a list element are the two ways one hides.
+        for src in [
+            "interface P { a: { b: Id | Blank }; }",
+            "interface P { a: (Id | Blank)[]; }",
+        ] {
+            assert!(extract_interfaces(src).is_err(), "{src}");
+        }
+
+        // Every refused declaration is reported, not just the first.
+        let errors = extract_interfaces(
+            "interface A { x: Id | Blank; }\ninterface B { y: Id | Blank; }",
+        )
+        .expect_err("two refusals");
+        assert_eq!(errors.len(), 2, "{errors:?}");
     }
 
     #[test]
