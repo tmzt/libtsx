@@ -27,9 +27,9 @@
 //!   passed to whichever parse entry point the caller needs (Rule 49).
 
 use crate::dag::{
-    AttrValue, EffectError, Element, FieldDecl, FuncSig, ImportDecl, ImportKind, ImportName,
-    InterfaceDecl, NamedEffect, Node, ParserHost, Resolution, TsxDocument, TypeShape,
-    is_event_binding, is_host_namespace,
+    AttrValue, BindingExpr, BindingLiteral, BindingParam, EffectError, EffectProgram, EffectStmt,
+    Element, FieldDecl, FuncSig, ImportDecl, ImportKind, ImportName, InterfaceDecl, NamedEffect,
+    Node, ParserHost, Resolution, TsxDocument, TypeShape, is_event_binding, is_host_namespace,
 };
 use std::sync::Arc;
 use oxc_allocator::Allocator;
@@ -1212,12 +1212,23 @@ fn convert_element(jsx: &JSXElement, low: &Lowering) -> Result<Element, EffectEr
             match &a.value {
                 None => AttrValue::Bool(true),
                 Some(JSXAttributeValue::StringLiteral(s)) => AttrValue::Str(s.value.to_string()),
-                Some(JSXAttributeValue::ExpressionContainer(c)) => c
-                    .expression
-                    .as_expression()
-                    .map(attr_from_expr)
-                    .unwrap_or(AttrValue::Opaque),
-                _ => AttrValue::Opaque,
+                Some(JSXAttributeValue::ExpressionContainer(c)) => {
+                    let Some(expr) = c.expression.as_expression() else {
+                        return Err(EffectError::BindingSyntax {
+                            attr: key,
+                            message: "an empty expression container is unsupported".into(),
+                        });
+                    };
+                    AttrValue::BindingExpr(lower_binding_expr(expr, &low.scope).map_err(|message| {
+                        EffectError::BindingSyntax { attr: key.clone(), message }
+                    })?)
+                }
+                _ => {
+                    return Err(EffectError::BindingSyntax {
+                        attr: key,
+                        message: "the attribute value is not a supported expression".into(),
+                    });
+                }
             }
         };
         attrs.push((key, value));
@@ -1319,14 +1330,267 @@ fn push_child(
     Ok(())
 }
 
-fn attr_from_expr(expr: &Expression) -> AttrValue {
+/// Lower an ordinary JSX expression container into the owned object-binding
+/// vocabulary. This deliberately has no `Opaque` fallback: callers need an
+/// explicit parser refusal when JavaScript would execute something the owned
+/// graph cannot represent.
+fn lower_binding_expr(expr: &Expression, _scope: &EffectScope) -> Result<BindingExpr, String> {
+    use BindingExpr as B;
+    let expr = unparen(expr);
     match expr {
-        Expression::StringLiteral(s) => AttrValue::Str(s.value.to_string()),
-        Expression::NumericLiteral(n) => AttrValue::Num(n.value),
-        Expression::BooleanLiteral(b) => AttrValue::Bool(b.value),
-        other => expr_path(other)
-            .map(AttrValue::Binding)
-            .unwrap_or(AttrValue::Opaque),
+        Expression::NullLiteral(_) => Ok(B::Literal(BindingLiteral::Null)),
+        Expression::BooleanLiteral(v) => Ok(B::Literal(BindingLiteral::Bool(v.value))),
+        Expression::NumericLiteral(v) => Ok(B::Literal(BindingLiteral::Number(v.value))),
+        Expression::StringLiteral(v) => Ok(B::Literal(BindingLiteral::String(v.value.to_string()))),
+        Expression::Identifier(_) | Expression::StaticMemberExpression(_) => {
+            let Some(path) = expr_path(expr) else {
+                return Err("computed or private member paths are unsupported".into());
+            };
+            Ok(B::Path(path.split('.').map(str::to_owned).collect()))
+        }
+        Expression::ArrayExpression(array) => {
+            let mut items = Vec::with_capacity(array.elements.len());
+            for item in &array.elements {
+                let Some(expr) = (match item {
+                    oxc_ast::ast::ArrayExpressionElement::SpreadElement(_) => {
+                        return Err("array spreads are unsupported".into())
+                    }
+                    oxc_ast::ast::ArrayExpressionElement::Elision(_) => {
+                        return Err("sparse array holes are unsupported".into())
+                    }
+                    other => other.as_expression(),
+                }) else {
+                    return Err("array item is unsupported".into());
+                };
+                items.push(lower_binding_expr(expr, _scope)?);
+            }
+            Ok(B::Array(items))
+        }
+        Expression::ObjectExpression(object) => {
+            let mut fields = Vec::with_capacity(object.properties.len());
+            for property in &object.properties {
+                let oxc_ast::ast::ObjectPropertyKind::ObjectProperty(property) = property else {
+                    return Err("object spreads are unsupported".into());
+                };
+                if property.computed {
+                    return Err("computed object keys are unsupported".into());
+                }
+                if property.method || property.kind != oxc_ast::ast::PropertyKind::Init {
+                    return Err("object methods and accessors are unsupported".into());
+                }
+                let name = match &property.key {
+                    PropertyKey::StaticIdentifier(key) => key.name.to_string(),
+                    PropertyKey::StringLiteral(key) => key.value.to_string(),
+                    _ => return Err("computed object keys are unsupported".into()),
+                };
+                fields.push((name, lower_binding_expr(&property.value, _scope)?));
+            }
+            Ok(B::Record(fields))
+        }
+        Expression::CallExpression(call) => {
+            let (namespace, name) = static_call_parts(&call.callee)?;
+            if call.optional {
+                return Err("optional calls are unsupported".into());
+            }
+            let type_args = call
+                .type_arguments
+                .as_ref()
+                .map(|args| {
+                    args.params
+                        .iter()
+                        .map(|arg| type_shape(arg).unwrap_or(TypeShape::Named("unknown".into())))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let mut args = Vec::with_capacity(call.arguments.len());
+            for arg in &call.arguments {
+                let Some(arg) = arg.as_expression() else {
+                    return Err("call argument spreads are unsupported".into());
+                };
+                args.push(lower_binding_expr(arg, _scope)?);
+            }
+            Ok(B::Call { namespace, name, type_args, args })
+        }
+        Expression::ArrowFunctionExpression(arrow) if arrow.r#async => {
+            lower_async_arrow(arrow, _scope).map(B::Async)
+        }
+        Expression::ComputedMemberExpression(_) => {
+            Err("computed member paths are unsupported".into())
+        }
+        Expression::AssignmentExpression(_)
+        | Expression::UpdateExpression(_)
+        | Expression::UnaryExpression(_)
+        | Expression::BinaryExpression(_)
+        | Expression::LogicalExpression(_)
+        | Expression::ConditionalExpression(_)
+        | Expression::AwaitExpression(_)
+        | Expression::ArrowFunctionExpression(_) => {
+            Err(format!("{} expressions are unsupported", binding_expr_kind(expr)))
+        }
+        _ => Err(format!("{} expressions are unsupported", binding_expr_kind(expr))),
+    }
+}
+
+fn static_call_parts(expr: &Expression) -> Result<(String, String), String> {
+    match unparen(expr) {
+        Expression::StaticMemberExpression(member) => {
+            let Some(namespace) = expr_path(&member.object) else {
+                return Err("computed call callees are unsupported".into());
+            };
+            Ok((namespace, member.property.name.to_string()))
+        }
+        Expression::ComputedMemberExpression(_) => Err("computed call callees are unsupported".into()),
+        _ => Err("call callee must be a qualified static member".into()),
+    }
+}
+
+fn lower_async_arrow(
+    arrow: &ArrowFunctionExpression,
+    scope: &EffectScope,
+) -> Result<EffectProgram, String> {
+    if arrow.expression {
+        return Err("async expression-bodied arrows are unsupported; use an explicit block".into());
+    }
+    let mut params = Vec::with_capacity(arrow.params.items.len());
+    if arrow.params.rest.is_some() {
+        return Err("async rest parameters are unsupported".into());
+    }
+    for param in &arrow.params.items {
+        let Some(id) = param.pattern.get_binding_identifier() else {
+            return Err("async parameters must be simple identifiers".into());
+        };
+        let ty = param
+            .type_annotation
+            .as_ref()
+            .map(|ty| type_shape(&ty.type_annotation))
+            .transpose()
+            .map_err(|e| format!("async parameter type is unsupported: {e}"))?
+            .unwrap_or(TypeShape::Named("unknown".into()));
+        params.push(BindingParam { name: id.name.to_string(), ty });
+    }
+    Ok(EffectProgram {
+        params,
+        body: lower_effect_block(&arrow.body.statements, scope)?,
+    })
+}
+
+fn lower_effect_block(
+    statements: &[Statement],
+    scope: &EffectScope,
+) -> Result<Vec<EffectStmt>, String> {
+    let mut out = Vec::new();
+    for statement in statements {
+        out.extend(lower_effect_statement(statement, scope)?);
+    }
+    Ok(out)
+}
+
+fn lower_effect_statement(
+    statement: &Statement,
+    scope: &EffectScope,
+) -> Result<Vec<EffectStmt>, String> {
+    use EffectStmt as S;
+    match statement {
+        Statement::BlockStatement(block) => lower_effect_block(&block.body, scope),
+        Statement::VariableDeclaration(decl) => {
+            let mut out = Vec::with_capacity(decl.declarations.len());
+            for declarator in &decl.declarations {
+                let Some(id) = declarator.id.get_binding_identifier() else {
+                    return Err("destructuring declarations are unsupported".into());
+                };
+                let Some(init) = declarator.init.as_ref() else {
+                    return Err("uninitialized declarations are unsupported".into());
+                };
+                let value = unparen(init);
+                if let Expression::AwaitExpression(awaited) = value {
+                    out.push(S::Await {
+                        slot: Some(id.name.to_string()),
+                        awaitable: lower_binding_expr(&awaited.argument, scope)?,
+                    });
+                } else {
+                    out.push(S::Let {
+                        slot: id.name.to_string(),
+                        value: lower_binding_expr(value, scope)?,
+                    });
+                }
+            }
+            Ok(out)
+        }
+        Statement::ExpressionStatement(statement) => {
+            let Expression::AwaitExpression(awaited) = unparen(&statement.expression) else {
+                return Err("expression statements are unsupported in async blocks".into());
+            };
+            Ok(vec![S::Await {
+                slot: None,
+                awaitable: lower_binding_expr(&awaited.argument, scope)?,
+            }])
+        }
+        Statement::ReturnStatement(statement) => {
+            let Some(value) = statement.argument.as_ref() else {
+                return Err("empty returns are unsupported in async blocks".into());
+            };
+            Ok(vec![S::Return(lower_binding_expr(value, scope)?)])
+        }
+        Statement::IfStatement(statement) => {
+            let then_branch = lower_effect_statement(&statement.consequent, scope)?;
+            let else_branch = statement
+                .alternate
+                .as_ref()
+                .map(|alternate| lower_effect_statement(alternate, scope))
+                .transpose()?
+                .unwrap_or_default();
+            Ok(vec![S::If {
+                condition: lower_binding_expr(&statement.test, scope)?,
+                then_branch,
+                else_branch,
+            }])
+        }
+        Statement::TryStatement(statement) => {
+            let Some(handler) = statement.handler.as_ref() else {
+                return Err("try statements require a catch clause".into());
+            };
+            if statement.finalizer.is_some() {
+                return Err("try/finally is unsupported in async blocks".into());
+            }
+            let Some(param) = handler.param.as_ref() else {
+                return Err("catch clauses require an error identifier".into());
+            };
+            let Some(id) = param.pattern.get_binding_identifier() else {
+                return Err("catch parameters must be simple identifiers".into());
+            };
+            Ok(vec![S::Try {
+                body: lower_effect_block(&statement.block.body, scope)?,
+                error_slot: id.name.to_string(),
+                catch: lower_effect_block(&handler.body.body, scope)?,
+            }])
+        }
+        _ => Err(format!(
+            "{} statements are unsupported in async blocks",
+            effect_statement_kind(statement)
+        )),
+    }
+}
+
+fn binding_expr_kind(expr: &Expression) -> &'static str {
+    match expr {
+        Expression::AssignmentExpression(_) | Expression::UpdateExpression(_) => "mutation",
+        Expression::CallExpression(_) => "call",
+        Expression::ArrowFunctionExpression(_) => "function",
+        Expression::ComputedMemberExpression(_) => "computed",
+        Expression::NewExpression(_) => "constructor",
+        _ => "expression",
+    }
+}
+
+fn effect_statement_kind(statement: &Statement) -> &'static str {
+    match statement {
+        Statement::ForStatement(_)
+        | Statement::ForInStatement(_)
+        | Statement::ForOfStatement(_)
+        | Statement::WhileStatement(_)
+        | Statement::DoWhileStatement(_) => "loop",
+        Statement::ExpressionStatement(_) => "expression",
+        _ => "statement",
     }
 }
 
@@ -1340,7 +1604,6 @@ fn expr_path(expr: &Expression) -> Option<String> {
         _ => None,
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1357,8 +1620,14 @@ mod tests {
         assert_eq!(list.tag, "List");
         // Source order preserved.
         assert_eq!(list.attrs[0].0, "value");
-        assert_eq!(list.attrs[0].1, AttrValue::Binding("props.items".into()));
-        assert_eq!(list.attrs[1].1, AttrValue::Num(3.0));
+        assert_eq!(
+            list.attrs[0].1,
+            AttrValue::BindingExpr(BindingExpr::Path(vec!["props".into(), "items".into()]))
+        );
+        assert_eq!(
+            list.attrs[1].1,
+            AttrValue::BindingExpr(BindingExpr::Literal(BindingLiteral::Number(3.0)))
+        );
         assert_eq!(list.attrs[2].1, AttrValue::Bool(true));
         let Node::Element(item) = &list.children[0] else {
             panic!("expected item")
@@ -1378,7 +1647,10 @@ mod tests {
         assert_eq!(list.tag, "List", "the type argument is not part of the tag");
         assert_eq!(list.type_args, vec![TypeShape::Named("Message".into())]);
         // Attributes and children are untouched by the generic spelling.
-        assert_eq!(list.attr("value"), Some(&AttrValue::Binding("chatFeed".into())));
+        assert_eq!(
+            list.attr("value"),
+            Some(&AttrValue::BindingExpr(BindingExpr::Path(vec!["chatFeed".into()])))
+        );
         assert_eq!(list.children.len(), 1);
 
         // Self-closing, several arguments, and the built-in type vocabulary all
@@ -1573,7 +1845,10 @@ mod tests {
         // The <List> passes the imported provider as its bound value.
         let Node::Element(list) = &screen.children[0] else { panic!("first child is the List") };
         assert_eq!(list.tag, "List");
-        assert_eq!(list.attr("value"), Some(&AttrValue::Binding("libraryFeed".into())));
+        assert_eq!(
+            list.attr("value"),
+            Some(&AttrValue::BindingExpr(BindingExpr::Path(vec!["libraryFeed".into()])))
+        );
 
         // The import is captured as a typed reference (module + local/imported).
         assert_eq!(doc.imports.len(), 1);
@@ -1646,7 +1921,10 @@ mod tests {
         let app = r#"<App depth={2} />"#;
         let doc = parse_app(app, &[r#"<Screen name="Only" />"#]).expect("parse");
         let Node::Element(app_el) = &doc.root_nodes[0] else { panic!() };
-        assert_eq!(app_el.attr("depth"), Some(&AttrValue::Num(2.0)));
+        assert_eq!(
+            app_el.attr("depth"),
+            Some(&AttrValue::BindingExpr(BindingExpr::Literal(BindingLiteral::Number(2.0))))
+        );
         assert_eq!(app_el.children.len(), 1);
     }
 
@@ -1696,6 +1974,128 @@ mod tests {
         assert_eq!(back.imports[0].source, "Chat Feed");
     }
 
+
+    #[test]
+    fn ordinary_expression_containers_lower_structurally() {
+        let doc = parse_tsx(
+            r#"<Thing
+                text={"hello"}
+                path={props.user.name}
+                values={[true, props.count, null]}
+                record={{first: 1, second: "two"}}
+            />"#,
+        )
+        .expect("object binding expressions parse");
+        let Node::Element(thing) = &doc.root_nodes[0] else {
+            panic!("expected element")
+        };
+        assert_eq!(
+            thing.attr("text"),
+            Some(&AttrValue::BindingExpr(BindingExpr::Literal(
+                BindingLiteral::String("hello".into())
+            )))
+        );
+        assert_eq!(
+            thing.attr("path"),
+            Some(&AttrValue::BindingExpr(BindingExpr::Path(vec![
+                "props".into(),
+                "user".into(),
+                "name".into()
+            ])))
+        );
+        assert_eq!(
+            thing.attr("values"),
+            Some(&AttrValue::BindingExpr(BindingExpr::Array(vec![
+                BindingExpr::Literal(BindingLiteral::Bool(true)),
+                BindingExpr::Path(vec!["props".into(), "count".into()]),
+                BindingExpr::Literal(BindingLiteral::Null),
+            ])))
+        );
+        assert_eq!(
+            thing.attr("record"),
+            Some(&AttrValue::BindingExpr(BindingExpr::Record(vec![
+                (
+                    "first".into(),
+                    BindingExpr::Literal(BindingLiteral::Number(1.0))
+                ),
+                (
+                    "second".into(),
+                    BindingExpr::Literal(BindingLiteral::String("two".into()))
+                ),
+            ])))
+        );
+    }
+
+    #[test]
+    fn qualified_generic_calls_keep_namespace_name_and_type_arguments() {
+        let doc = parse_tsx(
+            r#"<Thing value={objects.make<User, Error>(props.id, "fallback")} />"#,
+        )
+        .expect("qualified generic call parses");
+        let Node::Element(thing) = &doc.root_nodes[0] else {
+            panic!("expected element")
+        };
+        assert_eq!(
+            thing.attr("value"),
+            Some(&AttrValue::BindingExpr(BindingExpr::Call {
+                namespace: "objects".into(),
+                name: "make".into(),
+                type_args: vec![
+                    TypeShape::Named("User".into()),
+                    TypeShape::Named("Error".into())
+                ],
+                args: vec![
+                    BindingExpr::Path(vec!["props".into(), "id".into()]),
+                    BindingExpr::Literal(BindingLiteral::String("fallback".into())),
+                ],
+            }))
+        );
+    }
+
+    #[test]
+    fn unsupported_binding_expressions_are_typed_refusals() {
+        for (source, expected) in [
+            (r#"<Thing value={objects[method]}/>"#, "computed"),
+            (r#"<Thing value={count++}/>"#, "mutation"),
+            (r#"<Thing value={{...props}}/>"#, "spreads"),
+        ] {
+            let Err(ParseError::Effect(EffectError::BindingSyntax { message, .. })) =
+                ParseCtx::default().parse_tsx(source)
+            else {
+                panic!("expected BindingSyntax for {source}");
+            };
+            assert!(message.contains(expected), "{message:?}");
+        }
+    }
+
+    #[test]
+    fn explicit_async_blocks_lower_supported_effect_statements() {
+        let doc = parse_tsx(
+            r#"<Thing value={async (input: User) => {
+                const loaded = await objects.load<User>(input.id);
+                if (input.ready) {
+                    return loaded;
+                }
+                return null;
+            }} />"#,
+        )
+        .expect("async block parses");
+        let Node::Element(thing) = &doc.root_nodes[0] else {
+            panic!("expected element")
+        };
+        let AttrValue::BindingExpr(BindingExpr::Async(program)) =
+            thing.attr("value").expect("value")
+        else {
+            panic!("expected async binding");
+        };
+        assert_eq!(program.params[0].name, "input");
+        assert_eq!(program.params[0].ty, TypeShape::Named("User".into()));
+        assert!(matches!(&program.body[1], EffectStmt::If { .. }));
+        assert!(matches!(
+            &program.body[2],
+            EffectStmt::Return(BindingExpr::Literal(BindingLiteral::Null))
+        ));
+    }
 
     #[test]
     fn parse_app_is_deterministic_and_reports_bad_screens() {

@@ -608,6 +608,15 @@ pub enum EffectError {
         /// The tag it was written on.
         tag: String,
     },
+    /// An ordinary JSX object binding cannot be represented by the owned
+    /// expression vocabulary. Unlike an event refusal, this names the
+    /// attribute syntax itself and never changes `NamedEffect` semantics.
+    BindingSyntax {
+        /// The ordinary attribute carrying the rejected expression.
+        attr: String,
+        /// Why the expression has no owned representation.
+        message: String,
+    }
 }
 
 impl std::fmt::Display for EffectError {
@@ -686,6 +695,9 @@ impl std::fmt::Display for EffectError {
                 f,
                 "<{tag}> spreads its attributes, and a spread cannot be resolved to declared props or checked for an effect"
             ),
+            Self::BindingSyntax { attr, message } => {
+                write!(f, "`{attr}` has an unsupported binding expression: {message}")
+            }
         }
     }
 }

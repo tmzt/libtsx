@@ -23,8 +23,8 @@
 //! there is nothing else to parse them from.
 
 use libtsx::dag::{
-    AttrValue, EffectError, Expr, FieldDecl, FuncSig, ImportKind, NamedEffect, Node, ParserHost,
-    Resolution, TsxDocument, TypeShape,
+    AttrValue, BindingExpr, BindingLiteral, EffectError, Expr, FieldDecl, FuncSig, ImportKind,
+    NamedEffect, Node, ParserHost, Resolution, TsxDocument, TypeShape,
 };
 use libtsx::{ParseCtx, ParseError, parse_tsx};
 
@@ -363,7 +363,8 @@ fn an_event_binding_carries_a_named_effect() {
         })
     );
 
-    // And an ordinary attribute is untouched by any of it.
+    // Ordinary attributes now lower into the owned binding vocabulary rather
+    // than disappearing into an untyped opaque value.
     let doc = ctx()
         .parse_tsx(&format!(
             r#"
@@ -380,8 +381,14 @@ fn an_event_binding_carries_a_named_effect() {
         vec!["id", "height", "onGrommet", "label"],
         "attributes keep source order",
     );
-    assert_eq!(el.attr("height"), Some(&AttrValue::Num(56.0)));
-    assert_eq!(el.attr("label"), Some(&AttrValue::Str("Chat".into())));
+    assert_eq!(
+        el.attr("height"),
+        Some(&AttrValue::BindingExpr(BindingExpr::Literal(BindingLiteral::Number(56.0))))
+    );
+    assert_eq!(
+        el.attr("label"),
+        Some(&AttrValue::Str("Chat".into()))
+    );
 }
 
 /// **The effect's identity is the QUALIFIED name** (Rule 48): the namespace it
