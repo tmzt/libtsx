@@ -206,10 +206,15 @@ pub enum AttrValue {
     /// an event binding; the value was one call expression resolving to a
     /// declared host import. See [`NamedEffect`].
     ///
-    /// **Appended last on purpose.** postcard encodes enum variants
-    /// positionally, so a variant inserted anywhere else would renumber every
-    /// value above it in already-written bytes.
+    /// **Kept after all preceding variants on purpose.** postcard encodes enum
+    /// variants positionally, so existing values above it must not move.
     NamedEffect(NamedEffect),
+    /// An owned object/data binding expression. This is deliberately separate
+    /// from [`Binding`] and [`NamedEffect`]: the former is the legacy path
+    /// spelling and the latter is the narrow, checked event grammar.
+    ///
+    /// **Appended last on purpose.** `AttrValue` is persisted positionally.
+    BindingExpr(BindingExpr),
 }
 
 /// The prefix that marks a module specifier as a **host namespace**: an import
@@ -287,6 +292,79 @@ pub struct NamedEffect {
     /// computes is [`EffectError::ArgNotALiteral`].
     pub args: Vec<Expr>,
 }
+
+/// A literal accepted by an owned object/data binding expression.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum BindingLiteral {
+    Bool(bool),
+    Number(f64),
+    String(String),
+    Null,
+}
+
+/// The owned expression vocabulary for object-valued bindings.
+///
+/// This is intentionally independent of [`Expr`] and of the legacy event
+/// grammar. In particular, adding this vocabulary does not make an
+/// `AttrValue::Opaque` event expression executable.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum BindingExpr {
+    Literal(BindingLiteral),
+    Path(Vec<String>),
+    Array(Vec<BindingExpr>),
+    Record(Vec<(String, BindingExpr)>),
+    Call {
+        namespace: String,
+        name: String,
+        type_args: Vec<TypeShape>,
+        args: Vec<BindingExpr>,
+    },
+    Map {
+        source: Box<BindingExpr>,
+        param: String,
+        body: Box<BindingExpr>,
+    },
+    Async(EffectProgram),
+}
+
+/// A named parameter of an owned effect program.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BindingParam {
+    pub name: String,
+    pub ty: TypeShape,
+}
+
+/// A closed, owned effect program. It is semantic IR, never JavaScript.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EffectProgram {
+    pub params: Vec<BindingParam>,
+    pub body: Vec<EffectStmt>,
+}
+
+/// The only statement forms admitted in the first owned effect IR slice.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum EffectStmt {
+    Let {
+        slot: String,
+        value: BindingExpr,
+    },
+    Await {
+        slot: Option<String>,
+        awaitable: BindingExpr,
+    },
+    If {
+        condition: BindingExpr,
+        then_branch: Vec<EffectStmt>,
+        else_branch: Vec<EffectStmt>,
+    },
+    Try {
+        body: Vec<EffectStmt>,
+        error_slot: String,
+        catch: Vec<EffectStmt>,
+    },
+    Return(BindingExpr),
+}
+
 
 /// **What an import specifier resolves to** - the one question the parse asks
 /// its embedding (LIBHBUI_PLAN Rules 48, 52).
@@ -913,6 +991,14 @@ pub enum TypeShape {
     Record(Vec<FieldDecl>),
     /// A reference to another interface by name.
     Named(String),
+    /// A generic type application, preserving its constructor and every
+    /// argument in source order (`Result<T, E>`, `PartialData<T, K>`, ...).
+    ///
+    /// **Appended last on purpose.** TypeShape is persisted positionally.
+    Apply {
+        constructor: String,
+        args: Vec<TypeShape>,
+    },
 }
 
 /// A function signature (handler export or host import).
@@ -1456,6 +1542,57 @@ mod tests {
         assert!(!is_host_namespace("@highbay/effects"));
         assert!(!is_host_namespace("hosted:effects"));
         assert!(!is_host_namespace(""));
+    }
+
+    #[test]
+    fn owned_binding_ir_round_trips_through_serde() {
+        let program = EffectProgram {
+            params: vec![BindingParam {
+                name: "input".into(),
+                ty: TypeShape::Apply {
+                    constructor: "Result".into(),
+                    args: vec![TypeShape::Named("User".into()), TypeShape::Named("Error".into())],
+                },
+            }],
+            body: vec![
+                EffectStmt::Let {
+                    slot: "rows".into(),
+                    value: BindingExpr::Array(vec![
+                        BindingExpr::Literal(BindingLiteral::Bool(true)),
+                        BindingExpr::Path(vec!["input".into(), "rows".into()]),
+                    ]),
+                },
+                EffectStmt::Await {
+                    slot: Some("saved".into()),
+                    awaitable: BindingExpr::Call {
+                        namespace: "storage".into(),
+                        name: "save".into(),
+                        type_args: vec![TypeShape::Named("User".into())],
+                        args: vec![BindingExpr::Path(vec!["input".into()])],
+                    },
+                },
+                EffectStmt::If {
+                    condition: BindingExpr::Path(vec!["saved".into(), "ok".into()]),
+                    then_branch: vec![EffectStmt::Return(BindingExpr::Literal(
+                        BindingLiteral::Null,
+                    ))],
+                    else_branch: vec![EffectStmt::Try {
+                        body: vec![EffectStmt::Return(BindingExpr::Path(vec![
+                            "saved".into(),
+                            "error".into(),
+                        ]))],
+                        error_slot: "error".into(),
+                        catch: vec![EffectStmt::Return(BindingExpr::Literal(
+                            BindingLiteral::String("failed".into()),
+                        ))],
+                    }],
+                },
+            ],
+        };
+        let value = AttrValue::BindingExpr(BindingExpr::Async(program));
+        let json = serde_json::to_string(&value).expect("serialize owned binding");
+        let back: AttrValue = serde_json::from_str(&json).expect("deserialize owned binding");
+        assert_eq!(value, back);
     }
 
     #[test]

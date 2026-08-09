@@ -15,8 +15,8 @@
 //! none - which is the publish path, and is why no `.hbdef` can contain one.
 
 use crate::dag::{
-    AttrValue, Element, ImportDecl, InterfaceDecl, Node,
-    TsxDocument, TypeShape,
+    AttrValue, BindingExpr, BindingLiteral, EffectProgram, EffectStmt, Element, ImportDecl,
+    InterfaceDecl, Node, TsxDocument, TypeShape,
 };
 
 /// Emit a [`TsxDocument`] back to TSX source text.
@@ -229,6 +229,11 @@ fn emit_attr_value(out: &mut String, value: &AttrValue) {
             // seeking to serialize will need to track these separately or accept
             // their loss.
         }
+        AttrValue::BindingExpr(expr) => {
+            out.push_str("={");
+            emit_binding_expr(out, expr);
+            out.push('}');
+        }
         AttrValue::NamedEffect(effect) => {
             out.push_str("={");
             // Emit just the effect name, not the namespace.
@@ -243,8 +248,177 @@ fn emit_attr_value(out: &mut String, value: &AttrValue) {
                 }
                 emit_expr(out, arg);
             }
-
             out.push_str(")}");
+        }
+    }
+}
+
+/// Emit one owned object-binding expression. Unlike [`AttrValue::NamedEffect`],
+/// this vocabulary is not used by the legacy event parser; it is emitted only
+/// when a caller has already constructed the owned semantic IR.
+fn emit_binding_expr(out: &mut String, expr: &BindingExpr) {
+    match expr {
+        BindingExpr::Literal(literal) => match literal {
+            BindingLiteral::Bool(value) => out.push_str(if *value { "true" } else { "false" }),
+            BindingLiteral::Number(value) => out.push_str(&value.to_string()),
+            BindingLiteral::String(value) => {
+                out.push('"');
+                out.push_str(value);
+                out.push('"');
+            }
+            BindingLiteral::Null => out.push_str("null"),
+        },
+        BindingExpr::Path(path) => out.push_str(&path.join(".")),
+        BindingExpr::Array(items) => {
+            out.push('[');
+            for (index, item) in items.iter().enumerate() {
+                if index > 0 {
+                    out.push_str(", ");
+                }
+                emit_binding_expr(out, item);
+            }
+            out.push(']');
+        }
+        BindingExpr::Record(fields) => {
+            out.push('{');
+            for (index, (name, value)) in fields.iter().enumerate() {
+                if index > 0 {
+                    out.push_str(", ");
+                }
+                out.push_str(name);
+                out.push_str(": ");
+                emit_binding_expr(out, value);
+            }
+            out.push('}');
+        }
+        BindingExpr::Call {
+            namespace,
+            name,
+            type_args,
+            args,
+        } => {
+            if !namespace.is_empty() {
+                out.push_str(namespace);
+                out.push('.');
+            }
+            out.push_str(name);
+            if !type_args.is_empty() {
+                out.push('<');
+                for (index, ty) in type_args.iter().enumerate() {
+                    if index > 0 {
+                        out.push_str(", ");
+                    }
+                    emit_type_shape(out, ty);
+                }
+                out.push('>');
+            }
+            out.push('(');
+            for (index, arg) in args.iter().enumerate() {
+                if index > 0 {
+                    out.push_str(", ");
+                }
+                emit_binding_expr(out, arg);
+            }
+            out.push(')');
+        }
+        BindingExpr::Map {
+            source,
+            param,
+            body,
+        } => {
+            emit_binding_expr(out, source);
+            out.push_str(".map(");
+            out.push_str(param);
+            out.push_str(" => ");
+            emit_binding_expr(out, body);
+            out.push(')');
+        }
+        BindingExpr::Async(program) => emit_effect_program(out, program),
+    }
+}
+
+fn emit_effect_program(out: &mut String, program: &EffectProgram) {
+    out.push_str("async (");
+    for (index, param) in program.params.iter().enumerate() {
+        if index > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(&param.name);
+        out.push_str(": ");
+        emit_type_shape(out, &param.ty);
+    }
+    out.push_str(") => {");
+    if !program.body.is_empty() {
+        out.push('\n');
+        emit_effect_statements(out, &program.body, 1);
+    }
+    out.push('}');
+}
+
+fn emit_effect_statements(out: &mut String, statements: &[EffectStmt], indent: usize) {
+    for statement in statements {
+        emit_indent(out, indent);
+        match statement {
+            EffectStmt::Let { slot, value } => {
+                out.push_str("const ");
+                out.push_str(slot);
+                out.push_str(" = ");
+                emit_binding_expr(out, value);
+                out.push_str(";\n");
+            }
+            EffectStmt::Await { slot, awaitable } => {
+                if let Some(slot) = slot {
+                    out.push_str("const ");
+                    out.push_str(slot);
+                    out.push_str(" = ");
+                } else {
+                    out.push_str("await ");
+                }
+                if slot.is_some() {
+                    out.push_str("await ");
+                }
+                emit_binding_expr(out, awaitable);
+                out.push_str(";\n");
+            }
+            EffectStmt::If {
+                condition,
+                then_branch,
+                else_branch,
+            } => {
+                out.push_str("if (");
+                emit_binding_expr(out, condition);
+                out.push_str(") {\n");
+                emit_effect_statements(out, then_branch, indent + 1);
+                emit_indent(out, indent);
+                out.push('}');
+                if !else_branch.is_empty() {
+                    out.push_str(" else {\n");
+                    emit_effect_statements(out, else_branch, indent + 1);
+                    emit_indent(out, indent);
+                    out.push('}');
+                }
+                out.push('\n');
+            }
+            EffectStmt::Try {
+                body,
+                error_slot,
+                catch,
+            } => {
+                out.push_str("try {\n");
+                emit_effect_statements(out, body, indent + 1);
+                emit_indent(out, indent);
+                out.push_str("} catch (");
+                out.push_str(error_slot);
+                out.push_str(") {\n");
+                emit_effect_statements(out, catch, indent + 1);
+                emit_indent(out, indent);
+                out.push_str("}\n");
+            }
+            EffectStmt::Return(value) => {
+                out.push_str("return ");
+                emit_binding_expr(out, value);
+                out.push_str(";\n");
+            }
         }
     }
 }
@@ -330,6 +504,17 @@ fn emit_type_shape(out: &mut String, shape: &TypeShape) {
             out.push_str("{}");
         }
         TypeShape::Named(name) => out.push_str(name),
+        TypeShape::Apply { constructor, args } => {
+            out.push_str(constructor);
+            out.push('<');
+            for (index, arg) in args.iter().enumerate() {
+                if index > 0 {
+                    out.push_str(", ");
+                }
+                emit_type_shape(out, arg);
+            }
+            out.push('>');
+        }
     }
 }
 
@@ -419,6 +604,48 @@ mod tests {
 
         let output = emit_tsx_document(&doc);
         assert!(output.contains("<List<Message>"));
+    }
+
+    #[test]
+    fn emit_nested_generic_type_and_owned_binding_expression() {
+        let elem = Element {
+            tag: "ResultView".into(),
+            type_args: vec![TypeShape::Apply {
+                constructor: "Result".into(),
+                args: vec![
+                    TypeShape::Named("User".into()),
+                    TypeShape::Named("Error".into()),
+                ],
+            }],
+            attrs: vec![(
+                "value".into(),
+                AttrValue::BindingExpr(BindingExpr::Record(vec![
+                    (
+                        "rows".into(),
+                        BindingExpr::Array(vec![BindingExpr::Literal(BindingLiteral::Number(
+                            3.0,
+                        ))]),
+                    ),
+                    (
+                        "load".into(),
+                        BindingExpr::Call {
+                            namespace: "storage".into(),
+                            name: "load".into(),
+                            type_args: vec![TypeShape::Named("User".into())],
+                            args: vec![BindingExpr::Path(vec!["props".into(), "id".into()])],
+                        },
+                    ),
+                ])),
+            )],
+            children: vec![],
+        };
+        let doc = TsxDocument {
+            root_nodes: vec![DagNode::Element(elem)],
+            imports: vec![],
+        };
+        let output = emit_tsx_document(&doc);
+        assert!(output.contains("<ResultView<Result<User, Error>>"));
+        assert!(output.contains("value={{rows: [3], load: storage.load<User>(props.id)}}"));
     }
 
     #[test]

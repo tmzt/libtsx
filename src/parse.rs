@@ -1131,20 +1131,30 @@ fn union_shape(u: &oxc_ast::ast::TSUnionType) -> Result<TypeShape, String> {
     }
 }
 
-/// `Array<T>` → `List<T>`; anything else named → `Named`.
+/// `Array<T>` → `List<T>`; every other generic reference preserves its
+/// constructor and all arguments as [`TypeShape::Apply`].
 fn reference_shape(r: &oxc_ast::ast::TSTypeReference) -> Result<TypeShape, String> {
     let name = match &r.type_name {
         oxc_ast::ast::TSTypeName::IdentifierReference(id) => id.name.to_string(),
         _ => return Ok(TypeShape::Named("unknown".to_string())),
     };
+    let Some(type_arguments) = &r.type_arguments else {
+        return Ok(TypeShape::Named(name));
+    };
+    let args = type_arguments
+        .params
+        .iter()
+        .map(type_shape)
+        .collect::<Result<Vec<_>, _>>()?;
     if name == "Array" {
-        if let Some(args) = &r.type_arguments {
-            if let Some(first) = args.params.first() {
-                return Ok(TypeShape::List(Box::new(type_shape(first)?)));
-            }
+        if let Some(first) = args.first() {
+            return Ok(TypeShape::List(Box::new(first.clone())));
         }
     }
-    Ok(TypeShape::Named(name))
+    Ok(TypeShape::Apply {
+        constructor: name,
+        args,
+    })
 }
 
 fn convert_element(jsx: &JSXElement, low: &Lowering) -> Result<Element, EffectError> {
@@ -1378,6 +1388,47 @@ mod tests {
         assert_eq!(
             grid.type_args,
             vec![TypeShape::Named("Message".into()), TypeShape::String],
+        );
+    }
+
+    #[test]
+    fn generic_references_preserve_all_arguments_except_array_list_sugar() {
+        let interfaces = extract_interfaces(
+            r#"
+                interface Props {
+                    result: Result<User, Error>;
+                    selected: PartialData<User, string>;
+                    values: Array<Result<User, Error>>;
+                }
+            "#,
+        )
+        .expect("generic references parse");
+        assert_eq!(
+            interfaces[0].fields[0].ty,
+            TypeShape::Apply {
+                constructor: "Result".into(),
+                args: vec![
+                    TypeShape::Named("User".into()),
+                    TypeShape::Named("Error".into()),
+                ],
+            }
+        );
+        assert_eq!(
+            interfaces[0].fields[1].ty,
+            TypeShape::Apply {
+                constructor: "PartialData".into(),
+                args: vec![TypeShape::Named("User".into()), TypeShape::String],
+            }
+        );
+        assert_eq!(
+            interfaces[0].fields[2].ty,
+            TypeShape::List(Box::new(TypeShape::Apply {
+                constructor: "Result".into(),
+                args: vec![
+                    TypeShape::Named("User".into()),
+                    TypeShape::Named("Error".into()),
+                ],
+            }))
         );
     }
 
