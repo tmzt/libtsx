@@ -27,6 +27,32 @@
 //!   depend with `default-features = false` and skip the parser stack
 //!   entirely — including the element tree, which is graph data and so is
 //!   nameable without the parser.
+//!
+//! # The expression seam is a pair of conversions
+//!
+//! One [`dag::BindingExpr`] is the root of an expression subtree and needs no
+//! document, so the two directions across the TEXT boundary are spelled as
+//! Rust's own conversion traits rather than a bespoke vocabulary:
+//!
+//! * `impl From<&BindingExpr> for String` ([`emit`]) — **total**, so `From`.
+//!   Not feature-gated: emitting names no `oxc_*` type.
+//! * `impl TryFrom<&str> for BindingExpr` (feature `parse`) — **fallible**, so
+//!   `TryFrom`, with [`ParseError`] saying which of the four refusals it was.
+//!   It takes TEXT and not an `oxc_ast::Expression` because the quarantine
+//!   above forbids naming one in a public signature; the parse happens inside.
+//!
+//! The two are **inverse over the image of the parse**, which is the law
+//! `libhbui`'s `codec_round_trip.rs` measures over every authored `.tsx` in the
+//! repository and over an exhaustive operand/position matrix.
+//!
+//! **The ladder continues upward in the crate that owns the next rung**, and
+//! the orphan rule works out at each one without anything moving crates: a
+//! crate may write the impl whose NEW type is its own, because `&T` is
+//! fundamental (so `&BindingExpr` counts as local here, which is what makes
+//! `From<&BindingExpr> for String` legal even though `String` is std's). The
+//! instinct to put both directions beside the OLDER type is the one that does
+//! not compile. A rung whose owner is a third crate — one that owns neither
+//! end — needs a newtype or a free function; there is no impl for it.
 
 pub mod dag;
 

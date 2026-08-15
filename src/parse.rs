@@ -43,9 +43,10 @@ use oxc_span::{SourceType, Span};
 
 /// Everything a parse can refuse.
 ///
-/// Three kinds, kept apart because they are different facts: oxc could not read
-/// the source, it read it and the source declared something that cannot mean
-/// what it says, or a file that had to supply a root element did not. The free
+/// Four kinds, kept apart because they are different facts: oxc could not read
+/// the source, it read it and the owned expression vocabulary declines what it
+/// says, it read it and the source declared something that cannot mean what it
+/// says, or a file that had to supply a root element did not. The free
 /// [`parse_tsx`] / [`parse_app`] flatten all of them into the `Vec<String>`
 /// their callers have always taken; [`ParseCtx::parse_tsx`] and
 /// [`ParseCtx::parse_app`] hand them back **typed**, which is what lets a
@@ -54,6 +55,15 @@ use oxc_span::{SourceType, Span};
 pub enum ParseError {
     /// oxc's diagnostics, rendered for a human (see [`parse_tsx`]).
     Syntax(Vec<String>),
+    /// The text is valid TypeScript and the owned vocabulary has no shape for
+    /// it - a spread, a computed key, a template literal.
+    ///
+    /// Only [`BindingExpr`]'s `TryFrom<&str>` produces this: a refusal reached
+    /// through a DOCUMENT is about an attribute, and carries the attribute's
+    /// name as [`EffectError::BindingSyntax`]. A bare fragment has no attribute
+    /// to name, and inventing one would be a lie about where the text came
+    /// from.
+    Binding(String),
     /// An effect binding or a host import that cannot mean what it says
     /// (LIBHBUI_PLAN Rules 46a, 48).
     Effect(EffectError),
@@ -87,6 +97,7 @@ impl std::fmt::Display for ParseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Syntax(messages) => write!(f, "{}", messages.join("; ")),
+            Self::Binding(message) => write!(f, "unsupported binding expression: {message}"),
             Self::Effect(e) => write!(f, "{e}"),
             Self::NoRootElement { screen: None } => write!(f, "app source has no root element"),
             Self::NoRootElement { screen: Some(i) } => {
@@ -1330,10 +1341,96 @@ fn push_child(
     Ok(())
 }
 
+/// **The public lowering seam: one TypeScript expression's TEXT to one node.**
+///
+/// The upward rung of the IR ladder, spelled as Rust's own fallible conversion
+/// trait. It is the inverse of `impl From<&BindingExpr> for String`
+/// ([`crate::emit`]) over the image of the parse - which is exactly the law
+/// `codec_round_trip.rs` measures - and it is what lets a caller wrap an
+/// expression as a pipeline stage without owning a document.
+///
+/// ```
+/// use libtsx::dag::{BindingExpr, BindingLiteral};
+///
+/// let expr = BindingExpr::try_from(r#"props.label ?? "none""#).expect("lowers");
+/// assert_eq!(
+///     expr,
+///     BindingExpr::Coalesce(vec![
+///         BindingExpr::Path(vec!["props".into(), "label".into()]),
+///         BindingExpr::Literal(BindingLiteral::String("none".into())),
+///     ])
+/// );
+/// // And back, which is the pairing:
+/// assert_eq!(String::from(&expr), r#"props.label ?? "none""#);
+/// ```
+///
+/// # Why TEXT and not `&Expression`
+///
+/// [`lower_binding_expr`] below already takes ONE expression subtree root and
+/// needs no document; what kept it private is that its parameter is
+/// `&oxc_ast::Expression`, and **no `oxc_*` type appears in this crate's public
+/// API** (the quarantine, PLAN §4 - it is what lets a consumer take `libtsx`
+/// with `default-features = false` and never build oxc). So the public door
+/// takes the fragment and parses it here. Callers who already hold an oxc AST
+/// are all inside this crate and call the private function directly.
+///
+/// # What the wrapper does, and why there is one
+///
+/// The fragment is parsed as `(<text>\n);`. The parentheses are not cosmetic:
+/// a bare `{a: 1}` in statement position is a BLOCK, so without them the one
+/// expression that most needs this door could not come through it, and
+/// `From`/`TryFrom` would not be inverse. [`unparen`] strips them again before
+/// lowering, so the node is the same one the `<Probe v={...} />` document
+/// spelling produces.
+///
+/// # The scope is empty, and that is the right scope
+///
+/// A bare fragment declares no imports, so there is nothing for an
+/// [`EffectScope`] to hold. Nothing on this path consults one either: a scope
+/// is read only by the `on..` EVENT grammar ([`effect_attr`]), which resolves a
+/// callee to a granted host import. An ordinary binding expression carries its
+/// callee as a name, and is the same node whatever a module imported.
+#[allow(rustdoc::private_intra_doc_links)]
+impl TryFrom<&str> for BindingExpr {
+    type Error = ParseError;
+
+    fn try_from(source: &str) -> Result<Self, Self::Error> {
+        // The trailing newline is what keeps a fragment ending in a `//`
+        // comment from commenting out the closing parenthesis.
+        let wrapped = format!("({source}\n);");
+        let allocator = Allocator::default();
+        let ret = Parser::new(&allocator, &wrapped, SourceType::tsx()).parse();
+        if !ret.diagnostics.is_empty() {
+            // Display, not Debug - see `extract_interfaces`; these strings are
+            // user-facing.
+            return Err(ParseError::Syntax(
+                ret.diagnostics.into_iter().map(|e| e.to_string()).collect(),
+            ));
+        }
+        let [Statement::ExpressionStatement(statement)] = &ret.program.body[..] else {
+            return Err(ParseError::Binding(
+                "the text is not a single expression".into(),
+            ));
+        };
+        lower_binding_expr(
+            &statement.expression,
+            &EffectScope {
+                granted: Vec::new(),
+                foreign: Vec::new(),
+            },
+        )
+        .map_err(ParseError::Binding)
+    }
+}
+
 /// Lower an ordinary JSX expression container into the owned object-binding
 /// vocabulary. This deliberately has no `Opaque` fallback: callers need an
 /// explicit parser refusal when JavaScript would execute something the owned
 /// graph cannot represent.
+///
+/// **It takes one expression subtree root and no document**, which is the whole
+/// reason `impl TryFrom<&str> for BindingExpr` above can exist: the seam was
+/// always here, and only its `&oxc_ast::Expression` parameter kept it private.
 fn lower_binding_expr(expr: &Expression, _scope: &EffectScope) -> Result<BindingExpr, String> {
     use BindingExpr as B;
     let expr = unparen(expr);
