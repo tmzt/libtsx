@@ -205,6 +205,29 @@ fn a_parenthesised_member_chain_is_one_name() {
     }
 }
 
+/// **An inline record type argument keeps its fields.**
+///
+/// `emit_type_shape` used to write `{}` for a `TypeShape::Record` and say so in
+/// a comment - a declared gap, and still a hole in the round trip: the text
+/// parsed, so the fields went missing with nothing to report (libhbui's
+/// `codec_round_trip.rs`, F5).
+#[test]
+fn an_inline_record_type_argument_keeps_its_fields() {
+    for source in [
+        "g<{a: number}>()",
+        "g<{a: number, b: string}>()",
+        "g<{a?: number}>()",
+        "g<{a: {b: boolean}}>()",
+        "g<Array<{a: number}>>()",
+        r#"g<{"a-b": number}>()"#,
+        // The empty record still writes the two braces it always did - and now
+        // means them.
+        "g<{}>()",
+    ] {
+        round_trips(source);
+    }
+}
+
 #[test]
 fn a_refusal_says_which_kind_it_was() {
     // Not TypeScript.

@@ -801,10 +801,35 @@ fn emit_type_shape(out: &mut String, shape: &TypeShape) {
             emit_type_shape(out, inner);
             out.push_str(" | undefined");
         }
-        TypeShape::Record(_) => {
-            // Inline anonymous records in type arguments are complex
-            // For now, emit a placeholder
-            out.push_str("{}");
+        // An inline anonymous record - `{a: number, b?: string}` - written out
+        // field for field.
+        //
+        // It used to emit `{}` and say so ("Inline anonymous records in type
+        // arguments are complex. For now, emit a placeholder"), which is a
+        // DECLARED gap rather than an oversight and was pinned as one (libhbui's
+        // `codec_round_trip.rs`, F5): the text still parsed, so the fields were
+        // dropped silently and the re-parse was an empty record that compared
+        // unequal. There is nothing complex in it - a type literal's members are
+        // the same `FieldDecl`s an interface holds, they take the same two key
+        // spellings as a value record's, and `?` is where the optional flag
+        // goes.
+        //
+        // The separator is `,` rather than `;`: both are TypeScript, and this is
+        // the one the record VALUE spelling beside it already uses.
+        TypeShape::Record(fields) => {
+            out.push('{');
+            for (index, field) in fields.iter().enumerate() {
+                if index > 0 {
+                    out.push_str(", ");
+                }
+                push_property_key(out, &field.name);
+                if field.optional {
+                    out.push('?');
+                }
+                out.push_str(": ");
+                emit_type_shape(out, &field.ty);
+            }
+            out.push('}');
         }
         TypeShape::Named(name) => out.push_str(name),
         TypeShape::Apply { constructor, args } => {
@@ -1212,6 +1237,33 @@ mod tests {
         assert_eq!(keyed(""), r#"{"": 1}"#);
         // The key goes through the same escaping the values do.
         assert_eq!(keyed("quote\"in"), r#"{"quote\"in": 1}"#);
+    }
+
+    // --- F5: an inline record type is written field for field ----------------
+
+    #[test]
+    fn an_inline_record_type_is_written_field_for_field() {
+        use crate::dag::FieldDecl;
+        let shape = TypeShape::Record(vec![
+            FieldDecl {
+                name: "a".into(),
+                ty: TypeShape::F64,
+                optional: false,
+            },
+            FieldDecl {
+                name: "b-c".into(),
+                ty: TypeShape::Option(Box::new(TypeShape::String)),
+                optional: true,
+            },
+        ]);
+        let mut out = String::new();
+        emit_type_shape(&mut out, &shape);
+        assert_eq!(out, "{a: number, \"b-c\"?: string | undefined}");
+
+        // An empty one still writes the two braces it always did.
+        let mut out = String::new();
+        emit_type_shape(&mut out, &TypeShape::Record(vec![]));
+        assert_eq!(out, "{}");
     }
 
     #[test]
