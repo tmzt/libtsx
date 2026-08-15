@@ -305,11 +305,7 @@ fn emit_binding_expr(out: &mut String, expr: &BindingExpr) {
         BindingExpr::Literal(literal) => match literal {
             BindingLiteral::Bool(value) => out.push_str(if *value { "true" } else { "false" }),
             BindingLiteral::Number(value) => out.push_str(&value.to_string()),
-            BindingLiteral::String(value) => {
-                out.push('"');
-                out.push_str(value);
-                out.push('"');
-            }
+            BindingLiteral::String(value) => push_string_literal(out, value),
             BindingLiteral::Null => out.push_str("null"),
         },
         BindingExpr::Path(path) => out.push_str(&path.join(".")),
@@ -403,6 +399,41 @@ fn emit_binding_expr(out: &mut String, expr: &BindingExpr) {
             emit_arrow_body(out, body);
         }
     }
+}
+
+/// **A double-quoted TypeScript string literal for `value`, escaped.**
+///
+/// The unescaped spelling this replaces pushed `"`, the value, `"`, and failed
+/// three ways (libhbui's `codec_round_trip.rs`, F3): a quote ended the literal
+/// early, a newline left it unterminated, and a BACKSLASH was silently eaten -
+/// `back\slash` emitted as `"back\slash"`, which re-parses as `backslash`. The
+/// last is the one that matters, because both of the others are syntax errors a
+/// re-parse reports and that one is a different string nothing complains about.
+///
+/// **Minimal, deliberately.** Only what changes meaning is escaped, so an
+/// ordinary string is written the way an author would write it and the round
+/// trip is not "escape everything" wearing a fix's clothes - the single quote,
+/// the `$`, the backtick and every printable non-ASCII character go through
+/// untouched. `U+2028`/`U+2029` are in the list because they are line
+/// terminators to a JavaScript lexer even though they look like nothing.
+fn push_string_literal(out: &mut String, value: &str) {
+    out.push('"');
+    for ch in value.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{2028}' => out.push_str("\\u2028"),
+            '\u{2029}' => out.push_str("\\u2029"),
+            other if (other as u32) < 0x20 => {
+                out.push_str(&format!("\\u{:04x}", other as u32));
+            }
+            other => out.push(other),
+        }
+    }
+    out.push('"');
 }
 
 /// `(a: T, b: U)` - the parameter list of either arrow spelling.
@@ -665,11 +696,12 @@ fn emit_expr(out: &mut String, expr: &crate::dag::Expr) {
         Expr::LitS64(n) => out.push_str(&n.to_string()),
         Expr::LitF32(n) => out.push_str(&n.to_string()),
         Expr::LitF64(n) => out.push_str(&n.to_string()),
-        Expr::LitStr(s) => {
-            out.push('"');
-            out.push_str(s);
-            out.push('"');
-        }
+        // The same writer the binding vocabulary uses: an effect argument is
+        // spliced into a JSX expression container, so it is JavaScript text and
+        // takes JavaScript's escapes. (An `AttrValue::Str` is NOT - it is a JSX
+        // attribute string, where a backslash is a backslash and `"` would need
+        // an entity - so it keeps its own verbatim spelling above.)
+        Expr::LitStr(s) => push_string_literal(out, s),
         Expr::Param(_) => {
             // Parameters only appear in handlers, which are not part of the element tree
         }
@@ -1099,6 +1131,38 @@ mod tests {
             String::from(&outer),
             "(x: number) => ({a: 1} ?? ((x: number) => ({a: 1} ?? z)))"
         );
+    }
+
+    // --- F3: a string literal is escaped -------------------------------------
+    //
+    // Asserted from a HAND-BUILT node, which is the direction the seam test
+    // beside it cannot reach: a dag that never came from a parse is exactly the
+    // one an editor hands the emitter.
+
+    /// `"<value>"` as the emitter writes it.
+    fn literal(value: &str) -> String {
+        String::from(&BindingExpr::Literal(BindingLiteral::String(value.into())))
+    }
+
+    #[test]
+    fn a_string_literal_carries_its_escapes() {
+        assert_eq!(literal("back\\slash"), r#""back\\slash""#);
+        assert_eq!(literal("quote\"inside"), r#""quote\"inside""#);
+        assert_eq!(literal("line\nbreak"), r#""line\nbreak""#);
+        assert_eq!(literal("carriage\rreturn"), r#""carriage\rreturn""#);
+        assert_eq!(literal("tab\there"), r#""tab\there""#);
+        assert_eq!(literal("\u{1}"), "\"\\u0001\"");
+        assert_eq!(literal("\u{2028}"), "\"\\u2028\"");
+    }
+
+    #[test]
+    fn a_string_literal_with_nothing_to_escape_is_written_as_it_stands() {
+        // The over-correction guard: "escape everything" would pass the test
+        // above and be a different bug.
+        assert_eq!(literal("plain text 1.0"), r#""plain text 1.0""#);
+        assert_eq!(literal("it's $5 (100%) - `ok`"), r#""it's $5 (100%) - `ok`""#);
+        assert_eq!(literal("caf\u{e9}"), "\"caf\u{e9}\"");
+        assert_eq!(literal(""), r#""""#);
     }
 }
 

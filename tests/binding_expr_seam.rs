@@ -72,6 +72,45 @@ fn one_expression_of_each_variant_crosses_the_seam_and_comes_back() {
     }
 }
 
+/// **A string literal comes back as the string it went in as.**
+///
+/// The emit used to push `"`, the value, `"` (libhbui's `codec_round_trip.rs`,
+/// F3): a quote ended the literal early, a newline left it unterminated, and a
+/// backslash was eaten by the re-parse as an escape nobody wrote - `back\slash`
+/// came back `backslash`, valid text and a different string.
+#[test]
+fn a_string_literal_is_emitted_escaped() {
+    for (source, value) in [
+        (r#""quote\"inside""#, "quote\"inside"),
+        (r#""line\nbreak""#, "line\nbreak"),
+        (r#""back\\slash""#, "back\\slash"),
+        (r#""carriage\rreturn""#, "carriage\rreturn"),
+        (r#""tab\there""#, "tab\there"),
+        // A control character has no printable spelling at all.
+        (r#""\u0001""#, "\u{1}"),
+    ] {
+        let expr = round_trips(source);
+        assert_eq!(
+            expr,
+            BindingExpr::Literal(BindingLiteral::String(value.into())),
+            "{source} did not lower to the string it spells"
+        );
+    }
+
+    // **Not over-escaped**, which is the failure a naive fix would be: an
+    // apostrophe, a dollar, a backtick and a printable non-ASCII character are
+    // not escapes, and a string full of them is written the way it was read.
+    // (The `\u{e9}` is spelled as an escape HERE so this file stays ASCII; the
+    // string it denotes is one ordinary character.)
+    for source in [
+        r#""plain text 1.0""#,
+        r#""it's $5 (100%) - `ok`""#,
+        "\"caf\u{e9}\"",
+    ] {
+        round_trips(source);
+    }
+}
+
 #[test]
 fn a_record_crosses_the_seam_although_a_bare_brace_opens_a_block() {
     // The one shape that decides whether the seam needs its wrapping
