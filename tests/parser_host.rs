@@ -21,6 +21,14 @@
 //! malformations, which is Rule 43's exception - **the point IS the shape**:
 //! what is being ruled out is source an authoring surface could produce, so
 //! there is nothing else to parse them from.
+//!
+//! **Gated on `parse`, because everything here IS the parser.** Without the
+//! gate this target fails to COMPILE under `--no-default-features` - not skip,
+//! fail - which breaks `cargo test` for the types-only configuration that
+//! `highbay_data` actually consumes (`default-features = false`). The library
+//! half was always fine; only this test target was unbuildable.
+
+#![cfg(feature = "parse")]
 
 use libtsx::dag::{
     AttrValue, BindingExpr, BindingLiteral, EffectError, Expr, FieldDecl, FuncSig, ImportKind,
