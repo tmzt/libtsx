@@ -228,6 +228,28 @@ fn an_inline_record_type_argument_keeps_its_fields() {
     }
 }
 
+/// **`bigint` is a type argument that comes back.**
+///
+/// `type_shape` lowers the keyword to `TypeShape::S64` and the emit wrote it
+/// `i64` - a Rust/WIT spelling TypeScript does not have, which re-parsed as a
+/// dangling `Named("i64")` reference (libhbui's `codec_round_trip.rs`, F6).
+/// `S32` and `F32` share the cause and have no TS source at all, so this is the
+/// whole of the finding that an author can reach.
+#[test]
+fn a_bigint_type_argument_comes_back() {
+    for source in [
+        "g<bigint>()",
+        "g<Array<bigint>>()",
+        "g<{a: bigint}>()",
+        // The three whose spellings were TypeScript's already.
+        "g<number>()",
+        "g<boolean>()",
+        "g<string>()",
+    ] {
+        round_trips(source);
+    }
+}
+
 #[test]
 fn a_refusal_says_which_kind_it_was() {
     // Not TypeScript.

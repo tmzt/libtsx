@@ -787,9 +787,26 @@ fn emit_expr(out: &mut String, expr: &crate::dag::Expr) {
 fn emit_type_shape(out: &mut String, shape: &TypeShape) {
     match shape {
         TypeShape::Bool => out.push_str("boolean"),
-        TypeShape::S32 => out.push_str("i32"),
-        TypeShape::S64 => out.push_str("i64"),
-        TypeShape::F32 => out.push_str("f32"),
+        // **The sized numerics, in TypeScript** (libhbui's
+        // `codec_round_trip.rs`, F6). These three used to emit `i32`, `i64` and
+        // `f32` - Rust/WIT spellings that TypeScript does not have, and that
+        // `type_shape` has no arm for, so each re-parsed as a dangling
+        // `Named("i32")` reference to a type nobody declared.
+        //
+        // `S64` is the one with a keyword of its own: `bigint` is what
+        // `type_shape` lowers TO `S64` (`parse.rs`), so this spelling closes the
+        // round trip rather than merely being legal.
+        //
+        // `S32` and `F32` have no distinct spelling, because TypeScript has ONE
+        // numeric type - so they widen to `number`, which is what they mean
+        // there, and a re-parse of `number` is `F64`. That loss belongs to the
+        // target language: neither shape has a TS source (nothing in
+        // `type_shape` produces them; they arrive from a declared `FuncSig`), so
+        // the choice is between valid TypeScript that widens and invalid
+        // TypeScript that does not come back either.
+        TypeShape::S32 => out.push_str("number"),
+        TypeShape::S64 => out.push_str("bigint"),
+        TypeShape::F32 => out.push_str("number"),
         TypeShape::F64 => out.push_str("number"),
         TypeShape::String => out.push_str("string"),
         TypeShape::List(inner) => {
@@ -1264,6 +1281,33 @@ mod tests {
         let mut out = String::new();
         emit_type_shape(&mut out, &TypeShape::Record(vec![]));
         assert_eq!(out, "{}");
+    }
+
+    // --- F6: the sized numerics are written in TypeScript --------------------
+
+    /// One type shape's text.
+    fn type_text(shape: &TypeShape) -> String {
+        let mut out = String::new();
+        emit_type_shape(&mut out, shape);
+        out
+    }
+
+    #[test]
+    fn the_sized_numerics_are_written_in_typescript() {
+        // `bigint` is a keyword, and the one `type_shape` lowers to `S64`, so
+        // this spelling closes the round trip.
+        assert_eq!(type_text(&TypeShape::S64), "bigint");
+        // The other two widen: TypeScript has one numeric type, and `number` is
+        // what they mean in it. Stated as a test rather than left implicit,
+        // because the loss is real and it is the target language's, not this
+        // emitter's.
+        assert_eq!(type_text(&TypeShape::S32), "number");
+        assert_eq!(type_text(&TypeShape::F32), "number");
+        // Unchanged, and here so the whole vocabulary is written down in one
+        // place: these three spellings were TypeScript's already.
+        assert_eq!(type_text(&TypeShape::Bool), "boolean");
+        assert_eq!(type_text(&TypeShape::F64), "number");
+        assert_eq!(type_text(&TypeShape::String), "string");
     }
 
     #[test]
