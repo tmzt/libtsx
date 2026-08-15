@@ -130,6 +130,34 @@ fn a_record_crosses_the_seam_although_a_bare_brace_opens_a_block() {
     assert!(BindingExpr::try_from("{const q = 1;}").is_err());
 }
 
+/// **A key no identifier can spell keeps its quotes.**
+///
+/// The parse takes a `PropertyKey::StringLiteral` as readily as a
+/// `StaticIdentifier`, so `{"quoted-key": 1}` is an authorable record - and the
+/// emit wrote every key bare, which made `{quoted-key: 1}`, a syntax error
+/// (libhbui's `codec_round_trip.rs`, F4).
+#[test]
+fn a_record_key_that_is_not_an_identifier_is_quoted() {
+    for source in [
+        r#"{"quoted-key": 1}"#,
+        r#"{"with space": 1}"#,
+        r#"{"0leading": 1}"#,
+        r#"{"": 1}"#,
+        r#"{a: 1, "b-c": 2}"#,
+    ] {
+        round_trips(source);
+    }
+    // The boundary, both ways it can be written: an identifier key is emitted
+    // BARE, so a quoted one that did not need the quotes comes back without
+    // them - one spelling for one key, which is what stops a publish
+    // respelling every record in the corpus.
+    assert_eq!(
+        String::from(&BindingExpr::try_from(r#"{"a": 1}"#).expect("lowers")),
+        "{a: 1}"
+    );
+    round_trips("{a: 1}");
+}
+
 /// **A redundant parenthesis does not make a second shape.**
 ///
 /// `(a).b` is `a.b`, and the lowering says so: a chain whose base lowers to a

@@ -325,7 +325,7 @@ fn emit_binding_expr(out: &mut String, expr: &BindingExpr) {
                 if index > 0 {
                     out.push_str(", ");
                 }
-                out.push_str(name);
+                push_property_key(out, name);
                 out.push_str(": ");
                 emit_binding_expr(out, value);
             }
@@ -434,6 +434,45 @@ fn push_string_literal(out: &mut String, value: &str) {
         }
     }
     out.push('"');
+}
+
+/// **A property key: bare when it is an identifier, quoted when it is not.**
+///
+/// The parse accepts both spellings a TypeScript author may write - a
+/// `PropertyKey::StaticIdentifier` and a `PropertyKey::StringLiteral` - and
+/// stores the same `String` for each, so `{"quoted-key": 1}` is an authorable
+/// record whose key no identifier can spell. The emit wrote every key bare,
+/// which made `{quoted-key: 1}`: a syntax error, and a shape the parser
+/// produces that the emitter could not write (libhbui's `codec_round_trip.rs`,
+/// F4).
+///
+/// Bare stays the DEFAULT and not merely one of two options: quoting every key
+/// would round-trip just as well, and would respell every record in the corpus
+/// on the next publish.
+///
+/// Used for a value record's keys and for an inline record TYPE's field names,
+/// which take the same two spellings.
+fn push_property_key(out: &mut String, name: &str) {
+    if is_identifier(name) {
+        out.push_str(name);
+    } else {
+        push_string_literal(out, name);
+    }
+}
+
+/// Whether `name` can be written bare - ASCII only, deliberately.
+///
+/// TypeScript admits far more (any `ID_Start` followed by `ID_Continue`s, plus
+/// `\u` escapes), and the cost of the narrow answer is one pair of quotes
+/// around a key that did not need them - which still re-parses to the same
+/// string. The cost of a WIDE answer that is wrong anywhere is emitted text
+/// that does not parse, so this errs where the failure is harmless.
+fn is_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    let starts = chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_' || c == '$');
+    starts && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
 }
 
 /// `(a: T, b: U)` - the parameter list of either arrow spelling.
@@ -1153,6 +1192,35 @@ mod tests {
         assert_eq!(literal("tab\there"), r#""tab\there""#);
         assert_eq!(literal("\u{1}"), "\"\\u0001\"");
         assert_eq!(literal("\u{2028}"), "\"\\u2028\"");
+    }
+
+    // --- F4: a record key is quoted when it cannot be written bare -----------
+
+    /// `{<key>: 1}` as the emitter writes it.
+    fn keyed(key: &str) -> String {
+        String::from(&BindingExpr::Record(vec![(
+            key.into(),
+            BindingExpr::Literal(BindingLiteral::Number(1.0)),
+        )]))
+    }
+
+    #[test]
+    fn a_record_key_that_is_not_an_identifier_is_quoted() {
+        assert_eq!(keyed("quoted-key"), r#"{"quoted-key": 1}"#);
+        assert_eq!(keyed("with space"), r#"{"with space": 1}"#);
+        assert_eq!(keyed("0leading"), r#"{"0leading": 1}"#);
+        assert_eq!(keyed(""), r#"{"": 1}"#);
+        // The key goes through the same escaping the values do.
+        assert_eq!(keyed("quote\"in"), r#"{"quote\"in": 1}"#);
+    }
+
+    #[test]
+    fn an_identifier_record_key_stays_bare() {
+        // Quoting everything would round-trip too, and would respell every
+        // record in the corpus on the next publish.
+        for key in ["a", "camelCase", "_under", "$dollar", "a0"] {
+            assert_eq!(keyed(key), format!("{{{key}: 1}}"));
+        }
     }
 
     #[test]
