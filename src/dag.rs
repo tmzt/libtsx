@@ -327,6 +327,19 @@ pub enum BindingLiteral {
 /// decodes as a different expression. Appending keeps old bytes readable; old
 /// readers refuse new bytes, which is the version-gate event, and it starts the
 /// day an author WRITES one of the new forms - not the day the variant lands.
+///
+/// # A REMOVAL cannot be append-managed, and there has been one
+///
+/// The discipline above governs WITHIN a schema version and has nothing to
+/// offer a variant that LEAVES: every variant after the gap shifts down one
+/// index, so bytes written before the removal decode as a different expression
+/// with no error anywhere. `Map { source, param, body }` left here -
+/// `PIPELINE_PLAN.md` section 6b, on the ground that reading a callee named
+/// `map` as a comprehension is a MEANING and this enum captures forms - and
+/// `xs.map(x => x)` is now a [`Call`](BindingExpr::Call) whose argument is an
+/// [`Arrow`](BindingExpr::Arrow), which is what TypeScript says it is. That
+/// removal is why `libhbui`'s `HBDEF_VERSION` is 2. A future removal is another
+/// such event and costs another bump; there is no cheaper way to take one.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum BindingExpr {
     Literal(BindingLiteral),
@@ -338,11 +351,6 @@ pub enum BindingExpr {
         name: String,
         type_args: Vec<TypeShape>,
         args: Vec<BindingExpr>,
-    },
-    Map {
-        source: Box<BindingExpr>,
-        param: String,
-        body: Box<BindingExpr>,
     },
     Async(EffectProgram),
     /// `a ?? b`, and `a ?? b ?? c` as ONE n-ary node.

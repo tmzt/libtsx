@@ -321,18 +321,6 @@ fn emit_binding_expr(out: &mut String, expr: &BindingExpr) {
             }
             out.push(')');
         }
-        BindingExpr::Map {
-            source,
-            param,
-            body,
-        } => {
-            emit_binding_expr(out, source);
-            out.push_str(".map(");
-            out.push_str(param);
-            out.push_str(" => ");
-            emit_binding_expr(out, body);
-            out.push(')');
-        }
         BindingExpr::Async(program) => emit_effect_program(out, program),
         BindingExpr::Coalesce(operands) => {
             for (index, operand) in operands.iter().enumerate() {
@@ -466,13 +454,15 @@ fn emit_member_base(out: &mut String, expr: &BindingExpr) {
 /// Whether this expression's emitted text is self-delimiting - a literal, a
 /// name, a bracketed collection, a call, or a member chain ending in one.
 ///
-/// [`BindingExpr::Map`] is deliberately NOT primary despite ending in `)`: it
-/// emits `source.map(p => body)` and the arrow body runs to the end of the
-/// expression, so `xs.map(x => x) ?? y` re-parses with the `??` INSIDE the
-/// arrow. [`BindingExpr::Async`] and [`BindingExpr::Arrow`] have the same open
-/// tail, and [`BindingExpr::Arrow`] is the reason the rule exists: its body is
-/// the open end, so `(x: unknown) => x` must be wrapped before any operator
-/// may follow it.
+/// [`BindingExpr::Arrow`] and [`BindingExpr::Async`] are deliberately NOT
+/// primary: an arrow body runs to the end of the expression, so
+/// `(x: unknown) => x ?? y` puts the `??` INSIDE the arrow and the operand has
+/// to be wrapped before any operator may follow it.
+///
+/// [`BindingExpr::Call`] IS primary and stays so with an arrow inside it:
+/// `xs.map((x: unknown) => x) ?? y` closes the argument list with `)` before
+/// the `??`, which is exactly the open tail the retired `Map` variant did not
+/// have when it spelled the same source without brackets of its own.
 fn is_primary(expr: &BindingExpr) -> bool {
     matches!(
         expr,
