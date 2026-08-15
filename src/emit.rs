@@ -15,8 +15,8 @@
 //! none - which is the publish path, and is why no `.hbdef` can contain one.
 
 use crate::dag::{
-    AttrValue, BindingExpr, BindingLiteral, EffectProgram, EffectStmt, Element, ImportDecl,
-    InterfaceDecl, Node, TsxDocument, TypeShape,
+    AttrValue, BindingExpr, BindingLiteral, BindingParam, EffectProgram, EffectStmt, Element,
+    ImportDecl, InterfaceDecl, Node, TsxDocument, TypeShape,
 };
 
 /// Emit a [`TsxDocument`] back to TSX source text.
@@ -365,6 +365,50 @@ fn emit_binding_expr(out: &mut String, expr: &BindingExpr) {
             out.push_str(if *strict { " === " } else { " == " });
             emit_operand(out, right);
         }
+        BindingExpr::Arrow { params, body } => {
+            emit_binding_params(out, params);
+            out.push_str(" => ");
+            emit_arrow_body(out, body);
+        }
+    }
+}
+
+/// `(a: T, b: U)` - the parameter list of either arrow spelling.
+///
+/// **Always parenthesised, and always annotated.** TypeScript lets a single
+/// unannotated parameter drop both (`x => x`), and taking that shortcut would
+/// make the emitted text depend on how many parameters there are and on
+/// whether a type happens to be known - two more shapes for a re-parse to
+/// disagree with, in exchange for two characters.
+fn emit_binding_params(out: &mut String, params: &[BindingParam]) {
+    out.push('(');
+    for (index, param) in params.iter().enumerate() {
+        if index > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(&param.name);
+        out.push_str(": ");
+        emit_type_shape(out, &param.ty);
+    }
+    out.push(')');
+}
+
+/// The body of an expression-bodied arrow, parenthesised where TypeScript would
+/// otherwise read it as something else.
+///
+/// **A RECORD is the case**: `x => {a: 1}` opens a BLOCK, not an object
+/// literal, so the body has to be written `x => ({a: 1})`. Every other body
+/// spelling in this vocabulary is safe bare - an arrow body extends as far to
+/// the right as it can, which is exactly what any operator, call or member
+/// chain inside it wants, and [`emit_operand`] is what stops the arrow ITSELF
+/// swallowing an operator that follows it.
+fn emit_arrow_body(out: &mut String, body: &BindingExpr) {
+    if matches!(body, BindingExpr::Record(_)) {
+        out.push('(');
+        emit_binding_expr(out, body);
+        out.push(')');
+    } else {
+        emit_binding_expr(out, body);
     }
 }
 
@@ -425,7 +469,10 @@ fn emit_member_base(out: &mut String, expr: &BindingExpr) {
 /// [`BindingExpr::Map`] is deliberately NOT primary despite ending in `)`: it
 /// emits `source.map(p => body)` and the arrow body runs to the end of the
 /// expression, so `xs.map(x => x) ?? y` re-parses with the `??` INSIDE the
-/// arrow. [`BindingExpr::Async`] has the same open tail.
+/// arrow. [`BindingExpr::Async`] and [`BindingExpr::Arrow`] have the same open
+/// tail, and [`BindingExpr::Arrow`] is the reason the rule exists: its body is
+/// the open end, so `(x: unknown) => x` must be wrapped before any operator
+/// may follow it.
 fn is_primary(expr: &BindingExpr) -> bool {
     matches!(
         expr,
@@ -439,16 +486,9 @@ fn is_primary(expr: &BindingExpr) -> bool {
 }
 
 fn emit_effect_program(out: &mut String, program: &EffectProgram) {
-    out.push_str("async (");
-    for (index, param) in program.params.iter().enumerate() {
-        if index > 0 {
-            out.push_str(", ");
-        }
-        out.push_str(&param.name);
-        out.push_str(": ");
-        emit_type_shape(out, &param.ty);
-    }
-    out.push_str(") => {");
+    out.push_str("async ");
+    emit_binding_params(out, &program.params);
+    out.push_str(" => {");
     if !program.body.is_empty() {
         out.push('\n');
         emit_effect_statements(out, &program.body, 1);

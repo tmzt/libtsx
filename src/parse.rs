@@ -1439,6 +1439,22 @@ fn lower_binding_expr(expr: &Expression, _scope: &EffectScope) -> Result<Binding
         Expression::ArrowFunctionExpression(arrow) if arrow.r#async => {
             lower_async_arrow(arrow, _scope).map(B::Async)
         }
+        // `x => x`. The expression-bodied, NON-async arrow - the other half of
+        // the arrow capture, and what `xs.map(x => x)` needs now that no
+        // variant reads a callee named `map` as a comprehension. oxc puts a
+        // concise body in `body.statements` as a single expression statement
+        // and sets `expression`, so that flag is what tells the two bodies
+        // apart.
+        Expression::ArrowFunctionExpression(arrow) if arrow.expression => {
+            let params = arrow_params(arrow)?;
+            let Some(Statement::ExpressionStatement(body)) = arrow.body.statements.first() else {
+                return Err("an expression-bodied arrow must have an expression body".into());
+            };
+            Ok(B::Arrow {
+                params,
+                body: Box::new(lower_binding_expr(&body.expression, _scope)?),
+            })
+        }
         // `a ?? b`. Only the nullish operator: `||` and `&&` share oxc's
         // `LogicalExpression` and answer a DIFFERENT question (falsy vs
         // nullish), so they are refused here by name rather than collapsed
@@ -1475,13 +1491,21 @@ fn lower_binding_expr(expr: &Expression, _scope: &EffectScope) -> Result<Binding
         Expression::ComputedMemberExpression(_) => {
             Err("computed member paths are unsupported".into())
         }
+        // Every arrow the two positive arms above did not take: a non-async
+        // arrow with a BLOCK body, and an `async` arrow with an expression
+        // body (which `lower_async_arrow` refuses in its own words). Refused
+        // by name at CAPTURE - a decision about which TypeScript the DAG
+        // accepts, not a meaning layered onto it.
+        Expression::ArrowFunctionExpression(_) => Err(
+            "a block-bodied arrow must be `async`; a non-async arrow needs an expression body"
+                .into(),
+        ),
         Expression::AssignmentExpression(_)
         | Expression::UpdateExpression(_)
         | Expression::UnaryExpression(_)
         | Expression::BinaryExpression(_)
         | Expression::LogicalExpression(_)
-        | Expression::AwaitExpression(_)
-        | Expression::ArrowFunctionExpression(_) => {
+        | Expression::AwaitExpression(_) => {
             Err(format!("{} expressions are unsupported", binding_expr_kind(expr)))
         }
         _ => Err(format!("{} expressions are unsupported", binding_expr_kind(expr))),
@@ -1546,27 +1570,39 @@ fn lower_async_arrow(
     if arrow.expression {
         return Err("async expression-bodied arrows are unsupported; use an explicit block".into());
     }
-    let mut params = Vec::with_capacity(arrow.params.items.len());
+    Ok(EffectProgram {
+        params: arrow_params(arrow)?,
+        body: lower_effect_block(&arrow.body.statements, scope)?,
+    })
+}
+
+/// The parameter list both arrow captures share.
+///
+/// One function because the two spellings must describe their parameters
+/// IDENTICALLY: a reader that had to ask which arrow a `BindingParam` came from
+/// would be reading a difference the author never wrote. An unannotated
+/// parameter arrives as `TypeShape::Named("unknown")`, which is what
+/// [`type_shape`] answers for an unmodelled annotation too, so the emitted
+/// `: unknown` re-parses to the same shape.
+fn arrow_params(arrow: &ArrowFunctionExpression) -> Result<Vec<BindingParam>, String> {
     if arrow.params.rest.is_some() {
-        return Err("async rest parameters are unsupported".into());
+        return Err("arrow rest parameters are unsupported".into());
     }
+    let mut params = Vec::with_capacity(arrow.params.items.len());
     for param in &arrow.params.items {
         let Some(id) = param.pattern.get_binding_identifier() else {
-            return Err("async parameters must be simple identifiers".into());
+            return Err("arrow parameters must be simple identifiers".into());
         };
         let ty = param
             .type_annotation
             .as_ref()
             .map(|ty| type_shape(&ty.type_annotation))
             .transpose()
-            .map_err(|e| format!("async parameter type is unsupported: {e}"))?
+            .map_err(|e| format!("arrow parameter type is unsupported: {e}"))?
             .unwrap_or(TypeShape::Named("unknown".into()));
         params.push(BindingParam { name: id.name.to_string(), ty });
     }
-    Ok(EffectProgram {
-        params,
-        body: lower_effect_block(&arrow.body.statements, scope)?,
-    })
+    Ok(params)
 }
 
 fn lower_effect_block(
@@ -2416,6 +2452,18 @@ mod tests {
             r#"<Thing value={(a === b) === c}/>"#,
             r#"<Thing value={props.kind == "row"}/>"#,
             r#"<Thing value={(a ?? b) === c}/>"#,
+            // The expression-bodied arrow, and the four shapes whose
+            // parenthesisation the emitter has to get right: an operator
+            // BESIDE an arrow (the arrow's body would swallow it), an operator
+            // INSIDE one (it must not be lifted out), an object-literal body
+            // (a bare `{` opens a block), and an arrow in a ternary branch.
+            r#"<Thing value={xs.map(x => x.label)}/>"#,
+            r#"<Thing value={xs.map((x: Item) => ({id: x.id, label: x.label}))}/>"#,
+            r#"<Thing value={(x => x) ?? fallback}/>"#,
+            r#"<Thing value={xs.map(x => x.label ?? "none")}/>"#,
+            r#"<Thing value={props.ready ? (x => x) : (x => x.other)}/>"#,
+            r#"<Thing value={() => 1}/>"#,
+            r#"<Thing value={(a, b) => a === b}/>"#,
         ] {
             let first = parse_tsx(source).expect("parse");
             let emitted = crate::emit::emit_tsx_document(&first);
@@ -2426,6 +2474,114 @@ mod tests {
                 "{source} emitted as {emitted:?} and re-parsed differently"
             );
         }
+    }
+
+    /// **`xs.map(x => x.label)` is a CALL with an arrow argument**, which is
+    /// what TypeScript says it is. Nothing here reads the callee's name: a
+    /// consumer that wants a comprehension out of `map` applies that reading
+    /// itself, and one that wants `filter` or `flatMap` needs no new variant.
+    #[test]
+    fn a_map_call_is_a_call_whose_argument_is_an_arrow() {
+        let doc = parse_tsx(r#"<Thing value={xs.map((x: Item) => x.label)}/>"#)
+            .expect("a map call parses");
+        let Node::Element(thing) = &doc.root_nodes[0] else {
+            panic!("expected element")
+        };
+        let AttrValue::BindingExpr(BindingExpr::Call { namespace, name, args, .. }) =
+            thing.attr("value").expect("value")
+        else {
+            panic!("expected a call");
+        };
+        assert_eq!((namespace.as_str(), name.as_str()), ("xs", "map"));
+        let [BindingExpr::Arrow { params, body }] = args.as_slice() else {
+            panic!("expected one arrow argument, got {args:?}");
+        };
+        assert_eq!(params.len(), 1);
+        assert_eq!(params[0].name, "x");
+        assert_eq!(params[0].ty, TypeShape::Named("Item".into()));
+        assert_eq!(
+            **body,
+            BindingExpr::Path(vec!["x".into(), "label".into()])
+        );
+    }
+
+    /// An arrow parameter with no annotation is `unknown`, and the emitter's
+    /// `: unknown` re-parses to the same shape - which is what lets
+    /// [`the_new_operators_survive_a_round_trip_through_emit`] hold for arrows
+    /// at all.
+    #[test]
+    fn an_unannotated_arrow_parameter_is_named_unknown() {
+        let doc = parse_tsx(r#"<Thing value={x => x}/>"#).expect("a bare arrow parses");
+        let Node::Element(thing) = &doc.root_nodes[0] else {
+            panic!("expected element")
+        };
+        let AttrValue::BindingExpr(BindingExpr::Arrow { params, .. }) =
+            thing.attr("value").expect("value")
+        else {
+            panic!("expected an arrow");
+        };
+        assert_eq!(params[0].ty, TypeShape::Named("unknown".into()));
+
+        let emitted = crate::emit::emit_tsx_document(&doc);
+        assert!(
+            emitted.contains("(x: unknown) => x"),
+            "the emitter annotates and parenthesises: {emitted}"
+        );
+    }
+
+    /// **The known-bad twin for the arrow's parenthesisation.** Each source
+    /// below is emitted with a pair of parentheses that a reader would call
+    /// redundant; strip either one and the text re-parses as a DIFFERENT tree,
+    /// which the round-trip test above would then catch. This one names the
+    /// characters, so the reason they are there survives someone tidying them.
+    #[test]
+    fn the_arrows_parentheses_are_load_bearing() {
+        // An object-literal body: without the pair, `=> {` opens a block and
+        // TypeScript reads `id:` as a label, not as a field.
+        let doc = parse_tsx(r#"<Thing value={xs.map(x => ({id: x.id}))}/>"#).expect("parse");
+        let emitted = crate::emit::emit_tsx_document(&doc);
+        assert!(
+            emitted.contains("=> ({id: x.id})"),
+            "an object body keeps its parentheses: {emitted}"
+        );
+        assert!(
+            parse_tsx(&emitted.replace("({id: x.id})", "{id: x.id}")).is_err(),
+            "without them the text is not even this vocabulary any more"
+        );
+
+        // An arrow beside an operator: without the pair, `??` lands INSIDE the
+        // arrow body and the coalesce disappears.
+        let doc = parse_tsx(r#"<Thing value={(x => x) ?? fallback}/>"#).expect("parse");
+        let emitted = crate::emit::emit_tsx_document(&doc);
+        assert!(
+            emitted.contains("((x: unknown) => x) ?? fallback"),
+            "an arrow operand keeps its parentheses: {emitted}"
+        );
+        let stripped = emitted.replace("((x: unknown) => x) ??", "(x: unknown) => x ??");
+        let reparsed = parse_tsx(&stripped).expect("the stripped text still parses");
+        assert_ne!(
+            doc, reparsed,
+            "stripping the parentheses must change the tree, or they prove nothing"
+        );
+    }
+
+    /// The two arrow shapes NEITHER capture admits are refused at capture, by
+    /// name. Both are subset decisions - which TypeScript the DAG accepts -
+    /// and neither may become a silent `Opaque`.
+    #[test]
+    fn the_arrow_shapes_outside_the_subset_are_refused_by_name() {
+        let block = parse_tsx(r#"<Thing value={x => { return x; }}/>"#)
+            .expect_err("a non-async block-bodied arrow is refused");
+        assert!(
+            format!("{block:?}").contains("must be `async`"),
+            "refused for the wrong reason: {block:?}"
+        );
+        let async_concise = parse_tsx(r#"<Thing value={async x => x}/>"#)
+            .expect_err("an async expression-bodied arrow is refused");
+        assert!(
+            format!("{async_concise:?}").contains("async expression-bodied arrows"),
+            "refused for the wrong reason: {async_concise:?}"
+        );
     }
 
     #[test]

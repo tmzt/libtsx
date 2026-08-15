@@ -430,6 +430,46 @@ pub enum BindingExpr {
         /// `true` for `===`, `false` for `==`.
         strict: bool,
     },
+    /// `x => x` - an arrow function with an EXPRESSION body.
+    ///
+    /// **Appended after [`Eq`](BindingExpr::Eq) on purpose.**
+    ///
+    /// # Why it is here, and what it replaced
+    ///
+    /// TypeScript has no comprehension expression: `xs.map(x => x)` is a
+    /// method call whose argument is an arrow. This enum used to hold a `Map
+    /// { source, param, body }` variant instead, which read that call as a
+    /// comprehension - a JUDGMENT about what a callee named `map` means, and
+    /// therefore a meaning rather than a form (see the enum doc). With `Map`
+    /// gone the call is captured as a [`Call`](BindingExpr::Call) whose
+    /// argument is this variant, which is what the author wrote; the
+    /// comprehension reading belongs to whichever consumer wants it.
+    ///
+    /// # The two arrow spellings, and the subset boundary between them
+    ///
+    /// The BLOCK-bodied arrow is [`Async`](BindingExpr::Async), whose payload
+    /// is an [`EffectProgram`] - `params` plus a declared subset of a TS block.
+    /// This variant is the other half: an expression body, no block, and no
+    /// `async`. The two combinations neither covers - a non-async block body,
+    /// and an `async` expression body - are refused AT CAPTURE, which is a
+    /// decision about which TypeScript the DAG accepts and not a meaning
+    /// layered onto it. Growing the accepted set is the ordinary
+    /// capture-the-language cost, paid when an author needs to write the form.
+    ///
+    /// `params` reuses [`BindingParam`] so both arrow spellings describe their
+    /// parameters identically; an unannotated parameter arrives with
+    /// `TypeShape::Named("unknown")`, exactly as it does for
+    /// [`EffectProgram`]. A destructuring or rest parameter is refused.
+    ///
+    /// **The body is not primary and the emitter must not splice it bare.** An
+    /// arrow body runs to the end of the expression, so `x => x` beside any
+    /// operator has to be parenthesised, and a body that is a RECORD has to be
+    /// parenthesised the other way round (`x => ({a: 1})`), or the `{` opens a
+    /// block statement and the re-parse means something else.
+    Arrow {
+        params: Vec<BindingParam>,
+        body: Box<BindingExpr>,
+    },
 }
 
 /// A named parameter of an owned effect program.
