@@ -91,6 +91,53 @@ fn a_record_crosses_the_seam_although_a_bare_brace_opens_a_block() {
     assert!(BindingExpr::try_from("{const q = 1;}").is_err());
 }
 
+/// **A redundant parenthesis does not make a second shape.**
+///
+/// `(a).b` is `a.b`, and the lowering says so: a chain whose base lowers to a
+/// NAME is one `Path`, whatever parentheses the author left in it. The defect
+/// this pins down (`libhbui`'s `codec_round_trip.rs`, F2) was that the
+/// parenthesised spelling peeled to `Member { base: Path(["a"]), path: ["b"] }`
+/// while the bare one lowered to `Path(["a", "b"])` - one source with two dag
+/// shapes, and only the second of them recoverable from the emitted text.
+#[test]
+fn a_parenthesised_member_chain_is_one_name() {
+    for (source, segments) in [
+        ("(a).b", &["a", "b"][..]),
+        ("(props.a).b", &["props", "a", "b"][..]),
+        ("(props.a.b).m", &["props", "a", "b", "m"][..]),
+        ("(props.a.b).m.n", &["props", "a", "b", "m", "n"][..]),
+        // Nested parentheses, and a parenthesised INNER chain: the peel loop
+        // walks through both, so neither is a third shape.
+        ("((props.a)).b", &["props", "a", "b"][..]),
+        ("((props.a).b).c", &["props", "a", "b", "c"][..]),
+    ] {
+        let expr = BindingExpr::try_from(source).unwrap_or_else(|e| panic!("{source}: {e}"));
+        assert_eq!(
+            expr,
+            BindingExpr::Path(segments.iter().map(|s| s.to_string()).collect()),
+            "{source} did not lower to one path"
+        );
+        // And the text comes back WITHOUT the redundant parenthesis, which is
+        // the half that makes the round trip close.
+        assert_eq!(String::from(&expr), segments.join("."));
+    }
+
+    // The boundary, and the over-correction this would be if it went further: a
+    // base that is not a name stays a `Member` and keeps the parentheses emit
+    // gives it. `design().isAuthoring` is the shape the variant exists for.
+    // (Each source below is emit's OWN spelling, so `round_trips` can assert
+    // the text came back unchanged: a non-primary base keeps the parentheses
+    // `emit_member_base` gives it, which is why the array one is written with
+    // them.)
+    for source in ["h().x", "design().isAuthoring", "(a ?? b).c", "([1, 2]).length"] {
+        let expr = round_trips(source);
+        assert!(
+            matches!(expr, BindingExpr::Member { .. }),
+            "{source} stopped being a member chain: {expr:?}"
+        );
+    }
+}
+
 #[test]
 fn a_refusal_says_which_kind_it_was() {
     // Not TypeScript.

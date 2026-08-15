@@ -1465,8 +1465,27 @@ fn lower_binding_expr(expr: &Expression, _scope: &EffectScope) -> Result<Binding
                 cursor = &member.object;
             }
             segments.reverse();
+            let base = lower_binding_expr(cursor, _scope)?;
+            // **The invariant above, as a POSTCONDITION of this arm.** A
+            // redundant parenthesis is all it takes to arrive here with a base
+            // that is itself a name: `(a).b` fails `expr_path` (the object is a
+            // `ParenthesizedExpression`), peels to
+            // `Member { base: Path(["a"]), path: ["b"] }`, emits `a.b` - which
+            // is right - and re-parses through `expr_path` as
+            // `Path(["a", "b"])`. One source, two shapes.
+            //
+            // Collapsing here rather than teaching `expr_path` to `unparen`
+            // keeps the guarantee independent of the route taken into this arm:
+            // whatever spelling reaches it, a chain whose base lowers to a name
+            // leaves as ONE `Path`. (`expr_path` is also the child-node and
+            // callee reader; widening what IT accepts would change what those
+            // two capture, which is a different decision from this one.)
+            if let B::Path(mut rooted) = base {
+                rooted.extend(segments);
+                return Ok(B::Path(rooted));
+            }
             Ok(B::Member {
-                base: Box::new(lower_binding_expr(cursor, _scope)?),
+                base: Box::new(base),
                 path: segments,
             })
         }
