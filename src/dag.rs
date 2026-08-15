@@ -352,7 +352,7 @@ pub enum BindingExpr {
         type_args: Vec<TypeShape>,
         args: Vec<BindingExpr>,
     },
-    Async(EffectProgram),
+    Async(BlockArrow),
     /// `a ?? b`, and `a ?? b ?? c` as ONE n-ary node.
     ///
     /// **Appended after [`Async`](BindingExpr::Async) on purpose** - see the
@@ -456,7 +456,7 @@ pub enum BindingExpr {
     /// # The two arrow spellings, and the subset boundary between them
     ///
     /// The BLOCK-bodied arrow is [`Async`](BindingExpr::Async), whose payload
-    /// is an [`EffectProgram`] - `params` plus a declared subset of a TS block.
+    /// is an [`BlockArrow`] - `params` plus a declared subset of a TS block.
     /// This variant is the other half: an expression body, no block, and no
     /// `async`. The two combinations neither covers - a non-async block body,
     /// and an `async` expression body - are refused AT CAPTURE, which is a
@@ -467,7 +467,7 @@ pub enum BindingExpr {
     /// `params` reuses [`BindingParam`] so both arrow spellings describe their
     /// parameters identically; an unannotated parameter arrives with
     /// `TypeShape::Named("unknown")`, exactly as it does for
-    /// [`EffectProgram`]. A destructuring or rest parameter is refused.
+    /// [`BlockArrow`]. A destructuring or rest parameter is refused.
     ///
     /// **The body is not primary and the emitter must not splice it bare.** An
     /// arrow body runs to the end of the expression, so `x => x` beside any
@@ -480,23 +480,53 @@ pub enum BindingExpr {
     },
 }
 
-/// A named parameter of an owned effect program.
+/// A named parameter of either arrow spelling - [`BlockArrow`]'s and
+/// [`BindingExpr::Arrow`]'s alike.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BindingParam {
     pub name: String,
     pub ty: TypeShape,
 }
 
-/// A closed, owned effect program. It is semantic IR, never JavaScript.
+/// **An arrow function with a BLOCK body**, whose block is a declared SUBSET of
+/// a TypeScript block: `params`, and the statement forms [`BlockStmt`] admits.
+///
+/// # It used to be called `BlockArrow`, and the old name was wrong about it
+///
+/// The doc here read *"A closed, owned effect program. It is semantic IR, never
+/// JavaScript"*, and `PIPELINE_PLAN.md` section 6b measured that sentence
+/// against the type it described. Each of the five statement forms is
+/// TS-shaped, so the body is a subset of a TS block - and a subset of TS is
+/// still TS. What was never here was the EFFECT: dormancy, being run by a
+/// runtime, an await that suspends. Every one of those is a reading a consumer
+/// applies to this shape, not a property the shape has, and calling the type
+/// after the reading put a consumer's semantics into a vocabulary whose whole
+/// rule (see [`BindingExpr`]) is that it captures forms and no meanings.
+///
+/// So: renamed and re-documented in place, not relocated. It is dag vocabulary,
+/// it stays with the dag, and the rename costs no bytes - postcard encodes
+/// positions, never names.
+///
+/// **This is one half of the arrow capture**; [`BindingExpr::Arrow`] is the
+/// other, and the boundary between them is written down there.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct EffectProgram {
+pub struct BlockArrow {
     pub params: Vec<BindingParam>,
-    pub body: Vec<EffectStmt>,
+    pub body: Vec<BlockStmt>,
 }
 
-/// The only statement forms admitted in the first owned effect IR slice.
+/// The statement forms a [`BlockArrow`]'s block admits, and the only ones.
+///
+/// **A declared subset of TypeScript's statements, not a semantic IR of its
+/// own.** `let`/`await`/`if`/`try`/`return` are each TS-shaped; refusing what
+/// is OUTSIDE the subset is a decision about which TypeScript the DAG accepts,
+/// which capture is allowed to make. Growing the subset is the ordinary
+/// capture-the-language cost, paid per form when an author needs to write it.
+/// A consumer accepting LESS than the subset is a different thing entirely and
+/// stays a named refusal at the reader - `highbay_objects`' plan compiler
+/// refuses `If`/`Try` that the parser happily produces.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum EffectStmt {
+pub enum BlockStmt {
     Let {
         slot: String,
         value: BindingExpr,
@@ -507,13 +537,13 @@ pub enum EffectStmt {
     },
     If {
         condition: BindingExpr,
-        then_branch: Vec<EffectStmt>,
-        else_branch: Vec<EffectStmt>,
+        then_branch: Vec<BlockStmt>,
+        else_branch: Vec<BlockStmt>,
     },
     Try {
-        body: Vec<EffectStmt>,
+        body: Vec<BlockStmt>,
         error_slot: String,
-        catch: Vec<EffectStmt>,
+        catch: Vec<BlockStmt>,
     },
     Return(BindingExpr),
 }
@@ -1711,7 +1741,7 @@ mod tests {
 
     #[test]
     fn owned_binding_ir_round_trips_through_serde() {
-        let program = EffectProgram {
+        let program = BlockArrow {
             params: vec![BindingParam {
                 name: "input".into(),
                 ty: TypeShape::Apply {
@@ -1720,14 +1750,14 @@ mod tests {
                 },
             }],
             body: vec![
-                EffectStmt::Let {
+                BlockStmt::Let {
                     slot: "rows".into(),
                     value: BindingExpr::Array(vec![
                         BindingExpr::Literal(BindingLiteral::Bool(true)),
                         BindingExpr::Path(vec!["input".into(), "rows".into()]),
                     ]),
                 },
-                EffectStmt::Await {
+                BlockStmt::Await {
                     slot: Some("saved".into()),
                     awaitable: BindingExpr::Call {
                         namespace: "storage".into(),
@@ -1736,18 +1766,18 @@ mod tests {
                         args: vec![BindingExpr::Path(vec!["input".into()])],
                     },
                 },
-                EffectStmt::If {
+                BlockStmt::If {
                     condition: BindingExpr::Path(vec!["saved".into(), "ok".into()]),
-                    then_branch: vec![EffectStmt::Return(BindingExpr::Literal(
+                    then_branch: vec![BlockStmt::Return(BindingExpr::Literal(
                         BindingLiteral::Null,
                     ))],
-                    else_branch: vec![EffectStmt::Try {
-                        body: vec![EffectStmt::Return(BindingExpr::Path(vec![
+                    else_branch: vec![BlockStmt::Try {
+                        body: vec![BlockStmt::Return(BindingExpr::Path(vec![
                             "saved".into(),
                             "error".into(),
                         ]))],
                         error_slot: "error".into(),
-                        catch: vec![EffectStmt::Return(BindingExpr::Literal(
+                        catch: vec![BlockStmt::Return(BindingExpr::Literal(
                             BindingLiteral::String("failed".into()),
                         ))],
                     }],

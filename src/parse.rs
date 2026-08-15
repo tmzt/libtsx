@@ -27,7 +27,7 @@
 //!   passed to whichever parse entry point the caller needs (Rule 49).
 
 use crate::dag::{
-    AttrValue, BindingExpr, BindingLiteral, BindingParam, EffectError, EffectProgram, EffectStmt,
+    AttrValue, BindingExpr, BindingLiteral, BindingParam, EffectError, BlockArrow, BlockStmt,
     Element, FieldDecl, FuncSig, ImportDecl, ImportKind, ImportName, InterfaceDecl, NamedEffect,
     Node, ParserHost, Resolution, TsxDocument, TypeShape, is_event_binding, is_host_namespace,
 };
@@ -1566,13 +1566,13 @@ fn static_call_parts(expr: &Expression) -> Result<(String, String), String> {
 fn lower_async_arrow(
     arrow: &ArrowFunctionExpression,
     scope: &EffectScope,
-) -> Result<EffectProgram, String> {
+) -> Result<BlockArrow, String> {
     if arrow.expression {
         return Err("async expression-bodied arrows are unsupported; use an explicit block".into());
     }
-    Ok(EffectProgram {
+    Ok(BlockArrow {
         params: arrow_params(arrow)?,
-        body: lower_effect_block(&arrow.body.statements, scope)?,
+        body: lower_block_body(&arrow.body.statements, scope)?,
     })
 }
 
@@ -1605,24 +1605,24 @@ fn arrow_params(arrow: &ArrowFunctionExpression) -> Result<Vec<BindingParam>, St
     Ok(params)
 }
 
-fn lower_effect_block(
+fn lower_block_body(
     statements: &[Statement],
     scope: &EffectScope,
-) -> Result<Vec<EffectStmt>, String> {
+) -> Result<Vec<BlockStmt>, String> {
     let mut out = Vec::new();
     for statement in statements {
-        out.extend(lower_effect_statement(statement, scope)?);
+        out.extend(lower_block_statement(statement, scope)?);
     }
     Ok(out)
 }
 
-fn lower_effect_statement(
+fn lower_block_statement(
     statement: &Statement,
     scope: &EffectScope,
-) -> Result<Vec<EffectStmt>, String> {
-    use EffectStmt as S;
+) -> Result<Vec<BlockStmt>, String> {
+    use BlockStmt as S;
     match statement {
-        Statement::BlockStatement(block) => lower_effect_block(&block.body, scope),
+        Statement::BlockStatement(block) => lower_block_body(&block.body, scope),
         Statement::VariableDeclaration(decl) => {
             let mut out = Vec::with_capacity(decl.declarations.len());
             for declarator in &decl.declarations {
@@ -1663,11 +1663,11 @@ fn lower_effect_statement(
             Ok(vec![S::Return(lower_binding_expr(value, scope)?)])
         }
         Statement::IfStatement(statement) => {
-            let then_branch = lower_effect_statement(&statement.consequent, scope)?;
+            let then_branch = lower_block_statement(&statement.consequent, scope)?;
             let else_branch = statement
                 .alternate
                 .as_ref()
-                .map(|alternate| lower_effect_statement(alternate, scope))
+                .map(|alternate| lower_block_statement(alternate, scope))
                 .transpose()?
                 .unwrap_or_default();
             Ok(vec![S::If {
@@ -1690,9 +1690,9 @@ fn lower_effect_statement(
                 return Err("catch parameters must be simple identifiers".into());
             };
             Ok(vec![S::Try {
-                body: lower_effect_block(&statement.block.body, scope)?,
+                body: lower_block_body(&statement.block.body, scope)?,
                 error_slot: id.name.to_string(),
-                catch: lower_effect_block(&handler.body.body, scope)?,
+                catch: lower_block_body(&handler.body.body, scope)?,
             }])
         }
         _ => Err(format!(
@@ -2606,10 +2606,10 @@ mod tests {
         };
         assert_eq!(program.params[0].name, "input");
         assert_eq!(program.params[0].ty, TypeShape::Named("User".into()));
-        assert!(matches!(&program.body[1], EffectStmt::If { .. }));
+        assert!(matches!(&program.body[1], BlockStmt::If { .. }));
         assert!(matches!(
             &program.body[2],
-            EffectStmt::Return(BindingExpr::Literal(BindingLiteral::Null))
+            BlockStmt::Return(BindingExpr::Literal(BindingLiteral::Null))
         ));
     }
 

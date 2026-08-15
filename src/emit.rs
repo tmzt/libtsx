@@ -15,7 +15,7 @@
 //! none - which is the publish path, and is why no `.hbdef` can contain one.
 
 use crate::dag::{
-    AttrValue, BindingExpr, BindingLiteral, BindingParam, EffectProgram, EffectStmt, Element,
+    AttrValue, BindingExpr, BindingLiteral, BindingParam, BlockArrow, BlockStmt, Element,
     ImportDecl, InterfaceDecl, Node, TsxDocument, TypeShape,
 };
 
@@ -321,7 +321,7 @@ fn emit_binding_expr(out: &mut String, expr: &BindingExpr) {
             }
             out.push(')');
         }
-        BindingExpr::Async(program) => emit_effect_program(out, program),
+        BindingExpr::Async(program) => emit_block_arrow(out, program),
         BindingExpr::Coalesce(operands) => {
             for (index, operand) in operands.iter().enumerate() {
                 if index > 0 {
@@ -475,29 +475,29 @@ fn is_primary(expr: &BindingExpr) -> bool {
     )
 }
 
-fn emit_effect_program(out: &mut String, program: &EffectProgram) {
+fn emit_block_arrow(out: &mut String, program: &BlockArrow) {
     out.push_str("async ");
     emit_binding_params(out, &program.params);
     out.push_str(" => {");
     if !program.body.is_empty() {
         out.push('\n');
-        emit_effect_statements(out, &program.body, 1);
+        emit_block_statements(out, &program.body, 1);
     }
     out.push('}');
 }
 
-fn emit_effect_statements(out: &mut String, statements: &[EffectStmt], indent: usize) {
+fn emit_block_statements(out: &mut String, statements: &[BlockStmt], indent: usize) {
     for statement in statements {
         emit_indent(out, indent);
         match statement {
-            EffectStmt::Let { slot, value } => {
+            BlockStmt::Let { slot, value } => {
                 out.push_str("const ");
                 out.push_str(slot);
                 out.push_str(" = ");
                 emit_binding_expr(out, value);
                 out.push_str(";\n");
             }
-            EffectStmt::Await { slot, awaitable } => {
+            BlockStmt::Await { slot, awaitable } => {
                 if let Some(slot) = slot {
                     out.push_str("const ");
                     out.push_str(slot);
@@ -511,7 +511,7 @@ fn emit_effect_statements(out: &mut String, statements: &[EffectStmt], indent: u
                 emit_binding_expr(out, awaitable);
                 out.push_str(";\n");
             }
-            EffectStmt::If {
+            BlockStmt::If {
                 condition,
                 then_branch,
                 else_branch,
@@ -519,33 +519,33 @@ fn emit_effect_statements(out: &mut String, statements: &[EffectStmt], indent: u
                 out.push_str("if (");
                 emit_binding_expr(out, condition);
                 out.push_str(") {\n");
-                emit_effect_statements(out, then_branch, indent + 1);
+                emit_block_statements(out, then_branch, indent + 1);
                 emit_indent(out, indent);
                 out.push('}');
                 if !else_branch.is_empty() {
                     out.push_str(" else {\n");
-                    emit_effect_statements(out, else_branch, indent + 1);
+                    emit_block_statements(out, else_branch, indent + 1);
                     emit_indent(out, indent);
                     out.push('}');
                 }
                 out.push('\n');
             }
-            EffectStmt::Try {
+            BlockStmt::Try {
                 body,
                 error_slot,
                 catch,
             } => {
                 out.push_str("try {\n");
-                emit_effect_statements(out, body, indent + 1);
+                emit_block_statements(out, body, indent + 1);
                 emit_indent(out, indent);
                 out.push_str("} catch (");
                 out.push_str(error_slot);
                 out.push_str(") {\n");
-                emit_effect_statements(out, catch, indent + 1);
+                emit_block_statements(out, catch, indent + 1);
                 emit_indent(out, indent);
                 out.push_str("}\n");
             }
-            EffectStmt::Return(value) => {
+            BlockStmt::Return(value) => {
                 out.push_str("return ");
                 emit_binding_expr(out, value);
                 out.push_str(";\n");
