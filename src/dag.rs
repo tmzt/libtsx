@@ -307,6 +307,26 @@ pub enum BindingLiteral {
 /// This is intentionally independent of [`Expr`] and of the legacy event
 /// grammar. In particular, adding this vocabulary does not make an
 /// `AttrValue::Opaque` event expression executable.
+///
+/// # This vocabulary captures TS-LEVEL SYNTAX, not meaning
+///
+/// A variant here is justified by TypeScript having the form, and by nothing
+/// else - never by a consumer wanting a behaviour. `??` and `? :` are captured
+/// because an author can write them; what they MEAN (a null test, a branch
+/// selection) is supplied by a further lowering, which for an attribute is
+/// `libhbui::attr`. Two consumers may lower one variant differently and neither
+/// is wrong here; a variant added *for* one consumer's semantics would make
+/// this enum that consumer's private IR.
+///
+/// # APPEND-LAST, always
+///
+/// `BindingExpr` reaches disk inside [`AttrValue::BindingExpr`], and `AttrValue`
+/// is persisted POSITIONALLY by postcard - the committed `.hbdef` fixtures carry
+/// bare variant indices with no names in the bytes. So a new variant goes at the
+/// END, after every variant that already exists, or every committed fixture
+/// decodes as a different expression. Appending keeps old bytes readable; old
+/// readers refuse new bytes, which is the version-gate event, and it starts the
+/// day an author WRITES one of the new forms - not the day the variant lands.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum BindingExpr {
     Literal(BindingLiteral),
@@ -325,6 +345,91 @@ pub enum BindingExpr {
         body: Box<BindingExpr>,
     },
     Async(EffectProgram),
+    /// `a ?? b`, and `a ?? b ?? c` as ONE n-ary node.
+    ///
+    /// **Appended after [`Async`](BindingExpr::Async) on purpose** - see the
+    /// append-last rule on this enum.
+    ///
+    /// N-ary rather than a nested pair because `??` is left-associative and
+    /// non-mixing in TS, so `a ?? b ?? c` has exactly one reading and flattens
+    /// without losing anything a re-parse could tell apart. A nested spelling
+    /// would give one source two representations and hand every consumer the
+    /// job of normalising them.
+    ///
+    /// The vector holds the operands in source order and always has at least
+    /// two entries; the parser builds no shorter one. `||` and `&&` are NOT
+    /// this variant and stay refused - TS forbids them mixing with `??`
+    /// unparenthesised precisely because they answer a different question
+    /// (falsy vs nullish), and collapsing the two spellings here would decide
+    /// that question in the wrong layer.
+    Coalesce(Vec<BindingExpr>),
+    /// `cond ? then : other` - the conditional (ternary) expression.
+    ///
+    /// **Appended after [`Coalesce`](BindingExpr::Coalesce) on purpose.**
+    ///
+    /// Boxed on all three arms because the shape is recursive and the branches
+    /// are ordinary expressions, including further conditionals. What makes
+    /// `cond` true is not decided here: this variant records that the author
+    /// wrote a branch, and the lowering says what a condition value means.
+    Cond {
+        cond: Box<BindingExpr>,
+        then: Box<BindingExpr>,
+        other: Box<BindingExpr>,
+    },
+    /// A static member chain on a NON-identifier base: `f().x.y`.
+    ///
+    /// **Appended after [`Cond`](BindingExpr::Cond) on purpose, and it is the
+    /// genuinely new capture of the three.**
+    ///
+    /// [`Path`](BindingExpr::Path) roots at an identifier, so `props.value` is
+    /// a path and `design().isAuthoring` is not representable by it at all -
+    /// the base is a CALL. The alternative considered and rejected was folding
+    /// the member chain into the call (as extra arguments, or by appending to
+    /// its name): that avoids a variant by writing down something the author
+    /// did not write, and it stops being reversible the moment two accessors
+    /// disagree about what a suffix means. Capturing the member access as a
+    /// member access is what the capture-the-syntax rule asks for, and it
+    /// subsumes every later accessor without a further variant.
+    ///
+    /// `base` is the expression the chain hangs off; `path` is the
+    /// dot-separated static segments after it, in source order, never empty.
+    /// Computed access (`a[b]`) is not this variant and stays refused.
+    Member {
+        base: Box<BindingExpr>,
+        path: Vec<String>,
+    },
+    /// `a === b` and `a == b` - an equality test.
+    ///
+    /// **Appended after [`Member`](BindingExpr::Member) on purpose.**
+    ///
+    /// # Why `strict` is recorded rather than normalised away
+    ///
+    /// TypeScript has two equality operators and they are not the same
+    /// question: `===` compares without conversion, `==` converts first. A
+    /// capture that folded them together would be this layer answering "does
+    /// coercion happen?" - which is a MEANING, and meanings belong to the
+    /// lowering (see the enum's own doc). So the operator the author wrote is
+    /// recorded, the emitter puts back what it was given, and each consumer
+    /// decides for itself.
+    ///
+    /// **What the first consumer decided, recorded here because it is
+    /// surprising**: `libhbui::attr` evaluates an equality only when both sides
+    /// resolve to the SAME scalar kind, and refuses a cross-kind comparison
+    /// loudly. Under that rule `strict` never changes an answer - the two
+    /// operators differ exactly where coercion would have to happen, and that
+    /// case is refused rather than decided. The field is carried for fidelity,
+    /// not for behaviour, and a consumer that later wants JS coercion
+    /// semantics has the fact it needs instead of having to guess.
+    ///
+    /// `!=`/`!==` are NOT this variant and stay refused: a negation is a second
+    /// operator, nothing has asked for it, and inferring it from an equality
+    /// would be inventing syntax the author did not write.
+    Eq {
+        left: Box<BindingExpr>,
+        right: Box<BindingExpr>,
+        /// `true` for `===`, `false` for `==`.
+        strict: bool,
+    },
 }
 
 /// A named parameter of an owned effect program.

@@ -334,7 +334,108 @@ fn emit_binding_expr(out: &mut String, expr: &BindingExpr) {
             out.push(')');
         }
         BindingExpr::Async(program) => emit_effect_program(out, program),
+        BindingExpr::Coalesce(operands) => {
+            for (index, operand) in operands.iter().enumerate() {
+                if index > 0 {
+                    out.push_str(" ?? ");
+                }
+                emit_operand(out, operand);
+            }
+        }
+        BindingExpr::Cond { cond, then, other } => {
+            emit_operand(out, cond);
+            out.push_str(" ? ");
+            emit_operand(out, then);
+            out.push_str(" : ");
+            emit_operand(out, other);
+        }
+        BindingExpr::Member { base, path } => {
+            emit_member_base(out, base);
+            for segment in path {
+                out.push('.');
+                out.push_str(segment);
+            }
+        }
+        BindingExpr::Eq {
+            left,
+            right,
+            strict,
+        } => {
+            emit_operand(out, left);
+            out.push_str(if *strict { " === " } else { " == " });
+            emit_operand(out, right);
+        }
     }
+}
+
+/// **The emitter has no precedence model, so this one is conservative on
+/// purpose.**
+///
+/// Every other arm of [`emit_binding_expr`] splices its children in with no
+/// regard for how they re-parse, which was harmless while nothing in the
+/// vocabulary was an *operator*: a call, an array and a record all carry their
+/// own brackets. `??` and `? :` are the first forms whose meaning depends on
+/// what sits beside them, and TypeScript is unforgiving about both - `a ?? b ||
+/// c` is a SYNTAX ERROR rather than a precedence question, and a ternary nested
+/// in another ternary's branches re-associates without parentheses.
+///
+/// The rule, therefore: an operand keeps its bare spelling only if it is a
+/// PRIMARY expression - one whose text cannot absorb what follows it. Everything
+/// else is wrapped, including a nested `??` inside a `??`, where the parentheses
+/// are redundant. Redundant parentheses cost a round-trip nothing:
+/// [`crate::parse::unparen`]'s equivalent strips them before lowering, and
+/// `(a ?? b) ?? c` flattens back to the same n-ary node. A MISSING pair costs a
+/// re-parse that means something else.
+///
+/// This is a stand-in for a real precedence model, which the emitter is owed and
+/// which the next operator to land should bring.
+fn emit_operand(out: &mut String, expr: &BindingExpr) {
+    if is_primary(expr) {
+        emit_binding_expr(out, expr);
+    } else {
+        out.push('(');
+        emit_binding_expr(out, expr);
+        out.push(')');
+    }
+}
+
+/// [`emit_operand`]'s stricter sibling, for the thing a member chain hangs off.
+///
+/// A member access binds tighter than every operator, so its base admits even
+/// less: `1 .x` and `[1, 2].map(..).x` are the failure cases, and a numeric
+/// literal base is a syntax error outright (`1.x` lexes the dot into the
+/// number). Only a name, a call and another member chain are safe bare - which
+/// covers `design().isAuthoring`, the shape this variant exists for.
+fn emit_member_base(out: &mut String, expr: &BindingExpr) {
+    if matches!(
+        expr,
+        BindingExpr::Path(_) | BindingExpr::Call { .. } | BindingExpr::Member { .. }
+    ) {
+        emit_binding_expr(out, expr);
+    } else {
+        out.push('(');
+        emit_binding_expr(out, expr);
+        out.push(')');
+    }
+}
+
+/// Whether this expression's emitted text is self-delimiting - a literal, a
+/// name, a bracketed collection, a call, or a member chain ending in one.
+///
+/// [`BindingExpr::Map`] is deliberately NOT primary despite ending in `)`: it
+/// emits `source.map(p => body)` and the arrow body runs to the end of the
+/// expression, so `xs.map(x => x) ?? y` re-parses with the `??` INSIDE the
+/// arrow. [`BindingExpr::Async`] has the same open tail.
+fn is_primary(expr: &BindingExpr) -> bool {
+    matches!(
+        expr,
+        BindingExpr::Literal(_)
+            | BindingExpr::Path(_)
+            | BindingExpr::Array(_)
+            | BindingExpr::Record(_)
+            | BindingExpr::Call { .. }
+            | BindingExpr::Member { .. }
+    )
 }
 
 fn emit_effect_program(out: &mut String, program: &EffectProgram) {

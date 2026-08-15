@@ -35,8 +35,8 @@ use std::sync::Arc;
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     ArrowFunctionExpression, ExportDefaultDeclarationKind, Expression, ImportDeclarationSpecifier,
-    JSXAttributeItem, JSXAttributeName, JSXAttributeValue, JSXChild, JSXElement, JSXElementName,
-    ModuleExportName, PropertyKey, Statement, TSSignature, TSType,
+    BinaryOperator, JSXAttributeItem, JSXAttributeName, JSXAttributeValue, JSXChild, JSXElement,
+    JSXElementName, LogicalOperator, ModuleExportName, PropertyKey, Statement, TSSignature, TSType,
 };
 use oxc_parser::Parser;
 use oxc_span::{SourceType, Span};
@@ -1342,11 +1342,36 @@ fn lower_binding_expr(expr: &Expression, _scope: &EffectScope) -> Result<Binding
         Expression::BooleanLiteral(v) => Ok(B::Literal(BindingLiteral::Bool(v.value))),
         Expression::NumericLiteral(v) => Ok(B::Literal(BindingLiteral::Number(v.value))),
         Expression::StringLiteral(v) => Ok(B::Literal(BindingLiteral::String(v.value.to_string()))),
-        Expression::Identifier(_) | Expression::StaticMemberExpression(_) => {
+        Expression::Identifier(_) => {
             let Some(path) = expr_path(expr) else {
                 return Err("computed or private member paths are unsupported".into());
             };
             Ok(B::Path(path.split('.').map(str::to_owned).collect()))
+        }
+        Expression::StaticMemberExpression(_) => {
+            // Rooted at an identifier, so the whole chain is ONE name and the
+            // existing path spelling says everything: `props.value` must not
+            // become a `Member` on a `Path`, or one source has two shapes.
+            if let Some(path) = expr_path(expr) {
+                return Ok(B::Path(path.split('.').map(str::to_owned).collect()));
+            }
+            // Otherwise the base is something other than a name -
+            // `design().isAuthoring` being the case this exists for. Peel the
+            // static segments off and lower whatever they hang from.
+            let mut segments = Vec::new();
+            let mut cursor = expr;
+            while let Expression::StaticMemberExpression(member) = unparen(cursor) {
+                if member.optional {
+                    return Err("optional member access is unsupported".into());
+                }
+                segments.push(member.property.name.to_string());
+                cursor = &member.object;
+            }
+            segments.reverse();
+            Ok(B::Member {
+                base: Box::new(lower_binding_expr(cursor, _scope)?),
+                path: segments,
+            })
         }
         Expression::ArrayExpression(array) => {
             let mut items = Vec::with_capacity(array.elements.len());
@@ -1414,6 +1439,39 @@ fn lower_binding_expr(expr: &Expression, _scope: &EffectScope) -> Result<Binding
         Expression::ArrowFunctionExpression(arrow) if arrow.r#async => {
             lower_async_arrow(arrow, _scope).map(B::Async)
         }
+        // `a ?? b`. Only the nullish operator: `||` and `&&` share oxc's
+        // `LogicalExpression` and answer a DIFFERENT question (falsy vs
+        // nullish), so they are refused here by name rather than collapsed
+        // into one variant that would have to pick a meaning.
+        Expression::LogicalExpression(logical)
+            if logical.operator == LogicalOperator::Coalesce =>
+        {
+            let mut operands = Vec::new();
+            flatten_coalesce(&logical.left, _scope, &mut operands)?;
+            flatten_coalesce(&logical.right, _scope, &mut operands)?;
+            Ok(B::Coalesce(operands))
+        }
+        Expression::ConditionalExpression(cond) => Ok(B::Cond {
+            cond: Box::new(lower_binding_expr(&cond.test, _scope)?),
+            then: Box::new(lower_binding_expr(&cond.consequent, _scope)?),
+            other: Box::new(lower_binding_expr(&cond.alternate, _scope)?),
+        }),
+        // `===` and `==`, and ONLY those two of oxc's binary operators. The
+        // negations are a second operator and stay refused (see
+        // [`BindingExpr::Eq`]); every ordering comparison is refused for want
+        // of anything asking for one.
+        Expression::BinaryExpression(binary)
+            if matches!(
+                binary.operator,
+                BinaryOperator::StrictEquality | BinaryOperator::Equality
+            ) =>
+        {
+            Ok(B::Eq {
+                left: Box::new(lower_binding_expr(&binary.left, _scope)?),
+                right: Box::new(lower_binding_expr(&binary.right, _scope)?),
+                strict: binary.operator == BinaryOperator::StrictEquality,
+            })
+        }
         Expression::ComputedMemberExpression(_) => {
             Err("computed member paths are unsupported".into())
         }
@@ -1422,7 +1480,6 @@ fn lower_binding_expr(expr: &Expression, _scope: &EffectScope) -> Result<Binding
         | Expression::UnaryExpression(_)
         | Expression::BinaryExpression(_)
         | Expression::LogicalExpression(_)
-        | Expression::ConditionalExpression(_)
         | Expression::AwaitExpression(_)
         | Expression::ArrowFunctionExpression(_) => {
             Err(format!("{} expressions are unsupported", binding_expr_kind(expr)))
@@ -1431,8 +1488,46 @@ fn lower_binding_expr(expr: &Expression, _scope: &EffectScope) -> Result<Binding
     }
 }
 
+/// Collect the operands of a `??` chain into one n-ary list.
+///
+/// `a ?? b ?? c` parses left-associatively, so the left operand of the outer
+/// `??` is itself a `??`. Flattening it here is what makes
+/// [`BindingExpr::Coalesce`] n-ary rather than a nest of pairs, so one source
+/// has exactly one representation.
+///
+/// **A PARENTHESISED `??` is not flattened.** `(a ?? b) ?? c` reaches this
+/// through [`unparen`] with the same meaning as `a ?? b ?? c`, and flattening
+/// it is correct - `??` is associative on its own. What must not be flattened
+/// across is a different operator, and that cannot arrive here: TS is a syntax
+/// error on `a ?? b || c`, and the parenthesised form `(a || b) ?? c` is a
+/// `LogicalExpression` with the `||` operator, which the recursion refuses.
+fn flatten_coalesce(
+    expr: &Expression,
+    scope: &EffectScope,
+    out: &mut Vec<BindingExpr>,
+) -> Result<(), String> {
+    if let Expression::LogicalExpression(logical) = unparen(expr) {
+        if logical.operator == LogicalOperator::Coalesce {
+            flatten_coalesce(&logical.left, scope, out)?;
+            flatten_coalesce(&logical.right, scope, out)?;
+            return Ok(());
+        }
+    }
+    out.push(lower_binding_expr(expr, scope)?);
+    Ok(())
+}
+
+/// The `(namespace, name)` a call's callee spells.
+///
+/// A qualified callee (`ns.fn()`) yields both halves. An **unqualified** one
+/// (`design()`) yields an empty namespace and the bare name: that is what the
+/// author wrote, and writing down a namespace nobody spelled would be an
+/// invention this layer is not allowed to make. Consumers that require a
+/// namespace still refuse the empty one - `highbay_objects`' checked plan does,
+/// by name - so widening the capture widens no consumer's grammar.
 fn static_call_parts(expr: &Expression) -> Result<(String, String), String> {
     match unparen(expr) {
+        Expression::Identifier(id) => Ok((String::new(), id.name.to_string())),
         Expression::StaticMemberExpression(member) => {
             let Some(namespace) = expr_path(&member.object) else {
                 return Err("computed call callees are unsupported".into());
@@ -1440,7 +1535,7 @@ fn static_call_parts(expr: &Expression) -> Result<(String, String), String> {
             Ok((namespace, member.property.name.to_string()))
         }
         Expression::ComputedMemberExpression(_) => Err("computed call callees are unsupported".into()),
-        _ => Err("call callee must be a qualified static member".into()),
+        _ => Err("call callee must be a static name or qualified member".into()),
     }
 }
 
@@ -1571,6 +1666,15 @@ fn lower_effect_statement(
     }
 }
 
+/// What to CALL the thing being refused.
+///
+/// It exists so a refusal names the form the author wrote. It had a hole worth
+/// recording: `||`, `&&` and `? :` fell through to the catch-all and produced
+/// `"expression expressions are unsupported"`, which says nothing and reads as
+/// a bug in the message rather than a verdict on the source. `??` and `? :` are
+/// lowered now; `||` and `&&` are still refused, and they are refused BY NAME -
+/// so an author who writes one is told which operator this vocabulary declines
+/// and is not left guessing whether the parser understood the line at all.
 fn binding_expr_kind(expr: &Expression) -> &'static str {
     match expr {
         Expression::AssignmentExpression(_) | Expression::UpdateExpression(_) => "mutation",
@@ -1578,6 +1682,30 @@ fn binding_expr_kind(expr: &Expression) -> &'static str {
         Expression::ArrowFunctionExpression(_) => "function",
         Expression::ComputedMemberExpression(_) => "computed",
         Expression::NewExpression(_) => "constructor",
+        // Reached only for `||`/`&&`: the `??` operator has a positive arm and
+        // never gets here.
+        Expression::LogicalExpression(logical) => match logical.operator {
+            LogicalOperator::Or => "`||`",
+            LogicalOperator::And => "`&&`",
+            LogicalOperator::Coalesce => "`??`",
+        },
+        Expression::ConditionalExpression(_) => "conditional",
+        // Reached for every binary operator EXCEPT `===`/`==`, which have a
+        // positive arm. The negations are named individually because "we
+        // support equality" and "we refused your `!==`" are one keystroke
+        // apart, and an author who is told only "binary-operator" will read
+        // that as the equality support being absent.
+        Expression::BinaryExpression(binary) => match binary.operator {
+            BinaryOperator::Inequality => "`!=`",
+            BinaryOperator::StrictInequality => "`!==`",
+            BinaryOperator::LessThan
+            | BinaryOperator::LessEqualThan
+            | BinaryOperator::GreaterThan
+            | BinaryOperator::GreaterEqualThan => "ordering-comparison",
+            _ => "binary-operator",
+        },
+        Expression::UnaryExpression(_) => "unary-operator",
+        Expression::AwaitExpression(_) => "await",
         _ => "expression",
     }
 }
@@ -2065,6 +2193,238 @@ mod tests {
                 panic!("expected BindingSyntax for {source}");
             };
             assert!(message.contains(expected), "{message:?}");
+        }
+    }
+
+    /// Read one attribute's lowered binding expression, or panic.
+    fn binding_of(source: &str) -> BindingExpr {
+        let doc = parse_tsx(source).expect("parse");
+        let Node::Element(element) = &doc.root_nodes[0] else {
+            panic!("expected an element");
+        };
+        let Some(AttrValue::BindingExpr(expr)) = element.attr("value") else {
+            panic!("expected a lowered binding expression on `value`");
+        };
+        expr.clone()
+    }
+
+    fn path(segments: &[&str]) -> BindingExpr {
+        BindingExpr::Path(segments.iter().map(|s| (*s).to_string()).collect())
+    }
+
+    /// `??` lowers, and a CHAIN of it is one n-ary node rather than a nest.
+    ///
+    /// The flattening is the claim worth pinning: `a ?? b ?? c` is
+    /// left-associative in TS, so it arrives as a `??` whose left operand is
+    /// another `??`, and a lowering that kept that shape would give one source
+    /// two representations - the nested one and the flat one a later author
+    /// could equally mean - leaving every consumer to normalise. There is one
+    /// shape, and this says which.
+    #[test]
+    fn the_nullish_operator_lowers_and_a_chain_is_one_n_ary_node() {
+        assert_eq!(
+            binding_of(r#"<Thing value={props.placeholder ?? props.value}/>"#),
+            BindingExpr::Coalesce(vec![
+                path(&["props", "placeholder"]),
+                path(&["props", "value"]),
+            ])
+        );
+        assert_eq!(
+            binding_of(r#"<Thing value={a ?? b ?? c}/>"#),
+            BindingExpr::Coalesce(vec![path(&["a"]), path(&["b"]), path(&["c"])]),
+            "a chain flattens rather than nesting"
+        );
+        assert_eq!(
+            binding_of(r#"<Thing value={(a ?? b) ?? c}/>"#),
+            BindingExpr::Coalesce(vec![path(&["a"]), path(&["b"]), path(&["c"])]),
+            "parentheses around a `??` say nothing a re-parse could tell apart"
+        );
+    }
+
+    /// `||` and `&&` stay refused, and the refusal NAMES the operator.
+    ///
+    /// They share oxc's `LogicalExpression` with `??`, so the positive arm had
+    /// to be written on the operator rather than the node kind - and that is
+    /// what makes this test load-bearing rather than a restatement: an arm
+    /// matching the node would have silently lowered `a || b` as a coalesce,
+    /// answering a falsy test with a nullish one.
+    ///
+    /// Before this change all three produced `"expression expressions are
+    /// unsupported"`, which named nothing.
+    #[test]
+    fn the_other_logical_operators_are_refused_by_name() {
+        for (source, expected) in [
+            (r#"<Thing value={a || b}/>"#, "`||`"),
+            (r#"<Thing value={a && b}/>"#, "`&&`"),
+            (r#"<Thing value={a > b}/>"#, "ordering-comparison"),
+            (r#"<Thing value={a != b}/>"#, "`!=`"),
+            (r#"<Thing value={a !== b}/>"#, "`!==`"),
+            (r#"<Thing value={a + b}/>"#, "binary-operator"),
+            (r#"<Thing value={!a}/>"#, "unary-operator"),
+        ] {
+            let Err(ParseError::Effect(EffectError::BindingSyntax { message, .. })) =
+                ParseCtx::default().parse_tsx(source)
+            else {
+                panic!("expected BindingSyntax for {source}");
+            };
+            assert!(
+                message.contains(expected),
+                "{source} should name its operator, said {message:?}"
+            );
+        }
+    }
+
+    /// The ternary lowers, including nested in its own branches.
+    #[test]
+    fn the_conditional_expression_lowers() {
+        assert_eq!(
+            binding_of(r#"<Thing value={props.on ? props.a : props.b}/>"#),
+            BindingExpr::Cond {
+                cond: Box::new(path(&["props", "on"])),
+                then: Box::new(path(&["props", "a"])),
+                other: Box::new(path(&["props", "b"])),
+            }
+        );
+        let nested = binding_of(r#"<Thing value={a ? b : c ? d : e}/>"#);
+        let BindingExpr::Cond { other, .. } = &nested else {
+            panic!("expected a conditional");
+        };
+        assert!(
+            matches!(**other, BindingExpr::Cond { .. }),
+            "the else branch carries the nested conditional"
+        );
+    }
+
+    /// `design().isAuthoring` - the shape `Member` exists for.
+    ///
+    /// Two facts in one: an UNQUALIFIED callee is captured with an empty
+    /// namespace (writing down a namespace nobody spelled would be an
+    /// invention), and the member access hangs off the call rather than being
+    /// folded into its name.
+    #[test]
+    fn a_member_chain_on_a_call_result_lowers_to_member() {
+        assert_eq!(
+            binding_of(r#"<Thing value={design().isAuthoring}/>"#),
+            BindingExpr::Member {
+                base: Box::new(BindingExpr::Call {
+                    namespace: String::new(),
+                    name: "design".into(),
+                    type_args: vec![],
+                    args: vec![],
+                }),
+                path: vec!["isAuthoring".into()],
+            }
+        );
+        assert_eq!(
+            binding_of(r#"<Thing value={design().avatar.sm.box}/>"#),
+            BindingExpr::Member {
+                base: Box::new(BindingExpr::Call {
+                    namespace: String::new(),
+                    name: "design".into(),
+                    type_args: vec![],
+                    args: vec![],
+                }),
+                path: vec!["avatar".into(), "sm".into(), "box".into()],
+            },
+            "a deep chain is ONE member node, in source order"
+        );
+    }
+
+    /// **A plain dotted path did NOT become a `Member`.**
+    ///
+    /// The regression this guards is the whole reason `Member` is restricted to
+    /// non-identifier bases: `props.value` has a perfectly good spelling
+    /// already, every reader in the workspace knows it, and a lowering that
+    /// re-expressed it as a member access on a path would have changed the
+    /// meaning of every attribute in the shipped corpus while every test that
+    /// only checks *rendering* stayed green.
+    #[test]
+    fn an_identifier_rooted_chain_is_still_a_path() {
+        assert_eq!(
+            binding_of(r#"<Thing value={props.user.name}/>"#),
+            path(&["props", "user", "name"])
+        );
+        assert_eq!(binding_of(r#"<Thing value={items}/>"#), path(&["items"]));
+    }
+
+    /// `===` and `==` both lower, and WHICH ONE was written survives.
+    ///
+    /// The pin is the last clause. Folding the two operators together is the
+    /// tempting simplification - this vocabulary has no coercion, so they
+    /// cannot currently disagree - and it is the one that cannot be undone:
+    /// once `==` has been recorded as `===` the source is gone. `strict` costs
+    /// a bool and keeps the question open for whoever needs it.
+    #[test]
+    fn both_equality_operators_lower_and_keep_their_spelling() {
+        assert_eq!(
+            binding_of(r#"<Thing value={design().fidelity === "lofi"}/>"#),
+            BindingExpr::Eq {
+                left: Box::new(BindingExpr::Member {
+                    base: Box::new(BindingExpr::Call {
+                        namespace: String::new(),
+                        name: "design".into(),
+                        type_args: vec![],
+                        args: vec![],
+                    }),
+                    path: vec!["fidelity".into()],
+                }),
+                right: Box::new(BindingExpr::Literal(BindingLiteral::String("lofi".into()))),
+                strict: true,
+            }
+        );
+        assert_eq!(
+            binding_of(r#"<Thing value={props.kind == "row"}/>"#),
+            BindingExpr::Eq {
+                left: Box::new(path(&["props", "kind"])),
+                right: Box::new(BindingExpr::Literal(BindingLiteral::String("row".into()))),
+                strict: false,
+            },
+            "a loose equality is recorded as a loose equality"
+        );
+    }
+
+    /// Computed access stays refused wherever it sits in a chain.
+    #[test]
+    fn computed_access_is_still_refused_under_a_call() {
+        let Err(ParseError::Effect(EffectError::BindingSyntax { message, .. })) =
+            ParseCtx::default().parse_tsx(r#"<Thing value={design()[key]}/>"#)
+        else {
+            panic!("expected BindingSyntax");
+        };
+        assert!(message.contains("computed"), "{message:?}");
+    }
+
+    /// **Emit -> parse gives the tree back**, which is what the conservative
+    /// parenthesisation is for.
+    ///
+    /// The emitter has no precedence model, so the cases that matter are the
+    /// ones where splicing text would re-associate: a `??` inside a ternary
+    /// branch, a ternary inside a ternary's condition, and a `??` operand that
+    /// is itself a ternary. Each is emitted with parentheses it does not
+    /// strictly need in every position; the property being asserted is not
+    /// "the text is minimal" but "the text means what the tree said".
+    #[test]
+    fn the_new_operators_survive_a_round_trip_through_emit() {
+        for source in [
+            r#"<Thing value={design().isAuthoring ? (props.authoringPlaceholder ?? props.value) : props.value}/>"#,
+            r#"<Thing value={a ?? b ?? c}/>"#,
+            r#"<Thing value={(a ? b : c) ? d : e}/>"#,
+            r#"<Thing value={(a ? b : c) ?? d}/>"#,
+            r#"<Thing value={a ? (b ? c : d) : e}/>"#,
+            r#"<Thing value={design().avatar.sm.box ?? 8}/>"#,
+            r#"<Thing value={design().fidelity === "lofi" ? a : b}/>"#,
+            r#"<Thing value={(a === b) === c}/>"#,
+            r#"<Thing value={props.kind == "row"}/>"#,
+            r#"<Thing value={(a ?? b) === c}/>"#,
+        ] {
+            let first = parse_tsx(source).expect("parse");
+            let emitted = crate::emit::emit_tsx_document(&first);
+            let second = parse_tsx(&emitted)
+                .unwrap_or_else(|e| panic!("re-parse of {emitted:?} failed: {e:?}"));
+            assert_eq!(
+                first, second,
+                "{source} emitted as {emitted:?} and re-parsed differently"
+            );
         }
     }
 
