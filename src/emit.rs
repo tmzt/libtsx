@@ -253,9 +253,53 @@ fn emit_attr_value(out: &mut String, value: &AttrValue) {
     }
 }
 
+/// **The public emit seam: one expression node to its TypeScript text.**
+///
+/// The downward rung of the IR ladder, spelled as Rust's own conversion trait
+/// rather than a bespoke verb. Emit is TOTAL - every [`BindingExpr`] has a text
+/// - so it is [`From`] and not [`TryFrom`], and the pairing with
+/// [`BindingExpr`]'s `TryFrom<&str>` (feature `parse`) is what makes the
+/// round-trip property statable as a law: **`From` and `TryFrom` are inverse
+/// over the image of the parse.**
+///
+/// ```
+/// use libtsx::dag::{BindingExpr, BindingLiteral};
+///
+/// let expr = BindingExpr::Coalesce(vec![
+///     BindingExpr::Path(vec!["props".into(), "label".into()]),
+///     BindingExpr::Literal(BindingLiteral::String("none".into())),
+/// ]);
+/// assert_eq!(String::from(&expr), r#"props.label ?? "none""#);
+/// ```
+///
+/// **No feature gate.** [`crate::emit`] names no `oxc_*` type and never has, so
+/// this door is open to a `default-features = false` consumer that holds a
+/// graph and wants source out of it - unlike the parse door, which needs oxc to
+/// exist at all.
+///
+/// **Orphan rule**: legal here and only here. `String` is std's, but `&T` is
+/// fundamental, so `&BindingExpr` counts as local to the crate that defines
+/// [`BindingExpr`] - which is this one. The same impl written from a peer crate
+/// would have two foreign ends and would not compile; each rung of the ladder
+/// belongs to the crate that owns its NEW type.
+///
+/// The `&mut String` writer beside this one stays private: it is the recursion,
+/// and the shared buffer is why (an expression is spliced into a document, an
+/// attribute, an argument list).
+impl From<&BindingExpr> for String {
+    fn from(expr: &BindingExpr) -> Self {
+        let mut out = String::new();
+        emit_binding_expr(&mut out, expr);
+        out
+    }
+}
+
 /// Emit one owned object-binding expression. Unlike [`AttrValue::NamedEffect`],
 /// this vocabulary is not used by the legacy event parser; it is emitted only
 /// when a caller has already constructed the owned semantic IR.
+///
+/// The public spelling is `impl From<&BindingExpr> for String` above; this is
+/// the writer it and every internal splice share.
 fn emit_binding_expr(out: &mut String, expr: &BindingExpr) {
     match expr {
         BindingExpr::Literal(literal) => match literal {
@@ -384,19 +428,61 @@ fn emit_binding_params(out: &mut String, params: &[BindingParam]) {
 /// The body of an expression-bodied arrow, parenthesised where TypeScript would
 /// otherwise read it as something else.
 ///
-/// **A RECORD is the case**: `x => {a: 1}` opens a BLOCK, not an object
-/// literal, so the body has to be written `x => ({a: 1})`. Every other body
-/// spelling in this vocabulary is safe bare - an arrow body extends as far to
-/// the right as it can, which is exactly what any operator, call or member
-/// chain inside it wants, and [`emit_operand`] is what stops the arrow ITSELF
-/// swallowing an operator that follows it.
+/// **A LEADING BRACE is the case, not a record body**: `x => {a: 1}` opens a
+/// BLOCK, not an object literal, so the body has to be written `x => ({a: 1})`.
+/// The hazard belongs to the first TOKEN of the body's emitted text, and a body
+/// that merely *begins* with a record has it too - [`emit_operand`] splices a
+/// PRIMARY operand bare and a record is primary, so `{a: 1} ?? z`, `{a: 1} ? t
+/// : o` and `{a: 1} === z` all start with `{` while being no kind of record
+/// themselves. Guarding on the body's top node instead let those three through
+/// as `x => {a: 1} ?? z`, which is a syntax error rather than a different
+/// meaning (`codec_round_trip.rs`, F1).
+///
+/// Everything without that leading brace is safe bare - an arrow body extends
+/// as far to the right as it can, which is exactly what any operator, call or
+/// member chain inside it wants, and [`emit_operand`] is what stops the arrow
+/// ITSELF swallowing an operator that follows it.
 fn emit_arrow_body(out: &mut String, body: &BindingExpr) {
-    if matches!(body, BindingExpr::Record(_)) {
+    if begins_with_brace(body) {
         out.push('(');
         emit_binding_expr(out, body);
         out.push(')');
     } else {
         emit_binding_expr(out, body);
+    }
+}
+
+/// Whether this expression's emitted text starts with `{`.
+///
+/// **The recursion follows the BARE splices and stops at every parenthesised
+/// one**, which is what keeps it in step with the emitter rather than
+/// approximating it: an operand only contributes its own first token when
+/// [`is_primary`] left it unwrapped, and a member base only when
+/// [`is_bare_member_base`] did - the same two predicates the emitter itself
+/// branches on, so neither can drift from the text that is actually written.
+///
+/// It bottoms out immediately in practice, because [`BindingExpr::Record`] is
+/// the only bare-splicable form whose text opens with a brace. The recursive
+/// spelling is nonetheless the honest one: it stays correct if a future primary
+/// or a future operator changes that, where a one-level `matches!` would
+/// quietly stop covering the vocabulary.
+fn begins_with_brace(expr: &BindingExpr) -> bool {
+    match expr {
+        BindingExpr::Record(_) => true,
+        // The three operator forms: their leading operand goes through
+        // `emit_operand`.
+        BindingExpr::Coalesce(operands) => operands
+            .first()
+            .is_some_and(|first| is_primary(first) && begins_with_brace(first)),
+        BindingExpr::Cond { cond, .. } => is_primary(cond) && begins_with_brace(cond),
+        BindingExpr::Eq { left, .. } => is_primary(left) && begins_with_brace(left),
+        // A member chain leads with its base, through the stricter predicate.
+        BindingExpr::Member { base, .. } => {
+            is_bare_member_base(base) && begins_with_brace(base)
+        }
+        // Literal, Path, Array, Call, Arrow and Async each open with a token of
+        // their own - a value, a name, `[`, `(` or `async`.
+        _ => false,
     }
 }
 
@@ -439,16 +525,25 @@ fn emit_operand(out: &mut String, expr: &BindingExpr) {
 /// number). Only a name, a call and another member chain are safe bare - which
 /// covers `design().isAuthoring`, the shape this variant exists for.
 fn emit_member_base(out: &mut String, expr: &BindingExpr) {
-    if matches!(
-        expr,
-        BindingExpr::Path(_) | BindingExpr::Call { .. } | BindingExpr::Member { .. }
-    ) {
+    if is_bare_member_base(expr) {
         emit_binding_expr(out, expr);
     } else {
         out.push('(');
         emit_binding_expr(out, expr);
         out.push(')');
     }
+}
+
+/// Whether [`emit_member_base`] splices this base bare - factored out because
+/// [`begins_with_brace`] has to ask the SAME question the emitter branches on,
+/// and a second `matches!` spelling of it is exactly the drift CLAUDE.md item 5
+/// names ("a control's hit region and its drawn geometry must derive from ONE
+/// shared formula").
+fn is_bare_member_base(expr: &BindingExpr) -> bool {
+    matches!(
+        expr,
+        BindingExpr::Path(_) | BindingExpr::Call { .. } | BindingExpr::Member { .. }
+    )
 }
 
 /// Whether this expression's emitted text is self-delimiting - a literal, a
@@ -866,6 +961,145 @@ mod tests {
         assert!(output.contains("width={100}"));
         assert!(output.contains("height={50.5}"));
     }
+    // --- F1: an arrow body is guarded on its leading TOKEN -------------------
+    //
+    // These assert the emitted TEXT, with the known-bad twin beside each case:
+    // a body whose leading operand is NOT a record must stay unparenthesised,
+    // or "fixed" would just mean "parenthesises everything".
+
+    /// `{a: 1}`, the operand the hazard is about.
+    fn record() -> BindingExpr {
+        BindingExpr::Record(vec![(
+            "a".into(),
+            BindingExpr::Literal(BindingLiteral::Number(1.0)),
+        )])
+    }
+
+    /// `z`.
+    fn name(text: &str) -> BindingExpr {
+        BindingExpr::Path(vec![text.into()])
+    }
+
+    /// `(x: number) => <body>`.
+    fn arrow(body: BindingExpr) -> BindingExpr {
+        BindingExpr::Arrow {
+            params: vec![BindingParam {
+                name: "x".into(),
+                ty: TypeShape::F64,
+            }],
+            body: Box::new(body),
+        }
+    }
+
+    #[test]
+    fn an_arrow_body_whose_leading_operand_is_a_record_is_parenthesised() {
+        let cases = [
+            (
+                BindingExpr::Coalesce(vec![record(), name("z")]),
+                "(x: number) => ({a: 1} ?? z)",
+            ),
+            (
+                BindingExpr::Cond {
+                    cond: Box::new(record()),
+                    then: Box::new(name("t")),
+                    other: Box::new(name("o")),
+                },
+                "(x: number) => ({a: 1} ? t : o)",
+            ),
+            (
+                BindingExpr::Eq {
+                    left: Box::new(record()),
+                    right: Box::new(name("z")),
+                    strict: true,
+                },
+                "(x: number) => ({a: 1} === z)",
+            ),
+            // The body that IS a record - the case the old guard covered, which
+            // must keep working.
+            (record(), "(x: number) => ({a: 1})"),
+        ];
+        for (body, expected) in cases {
+            assert_eq!(String::from(&arrow(body)), expected);
+        }
+    }
+
+    #[test]
+    fn an_arrow_body_without_a_leading_brace_stays_bare() {
+        let cases = [
+            // The known-bad twin of each case above: same operator, leading
+            // operand that is not a record.
+            (
+                BindingExpr::Coalesce(vec![name("a"), name("z")]),
+                "(x: number) => a ?? z",
+            ),
+            (
+                BindingExpr::Cond {
+                    cond: Box::new(name("c")),
+                    then: Box::new(name("t")),
+                    other: Box::new(name("o")),
+                },
+                "(x: number) => c ? t : o",
+            ),
+            (
+                BindingExpr::Eq {
+                    left: Box::new(name("a")),
+                    right: Box::new(name("z")),
+                    strict: true,
+                },
+                "(x: number) => a === z",
+            ),
+            // An ARRAY leads with `[`, which is not the hazard.
+            (
+                BindingExpr::Coalesce(vec![
+                    BindingExpr::Array(vec![BindingExpr::Literal(BindingLiteral::Number(1.0))]),
+                    name("z"),
+                ]),
+                "(x: number) => [1] ?? z",
+            ),
+            // A member chain on a record: `emit_member_base` already wrapped the
+            // record, so the text leads with `(` and needs nothing more.
+            (
+                BindingExpr::Member {
+                    base: Box::new(record()),
+                    path: vec!["m".into()],
+                },
+                "(x: number) => ({a: 1}).m",
+            ),
+            // And one level in: a coalesce LED BY that member chain.
+            (
+                BindingExpr::Coalesce(vec![
+                    BindingExpr::Member {
+                        base: Box::new(record()),
+                        path: vec!["m".into()],
+                    },
+                    name("z"),
+                ]),
+                "(x: number) => ({a: 1}).m ?? z",
+            ),
+            // A record in the TRAILING position is not the hazard either.
+            (
+                BindingExpr::Coalesce(vec![name("z"), record()]),
+                "(x: number) => z ?? {a: 1}",
+            ),
+        ];
+        for (body, expected) in cases {
+            assert_eq!(String::from(&arrow(body)), expected);
+        }
+    }
+
+    #[test]
+    fn the_guard_reaches_through_a_nested_arrow() {
+        // `(x: number) => ({a: 1}) ?? ((x: number) => ({a: 1}) ?? z)` - the
+        // recursive case in the matrix. The inner arrow is an operand of the
+        // outer coalesce, so `emit_operand` wraps it (an arrow is not primary),
+        // and each arrow's own body is guarded independently.
+        let inner = arrow(BindingExpr::Coalesce(vec![record(), name("z")]));
+        let outer = arrow(BindingExpr::Coalesce(vec![record(), inner]));
+        assert_eq!(
+            String::from(&outer),
+            "(x: number) => ({a: 1} ?? ((x: number) => ({a: 1} ?? z)))"
+        );
+    }
 }
 
 #[cfg(all(test, feature = "parse"))]
@@ -1221,4 +1455,5 @@ import { navigate } from "host:effects";
         let doc = crate::parse_tsx(SOURCES[0]).expect("parse");
         assert_eq!(comment_texts(&doc.root_nodes), Vec::<String>::new());
     }
+
 }
