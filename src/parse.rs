@@ -2464,6 +2464,12 @@ mod tests {
             r#"<Thing value={props.ready ? (x => x) : (x => x.other)}/>"#,
             r#"<Thing value={() => 1}/>"#,
             r#"<Thing value={(a, b) => a === b}/>"#,
+            // `await` binds tighter than every operator in this vocabulary, so
+            // its operand is the one splice site inside a block that is not
+            // already delimited by a bracket, a comma or a keyword.
+            r#"<Thing value={async () => { const r = await (a ?? b); return r; }}/>"#,
+            r#"<Thing value={async () => { await (props.ready ? a : b); return null; }}/>"#,
+            r#"<Thing value={async () => { const r = await ((x) => x); return r; }}/>"#,
         ] {
             let first = parse_tsx(source).expect("parse");
             let emitted = crate::emit::emit_tsx_document(&first);
@@ -2562,6 +2568,34 @@ mod tests {
         assert_ne!(
             doc, reparsed,
             "stripping the parentheses must change the tree, or they prove nothing"
+        );
+    }
+
+    /// **`await`'s operand keeps its parentheses**, and this names the
+    /// characters so a reader tidying them meets the reason.
+    ///
+    /// `await` takes a UnaryExpression - tighter than every operator this
+    /// vocabulary captures - so a bare splice turns `await (a ?? b)` into
+    /// `await a ?? b`, which is `(await a) ?? b`. That is not a different
+    /// spelling of the same tree; it is not even in this vocabulary, and the
+    /// re-parse refuses it outright. The bug predates the arrow, which is why
+    /// this test exists separately from the arrow's.
+    #[test]
+    fn awaits_operand_keeps_its_parentheses() {
+        let doc = parse_tsx(
+            r#"<Thing value={async () => { const r = await (a ?? b); return r; }}/>"#,
+        )
+        .expect("parse");
+        let emitted = crate::emit::emit_tsx_document(&doc);
+        assert!(
+            emitted.contains("await (a ?? b)"),
+            "the operand keeps its parentheses: {emitted}"
+        );
+        let stripped = emitted.replace("await (a ?? b)", "await a ?? b");
+        assert!(
+            parse_tsx(&stripped).is_err(),
+            "without them the text is not this vocabulary any more, which is \
+             what makes the parentheses load-bearing rather than tidy"
         );
     }
 

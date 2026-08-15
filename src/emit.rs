@@ -508,7 +508,13 @@ fn emit_block_statements(out: &mut String, statements: &[BlockStmt], indent: usi
                 if slot.is_some() {
                     out.push_str("await ");
                 }
-                emit_binding_expr(out, awaitable);
+                // **[`emit_operand`], not a bare splice.** `await` takes a
+                // UnaryExpression, which binds tighter than every operator in
+                // this vocabulary and does not admit an arrow at all: `await a
+                // ?? b` is `(await a) ?? b`, and `await x => x` is a syntax
+                // error. This is the one splice inside a block that a bracket,
+                // a comma or a keyword does not already delimit.
+                emit_operand(out, awaitable);
                 out.push_str(";\n");
             }
             BlockStmt::If {
