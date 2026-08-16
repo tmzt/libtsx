@@ -1096,6 +1096,22 @@ fn every_effect_refusal_renders_ascii() {
         EffectError::SpreadAttribute {
             tag: "Widget".into(),
         },
+        // The element conversion's refusals, which are not effect refusals and
+        // reach the same status strip. This list is hand-maintained - a variant
+        // added without an entry here is simply not covered - so a new one
+        // belongs in it the day it lands.
+        EffectError::BindingSyntax {
+            attr: "value".into(),
+            message: "computed member paths are unsupported".into(),
+        },
+        EffectError::UnreadableChild {
+            tag: Some("Content".into()),
+            form: "an object literal".into(),
+        },
+        EffectError::UnreadableChild {
+            tag: None,
+            form: "a spread (`{...}`)".into(),
+        },
     ] {
         assert!(e.to_string().is_ascii(), "{e:?}");
         assert!(!e.to_string().is_empty());

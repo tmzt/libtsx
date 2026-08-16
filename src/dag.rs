@@ -630,6 +630,13 @@ pub trait ParserHost {
 /// matching [`is_event_binding`] announces itself, so there is no case in which
 /// "we could not lower this" and "the author wrote no effect" arrive as the
 /// same value (Rule 10).
+///
+/// **It is the element conversion's refusal type, not only the effect
+/// grammar's**, and has been since [`EffectError::SpreadAttribute`] and
+/// [`EffectError::BindingSyntax`]: what unites the variants is Rule 10, not the
+/// `on..` prefix. [`EffectError::UnreadableChild`] is the same rule one
+/// position over - a CHILD nothing can hold is now named here rather than
+/// dropped where nobody could see it.
 #[derive(Debug, Clone, PartialEq)]
 pub enum EffectError {
     /// An `on..` attribute whose value is not a call: a bare identifier, a
@@ -799,7 +806,50 @@ pub enum EffectError {
         attr: String,
         /// Why the expression has no owned representation.
         message: String,
-    }
+    },
+    /// A `{...}` **child** the element tree has no node for: a call, a
+    /// conditional, an object literal, a spread.
+    ///
+    /// # It was a silent drop, and that is the defect this closes
+    ///
+    /// The child positions this tree CAN hold are few and named:
+    /// [`Node::Text`] (a string or a plain template literal),
+    /// [`Node::Expr`] (a binding path), [`Node::Element`] (an element, or the
+    /// element a list render arrow returns) and [`Node::Comment`]. Everything
+    /// else used to be read, found unrepresentable, and dropped - the parse
+    /// succeeded, the child was gone, and nothing anywhere said so. A
+    /// `<Content>` whose only child was `{{greeting}}` (a JS object literal,
+    /// not the `{{ }}` placeholder its author meant) came out EMPTY and looked
+    /// exactly like a `<Content>` written empty on purpose.
+    ///
+    /// That is the shape Rule 10 exists to forbid, and it is the same rule the
+    /// attribute side has honoured all along: an `on..` value that is not a
+    /// call is [`EffectError::NotACall`], and a spread is
+    /// [`EffectError::SpreadAttribute`], never a quietly missing attribute.
+    ///
+    /// # Refusing is not the same answer as reading
+    ///
+    /// A refusal says the tree has no node for this, which for `{f(x)}` or
+    /// `{a && b}` is the whole truth - the graph is one-way data flow, not an
+    /// expression language, and a child that computes belongs in a Module. For
+    /// some forms it is only the truth FOR NOW: `{(props.a)}` is a path with
+    /// parentheses around it and `{<Row/>}` is an element. Those are candidates
+    /// for a reader, not permanent refusals, and until one exists this variant
+    /// is what names them (see the parser's `child_form`).
+    UnreadableChild {
+        /// The tag it was written under, or `None` for a child of a top-level
+        /// fragment (which has no tag to name).
+        ///
+        /// A screen is a hundred lines of nested elements and the form alone
+        /// does not say WHERE, so the refusal carries the one piece of context
+        /// the conversion already holds - the same choice
+        /// [`EffectError::SpreadAttribute`] made.
+        tag: Option<String>,
+        /// What was written, named by FORM - "a call", "an object literal", "a
+        /// conditional (`?:`)" - not the source text, which the parse does not
+        /// carry this far.
+        form: String,
+    },
 }
 
 impl std::fmt::Display for EffectError {
@@ -880,6 +930,16 @@ impl std::fmt::Display for EffectError {
             ),
             Self::BindingSyntax { attr, message } => {
                 write!(f, "`{attr}` has an unsupported binding expression: {message}")
+            }
+            Self::UnreadableChild { tag, form } => {
+                match tag {
+                    Some(tag) => write!(f, "<{tag}> has a child that is {form}")?,
+                    None => write!(f, "a fragment has a child that is {form}")?,
+                }
+                write!(
+                    f,
+                    ", and the element tree has a node only for text, a binding path, an element and a comment"
+                )
             }
         }
     }

@@ -356,7 +356,7 @@ impl ParseCtx {
                         owned.push(frag.span);
                         let mut kids = Vec::new();
                         for child in &frag.children {
-                            push_child(&mut kids, child, &low)?;
+                            push_child(&mut kids, child, &low, None)?;
                         }
                         roots.extend(kids.into_iter().map(|n| (frag.span.start, n)));
                     }
@@ -1247,7 +1247,7 @@ fn convert_element(jsx: &JSXElement, low: &Lowering) -> Result<Element, EffectEr
 
     let mut children = Vec::new();
     for child in &jsx.children {
-        push_child(&mut children, child, low)?;
+        push_child(&mut children, child, low, Some(&tag))?;
     }
 
     Ok(Element {
@@ -1285,6 +1285,7 @@ fn push_child(
     out: &mut Vec<Node>,
     child: &JSXChild,
     low: &Lowering,
+    parent: Option<&str>,
 ) -> Result<(), EffectError> {
     match child {
         JSXChild::Element(e) => out.push(Node::Element(convert_element(e, low)?)),
@@ -1300,25 +1301,53 @@ fn push_child(
                     Expression::StringLiteral(s) => out.push(Node::Text(s.value.to_string())),
                     Expression::TemplateLiteral(t) => {
                         // Only lower plain (no-substitution) template strings.
-                        if t.expressions.is_empty() && t.quasis.len() == 1 {
-                            if let Some(raw) = t.quasis[0].value.cooked.as_ref() {
-                                out.push(Node::Text(raw.to_string()));
-                            }
+                        // A substituted one COMPUTES, and the graph is one-way
+                        // data flow: `{`hi ${name}`}` is a Module's job, or the
+                        // `{{ }}` placeholder scan's ([`crate::template`]).
+                        if !t.expressions.is_empty() || t.quasis.len() != 1 {
+                            return Err(EffectError::UnreadableChild {
+                                tag: parent.map(str::to_string),
+                                form: "a template literal with a substitution".to_string(),
+                            });
                         }
+                        let Some(raw) = t.quasis[0].value.cooked.as_ref() else {
+                            // `cooked` is None only for an escape sequence that
+                            // has no value at all (`` `\u{}` ``), which is a
+                            // string this parse cannot produce rather than one
+                            // it declines to.
+                            return Err(EffectError::UnreadableChild {
+                                tag: parent.map(str::to_string),
+                                form: "a template literal whose escape has no value".to_string(),
+                            });
+                        };
+                        out.push(Node::Text(raw.to_string()));
                     }
                     Expression::ArrowFunctionExpression(arrow) => {
                         // A list render function is authored as
                         // `{(item) => <Item>...</Item>}`. The retained tree
                         // carries the returned JSX; the parameter remains
                         // available to its binding-valued props.
-                        if let Some(jsx) = arrow_root_jsx(arrow) {
-                            out.push(Node::Element(convert_element(jsx, low)?));
-                        }
+                        let Some(jsx) = arrow_root_jsx(arrow) else {
+                            return Err(EffectError::UnreadableChild {
+                                tag: parent.map(str::to_string),
+                                form: "a render function that returns no element".to_string(),
+                            });
+                        };
+                        out.push(Node::Element(convert_element(jsx, low)?));
                     }
                     other => {
-                        if let Some(path) = expr_path(other) {
-                            out.push(Node::Expr(path));
-                        }
+                        // **The refusal, where a silent drop used to be.** An
+                        // `expr_path` of `None` means this is not a binding
+                        // path, and a child that is not one of the four node
+                        // kinds is a finding for the surface to render - never
+                        // a child the parse quietly forgets.
+                        let Some(path) = expr_path(other) else {
+                            return Err(EffectError::UnreadableChild {
+                                tag: parent.map(str::to_string),
+                                form: child_form(other).to_string(),
+                            });
+                        };
+                        out.push(Node::Expr(path));
                     }
                 }
             } else if let Some(comments) = &low.comments {
@@ -1333,12 +1362,91 @@ fn push_child(
         }
         JSXChild::Fragment(frag) => {
             for c in &frag.children {
-                push_child(out, c, low)?;
+                push_child(out, c, low, parent)?;
             }
         }
-        JSXChild::Spread(_) => {}
+        // `<A>{...kids}</A>`. The same fact as [`EffectError::SpreadAttribute`]
+        // one position over: a spread's contents are not statically known, so
+        // there is nothing to place and no way to check what was spread.
+        JSXChild::Spread(_) => {
+            return Err(EffectError::UnreadableChild {
+                tag: parent.map(str::to_string),
+                form: "a spread (`{...}`)".to_string(),
+            });
+        }
     }
     Ok(())
+}
+
+/// Name a JSX child expression by its **form**, for
+/// [`EffectError::UnreadableChild`].
+///
+/// A form and not the source text: `push_child` is handed one expression
+/// subtree and no source, and threading the whole file down to a refusal so it
+/// could quote a span would put the source in every element conversion for the
+/// sake of one message. The form is what a reader needs anyway - "an object
+/// literal" says both what was written and why nothing can hold it, and it is
+/// what the pinning tests name.
+///
+/// The fallback is deliberately vague and deliberately reachable: this match
+/// covers what a JSX child plausibly holds, not all sixty-odd expression kinds,
+/// and a form that is missing here is still refused.
+///
+/// # Why this is not [`binding_expr_kind`]
+///
+/// That one names the same expressions for the ATTRIBUTE position, and the two
+/// positions do not refuse the same set: `v={a ?? b}`, `v={f(x)}` and
+/// `v={{k: 1}}` all LOWER, because an attribute value is a whole
+/// [`BindingExpr`], while the child position has only [`Node::Expr`] - a flat
+/// path `String`. So the child vocabulary is the narrower one, and the fix for
+/// the forms that deserve reading is in the NODE (an `Expr` that carries a
+/// `BindingExpr`), not in [`expr_path`], which is also the callee reader.
+/// Sharing one namer would hide that asymmetry behind a shared word list;
+/// `binding_expr_kind`'s terse nouns ("call", "computed") also read as
+/// `{kind} expressions are unsupported`, which is not this sentence.
+fn child_form(expr: &Expression) -> &'static str {
+    match expr {
+        // Not a path only because `expr_path` does not unparen. A candidate for
+        // READING rather than refusing - see `EffectError::UnreadableChild`.
+        Expression::ParenthesizedExpression(_) => "a parenthesised expression",
+        Expression::JSXElement(_) | Expression::JSXFragment(_) => {
+            "an element inside an expression container"
+        }
+        Expression::ConditionalExpression(_) => "a conditional (`?:`)",
+        Expression::LogicalExpression(e) => match e.operator {
+            LogicalOperator::Coalesce => "a coalesce (`??`)",
+            LogicalOperator::And => "a logical and (`&&`)",
+            LogicalOperator::Or => "a logical or (`||`)",
+        },
+        Expression::BinaryExpression(_) => "a binary expression",
+        Expression::UnaryExpression(_) => "a unary expression",
+        Expression::CallExpression(_) => "a call",
+        Expression::NewExpression(_) => "a constructor call",
+        Expression::TaggedTemplateExpression(_) => "a tagged template",
+        Expression::ComputedMemberExpression(_) => "a computed member (`a[b]`)",
+        Expression::PrivateFieldExpression(_) => "a private member (`a.#b`)",
+        // Rooted at a name it would BE a path, so reaching here means the base
+        // is something else: `this.a`, `f().a`, `a[b].c`.
+        Expression::StaticMemberExpression(_) => "a member chain not rooted at a name",
+        Expression::ChainExpression(_) => "an optional chain (`?.`)",
+        Expression::ObjectExpression(_) => "an object literal",
+        Expression::ArrayExpression(_) => "an array literal",
+        Expression::FunctionExpression(_) => "a function expression",
+        Expression::AssignmentExpression(_) => "an assignment",
+        Expression::SequenceExpression(_) => "a sequence (`,`)",
+        Expression::AwaitExpression(_) => "an await",
+        Expression::ThisExpression(_) => "`this`",
+        Expression::NumericLiteral(_) => "a number literal",
+        Expression::BigIntLiteral(_) => "a bigint literal",
+        Expression::BooleanLiteral(_) => "a boolean literal",
+        Expression::NullLiteral(_) => "`null`",
+        Expression::RegExpLiteral(_) => "a regular expression",
+        Expression::TSNonNullExpression(_) => "a non-null assertion (`!`)",
+        Expression::TSAsExpression(_) => "an `as` cast",
+        Expression::TSSatisfiesExpression(_) => "a `satisfies` expression",
+        Expression::TSTypeAssertion(_) => "a type assertion",
+        _ => "an expression this tree has no node for",
+    }
 }
 
 /// **The public lowering seam: one TypeScript expression's TEXT to one node.**
@@ -2732,6 +2840,202 @@ mod tests {
             format!("{async_concise:?}").contains("async expression-bodied arrows"),
             "refused for the wrong reason: {async_concise:?}"
         );
+    }
+
+    /// **Every child form the tree cannot hold is refused BY NAME.**
+    ///
+    /// Each of these used to parse to an element with NO children and no error
+    /// at all - the child the author wrote was read, found unrepresentable, and
+    /// dropped. The census that preceded this change found the authored corpus
+    /// (69 `{...}` children across 17 `.tsx` files) drops none of them, so
+    /// nothing here is a shape anything ships; what it defends is that the next
+    /// one is a finding rather than a hole.
+    ///
+    /// The forms are named individually because "refuse it" and "read it" are
+    /// different answers and some of these deserve the second - see
+    /// [`child_form`] for which, and why the fix would be in [`Node::Expr`].
+    ///
+    /// **Probe**: restoring the old `if let Some(path) = expr_path(other)` (the
+    /// silent drop) fails this test and
+    /// [`an_optional_chain_is_refused_in_both_positions`], and leaves
+    /// [`the_child_forms_the_tree_holds_are_untouched`] green - which is the
+    /// pair working as intended, one gate per direction.
+    #[test]
+    fn every_unreadable_child_form_is_refused_by_name() {
+        let cases: &[(&str, &str)] = &[
+            // The parenthesised path that surfaced this: `expr_path` does not
+            // unparen, so one redundant pair of brackets erased the child.
+            ("<A>{(props.a.b)}</A>", "a parenthesised expression"),
+            ("<A>{props.ready ? props.a : props.b}</A>", "a conditional (`?:`)"),
+            ("<A>{props.a ?? props.b}</A>", "a coalesce (`??`)"),
+            ("<A>{props.a && props.b}</A>", "a logical and (`&&`)"),
+            ("<A>{props.a || props.b}</A>", "a logical or (`||`)"),
+            ("<A>{props.a === props.b}</A>", "a binary expression"),
+            ("<A>{!props.a}</A>", "a unary expression"),
+            ("<A>{f(props.a)}</A>", "a call"),
+            ("<A>{props.items.map((i) => (<Item />))}</A>", "a call"),
+            ("<A>{new Thing()}</A>", "a constructor call"),
+            ("<A>{props.items[0]}</A>", "a computed member (`a[b]`)"),
+            ("<A>{this.a}</A>", "a member chain not rooted at a name"),
+            ("<A>{props?.a}</A>", "an optional chain (`?.`)"),
+            ("<A>{{a: 1}}</A>", "an object literal"),
+            // The spelling that cost this repo real content: a `{{ }}`
+            // placeholder written without its quotes is a JS object literal.
+            ("<A>{{greeting}}</A>", "an object literal"),
+            ("<A>{[1, 2]}</A>", "an array literal"),
+            ("<A>{7}</A>", "a number literal"),
+            ("<A>{true}</A>", "a boolean literal"),
+            ("<A>{null}</A>", "`null`"),
+            ("<A>{props.a!}</A>", "a non-null assertion (`!`)"),
+            ("<A>{props.a as string}</A>", "an `as` cast"),
+            ("<A>{<B />}</A>", "an element inside an expression container"),
+            // Not the catch-all arm, the same defect: three more child shapes
+            // that were read and thrown away in silence.
+            ("<A>{`hi ${props.a}`}</A>", "a template literal with a substitution"),
+            ("<A>{() => 1}</A>", "a render function that returns no element"),
+            ("<A>{...props.kids}</A>", "a spread (`{...}`)"),
+        ];
+        for (source, form) in cases {
+            let error = ParseCtx::default()
+                .parse_tsx(source)
+                .expect_err(&format!("{source} must not parse to a silent drop"));
+            assert_eq!(
+                error,
+                ParseError::Effect(EffectError::UnreadableChild {
+                    tag: Some("A".to_string()),
+                    form: (*form).to_string()
+                }),
+                "{source} was refused as something else"
+            );
+        }
+
+        // A top-level FRAGMENT has no tag to name, and says so rather than
+        // inventing one. (A fragment nested inside an element reports that
+        // element: the tag is the nearest one a reader can search for.)
+        assert_eq!(
+            ParseCtx::default().parse_tsx("<>{f(x)}</>"),
+            Err(ParseError::Effect(EffectError::UnreadableChild {
+                tag: None,
+                form: "a call".to_string()
+            }))
+        );
+        assert_eq!(
+            ParseCtx::default().parse_tsx("<A><>{f(x)}</></A>"),
+            Err(ParseError::Effect(EffectError::UnreadableChild {
+                tag: Some("A".to_string()),
+                form: "a call".to_string()
+            }))
+        );
+    }
+
+    /// **The known-bad twin of the refusal above**: every child form the tree
+    /// DOES have a node for still reads, and reads to the same node it always
+    /// did. A refusal that swallowed one of these would pass the test above
+    /// while gutting every authored screen.
+    ///
+    /// **Probe**: refusing unconditionally in the catch-all arm (a refusal one
+    /// step too broad) fails this test, `libhbui`'s
+    /// `a_child_the_tree_cannot_hold_is_refused_by_name` and its whole authored
+    /// corpus walk, while the refusal test above still passes.
+    #[test]
+    fn the_child_forms_the_tree_holds_are_untouched() {
+        let doc = ParseCtx::builder()
+            .retain_comments()
+            .build()
+            .parse_tsx(
+                r#"<A>
+                    plain text
+                    {"a string child"}
+                    {`a plain template`}
+                    {props.user.name}
+                    {/* a comment */}
+                    <B />
+                    {(item) => (<Item value={item} />)}
+                </A>"#,
+            )
+            .expect("every readable child form parses");
+        let Node::Element(a) = &doc.root_nodes[0] else {
+            panic!("expected an element")
+        };
+        assert_eq!(
+            a.children,
+            vec![
+                Node::Text("plain text".into()),
+                Node::Text("a string child".into()),
+                Node::Text("a plain template".into()),
+                Node::Expr("props.user.name".into()),
+                Node::Comment("/* a comment */".into()),
+                Node::Element(Element {
+                    tag: "B".into(),
+                    type_args: Vec::new(),
+                    attrs: Vec::new(),
+                    children: Vec::new(),
+                }),
+                Node::Element(Element {
+                    tag: "Item".into(),
+                    type_args: Vec::new(),
+                    attrs: vec![(
+                        "value".into(),
+                        AttrValue::BindingExpr(BindingExpr::Path(vec!["item".into()])),
+                    )],
+                    children: Vec::new(),
+                }),
+            ]
+        );
+        // A comment child on the PUBLISH path (comments not retained) is still
+        // the one container that legitimately contributes no node - it is not a
+        // dropped expression, it is a comment this parse was not asked to keep.
+        let published = parse_tsx(r#"<A>{/* a comment */}</A>"#).expect("parses");
+        let Node::Element(a) = &published.root_nodes[0] else {
+            panic!("expected an element")
+        };
+        assert!(a.children.is_empty());
+    }
+
+    /// **`a?.b` is refused in BOTH positions, and `expr_path` is why that
+    /// matters.**
+    ///
+    /// [`expr_path`] reads `member.property` and never looks at
+    /// `member.optional`, so an optional chain arriving there would lower to
+    /// the same `Path(["a", "b"])` as `a.b` - two different sources, one shape,
+    /// silently. It cannot arrive today because oxc wraps an optional chain in
+    /// a `ChainExpression`, which both readers below refuse before any member
+    /// is peeled; the peel loop in `lower_binding_expr`'s member arm checks
+    /// `optional` and `expr_path` above it does not, and this pins that the
+    /// split stays unreachable.
+    ///
+    /// This asserts the refusals, NOT the lowering: if a later wave teaches
+    /// either reader to see through a `ChainExpression`, this test fails and
+    /// `expr_path` has to answer for `optional` first.
+    #[test]
+    fn an_optional_chain_is_refused_in_both_positions() {
+        assert_eq!(
+            ParseCtx::default().parse_tsx("<A>{a?.b}</A>"),
+            Err(ParseError::Effect(EffectError::UnreadableChild {
+                tag: Some("A".to_string()),
+                form: "an optional chain (`?.`)".to_string()
+            })),
+            "an optional chain in child position"
+        );
+        let attribute = ParseCtx::default()
+            .parse_tsx("<A v={a?.b} />")
+            .expect_err("an optional chain in attribute position");
+        assert_eq!(
+            attribute,
+            ParseError::Effect(EffectError::BindingSyntax {
+                attr: "v".to_string(),
+                message: "expression expressions are unsupported".to_string(),
+            }),
+            "an optional chain must not lower as if the `?` were not written"
+        );
+        // The twin: the same text WITHOUT the question mark is the path both
+        // readers do produce, which is exactly what a silent acceptance of the
+        // optional form would have looked like.
+        let doc = ParseCtx::default().parse_tsx("<A>{a.b}</A>").expect("parses");
+        let Node::Element(a) = &doc.root_nodes[0] else {
+            panic!("expected an element")
+        };
+        assert_eq!(a.children, vec![Node::Expr("a.b".into())]);
     }
 
     #[test]
