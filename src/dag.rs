@@ -19,10 +19,10 @@
 //!   restricted semantic AST that projects symmetrically across language
 //!   views and synthesizes directly to wasm. Complex Modules are *not*
 //!   represented here; they are opaque native-language units by design.
-//! * **Effect bindings** ([`NamedEffect`], [`AttrValue::NamedEffect`]) -
+//! * **Imported calls** ([`ImportedCall`], [`AttrValue::ImportedCall`]) -
 //!   `onGrommet={frobnicate("sprocket")}`: an [`is_event_binding`] attribute whose value
 //!   is ONE call resolving to a granted host import. Deliberately *not* a
-//!   handler and not a body - see [`NamedEffect`] and [`HOST_PREFIX`]
+//!   handler and not a body - see [`ImportedCall`] and [`HOST_PREFIX`]
 //!   (LIBHBUI_PLAN Rules 46, 46a, 48).
 //! * **The embedding's provider** ([`ParserHost`], [`Resolution`]) - what a
 //!   module specifier resolves to. Not graph data: it is the question the
@@ -68,17 +68,17 @@ pub struct DagModule {
     /// **Not the same concept as [`ImportDecl`], despite the shared word.**
     /// An [`ImportDecl`] is the authored `import` statement - *where a name
     /// came from*: a specifier plus bindings with `local`/`imported`/`kind`.
-    /// This is *what a name may be called as*. An effect needs BOTH: the
-    /// declaration binds the local name, this types the call. Resolving a call
-    /// against the wrong one is a defect, not a shortcut - see
-    /// `parse::EffectScope`, which walks the declaration to a namespace and an
+    /// This is *what a name may be called as*. An imported call needs BOTH:
+    /// the declaration binds the local name, this types the call. Resolving a
+    /// call against the wrong one is a defect, not a shortcut - see
+    /// `parse::ImportScope`, which walks the declaration to a namespace and an
     /// exported name and only then asks the grant for the signature.
     pub imports: Vec<FuncSig>,
     /// Event handlers.
     ///
     /// **Empty in everything the authoring surface produces, and that is
-    /// correct rather than a gap** (LIBHBUI_PLAN Rule 46a): an effect is one
-    /// call expression in an `on[A-Z]*` attribute, so there is no handler to
+    /// correct rather than a gap** (LIBHBUI_PLAN Rule 46a): what an `on[A-Z]*`
+    /// attribute carries is one call expression, so there is no handler to
     /// declare. `HandlerDecl`, `Stmt`, `Return`, `If` and `Set` are a codec
     /// shape the format carries; nothing parses one, and
     /// `Definition::from_document` writes `handlers: Vec::new()`.
@@ -195,7 +195,7 @@ pub enum AttrValue {
     Binding(String),
     /// An expression we don't lower (element/fragment/complex expr).
     Opaque,
-    /// `onGrommet={frobnicate("sprocket")}` - an **effect binding**
+    /// `onGrommet={frobnicate("sprocket")}` - a **call to an imported symbol**
     /// (LIBHBUI_PLAN Rules 46, 46a, 48).
     ///
     /// The names in that spelling are libtsx's own placeholders and belong to
@@ -204,13 +204,26 @@ pub enum AttrValue {
     ///
     /// The attribute name matched [`is_event_binding`], so the author declared
     /// an event binding; the value was one call expression resolving to a
-    /// declared host import. See [`NamedEffect`].
+    /// declared host import. See [`ImportedCall`].
+    ///
+    /// # It was called `NamedEffect`, and that name claimed a meaning
+    ///
+    /// An "effect" is something that HAPPENS - it is run, it mutates, it
+    /// navigates. None of that is knowable here. libtsx read a call, resolved
+    /// its callee through the import chain, and checked its arguments against
+    /// the signature the embedding handed over; whether the thing on the other
+    /// end is an effect, a pure query or a no-op is the embedding's model, and
+    /// naming this variant after one of those readings put the embedding's
+    /// vocabulary into the parser's (Rule 52, the same rule
+    /// [`ParserHost`] exists to keep).
     ///
     /// **Kept after all preceding variants on purpose.** postcard encodes enum
-    /// variants positionally, so existing values above it must not move.
-    NamedEffect(NamedEffect),
+    /// variants positionally, so existing values above it must not move - and
+    /// the rename costs no bytes for the same reason: postcard writes indices,
+    /// never names.
+    ImportedCall(ImportedCall),
     /// An owned object/data binding expression. This is deliberately separate
-    /// from [`Binding`] and [`NamedEffect`]: the former is the legacy path
+    /// from [`Binding`] and [`ImportedCall`]: the former is the legacy path
     /// spelling and the latter is the narrow, checked event grammar.
     ///
     /// **Appended last on purpose.** `AttrValue` is persisted positionally.
@@ -250,27 +263,43 @@ pub fn is_event_binding(attr: &str) -> bool {
         .is_some_and(|c| c.is_ascii_uppercase())
 }
 
-/// An **effect**: a declared host import called with arguments
-/// (LIBHBUI_PLAN Rules 46a, 48).
+/// **A call to an imported symbol**: a declared host import, named, with its
+/// arguments (LIBHBUI_PLAN Rules 46a, 48).
 ///
-/// **"Named" is load-bearing.** An effect is never anonymous: [`name`] is a
-/// host import's own exported name, resolved through the module's import chain
-/// and checked against the [`FuncSig`] that namespace declares. A carrier
-/// holding an arbitrary [`Expr`] would admit an anonymous effect and lose that
-/// check; a named one cannot be written without something to resolve to.
+/// This is all libtsx knows and all it is entitled to know. The parse resolved
+/// [`name`] through the module's import chain to an exported name in
+/// [`namespace`], and checked [`args`] against the [`FuncSig`] that namespace
+/// declares. What the call DOES on the other side is the embedding's model.
+///
+/// # It was called `NamedEffect`, and the name misled two ways
+///
+/// **"Effect" was a claim libtsx cannot make.** The word says the callee runs
+/// something - navigates, mutates, fires. libtsx never learns that: it sees an
+/// import, a callee, a signature and some literals. Naming the type after the
+/// embedding's reading of the callee is the same mistake [`ParserHost`] is
+/// named to avoid (Rule 52), and it has since become actively ambiguous -
+/// "effect" now also names a pipeline stage (`libeffects`) and a value
+/// accessor, neither of which is this.
+///
+/// **"Named" was defending the wrong thing.** It was there to say a call here
+/// is never anonymous, but that is a property of being a resolved IMPORT: a
+/// carrier holding an arbitrary [`Expr`] could not be an imported call at all,
+/// because there would be nothing to resolve. The new name carries that
+/// guarantee in the noun, so the adjective has no work left to do.
 ///
 /// **The identity is the QUALIFIED name** (Rule 48): [`namespace`] and [`name`]
 /// together, never the bare name. A bare name is only unique inside one grant,
 /// and there is more than one grant - a provider answers for as many namespaces
 /// as the embedding declares. Dropping the namespace here would make two
-/// namespaces exporting a `frobnicate` with different meanings the same effect
+/// namespaces exporting a `frobnicate` with different meanings the same call
 /// to every reader downstream, and a decoded tree carrying one of them would
 /// pass a grant check written against the other.
 ///
-/// [`name`]: NamedEffect::name
-/// [`namespace`]: NamedEffect::namespace
+/// [`name`]: ImportedCall::name
+/// [`namespace`]: ImportedCall::namespace
+/// [`args`]: ImportedCall::args
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct NamedEffect {
+pub struct ImportedCall {
     /// The **specifier it was imported from** - the granted host namespace, as
     /// the source spelled it and as the provider answered for it. Half the
     /// identity, and the half a bare name cannot recover.
@@ -283,9 +312,9 @@ pub struct NamedEffect {
     /// The call's arguments, in source order, lowered against the declared
     /// parameter types.
     ///
-    /// **Literals and binding paths**, and nothing else - an effect is not an
-    /// expression language (Rule 46a). A literal arrives as the `Expr::Lit*`
-    /// its declared parameter type chose; a binding path (`{id}`,
+    /// **Literals and binding paths**, and nothing else - this call grammar is
+    /// not an expression language (Rule 46a). A literal arrives as the
+    /// `Expr::Lit*` its declared parameter type chose; a binding path (`{id}`,
     /// `{props.user.name}`) arrives as [`Expr::Get`], which is the existing
     /// path-read variant and not a new one, so a decoder that never met a
     /// binding argument still knows the shape it arrives in. Everything that
@@ -581,7 +610,7 @@ pub enum Resolution<'a> {
     /// A **granted host namespace** and the signatures it declares - an import
     /// with no source, whose qualified name *is* its identity (Rule 48).
     ///
-    /// The only answer that supplies anything an effect call can resolve
+    /// The only answer that supplies anything an [`ImportedCall`] can resolve
     /// against.
     Host(&'a [FuncSig]),
 }
@@ -594,18 +623,18 @@ pub enum Resolution<'a> {
 /// current implementor would be libtsx naming its client, which is the shape
 /// that invites a dependency cycle even where there is not one yet.
 ///
-/// **It is a package provider, not an effects grant.** The parser's actual
+/// **It is a package provider, not a host-import grant.** The parser's actual
 /// question is *what does this specifier resolve to*, and one provider answers
-/// all three of Rule 48's answers ([`Resolution`]). Building it effects-first
-/// would need `set_script_resolver` next and a third setter after that - a
-/// family of setters inside the very interface introduced to stop one
+/// all three of Rule 48's answers ([`Resolution`]). Building it host-imports-
+/// first would need `set_script_resolver` next and a third setter after that -
+/// a family of setters inside the very interface introduced to stop one
 /// (Rule 49's defect one level down).
 ///
 /// **libtsx knows the SHAPE, never the NAMES.** This crate knows that an
 /// `on[A-Z]*` attribute carries a named call with literal arguments, that a
 /// `host:` specifier is spelled with a scheme ([`HOST_PREFIX`]), and that
 /// arguments are checked against a [`FuncSig`] it is handed. WHICH attribute
-/// names an event, WHICH imported name is an effect, and what lives under a
+/// names an event, WHAT a given imported name MEANS, and what lives under a
 /// given host namespace are the *model*, and the model belongs to the
 /// embedding. libtsx's own tests therefore run against a mock provider
 /// granting a vocabulary no embedding uses, so a name leaking down here fails
@@ -769,7 +798,7 @@ pub enum EffectError {
         imported: String,
     },
     /// The source imports a `host:` namespace and the parse context does not
-    /// offer the effect surface at all (Rule 49's `enable_effects`).
+    /// offer the effect surface at all (Rule 49's `enable_host_imports`).
     ///
     /// Distinct from [`EffectError::UnknownHostNamespace`], which is a load
     /// that offers effects and does not grant *this* one. The two say different
@@ -788,7 +817,7 @@ pub enum EffectError {
     /// `handlers = { onGrommet: frobnicate("x") }` would reach an element as *no
     /// attribute at all*. The attribute loop never sees an `on..` name, so
     /// every refusal above is blind to it, and the effect is erased by exactly
-    /// the route the [`AttrValue::NamedEffect`] producer exists to close.
+    /// the route the [`AttrValue::ImportedCall`] producer exists to close.
     ///
     /// It could not be honoured even if it were resolvable: an attribute set
     /// spread from a value cannot be checked against declared props, so
@@ -800,7 +829,7 @@ pub enum EffectError {
     },
     /// An ordinary JSX object binding cannot be represented by the owned
     /// expression vocabulary. Unlike an event refusal, this names the
-    /// attribute syntax itself and never changes `NamedEffect` semantics.
+    /// attribute syntax itself and never changes `ImportedCall` semantics.
     BindingSyntax {
         /// The ordinary attribute carrying the rejected expression.
         attr: String,
@@ -1371,7 +1400,7 @@ mod tests {
             // reads as a statement about what a real host grants.
             //
             // WHAT IS CHECKED, AND WHAT IS NOT. The signature check lives in
-            // `parse::effect_attr` and covers an effect **attribute**:
+            // `parse::imported_call_attr` and covers an effect **attribute**:
             // an `on..` attribute's value is resolved through its `ImportDecl`
             // to a namespace and an exported name, and its arguments checked
             // against the `FuncSig` the provider grants. Nothing checks a
@@ -1533,7 +1562,7 @@ mod tests {
                     // fixture in libtsx that spelled an embedding's real effect
                     // would be the leak this crate's tests exist to catch.
                     "onGrommet".into(),
-                    AttrValue::NamedEffect(NamedEffect {
+                    AttrValue::ImportedCall(ImportedCall {
                         namespace: "host:zork".into(),
                         name: "frobnicate".into(),
                         args: vec![Expr::LitStr("sprocket".into())],

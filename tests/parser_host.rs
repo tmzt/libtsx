@@ -32,7 +32,7 @@
 
 use libtsx::dag::{
     AttrValue, BindingExpr, BindingLiteral, EffectError, Expr, FieldDecl, FuncSig, ImportKind,
-    NamedEffect, Node, ParserHost, Resolution, TsxDocument, TypeShape,
+    ImportedCall, Node, ParserHost, Resolution, TsxDocument, TypeShape,
 };
 use libtsx::{ParseCtx, ParseError, parse_tsx};
 
@@ -213,7 +213,7 @@ fn the_parse_splits_host_from_imported_from_unimported() {
             <Widget id="a" onGrommet={{frobnicate("sprocket")}} />
             "#
         )),
-        AttrValue::NamedEffect(NamedEffect {
+        AttrValue::ImportedCall(ImportedCall {
             namespace: ZORK.into(),
             name: "frobnicate".into(),
             args: vec![Expr::LitStr("sprocket".into())],
@@ -329,7 +329,7 @@ fn an_event_binding_carries_a_named_effect() {
             <Widget id="a" onGrommet={{frobnicate("sprocket")}} />
             "#
         )),
-        AttrValue::NamedEffect(NamedEffect {
+        AttrValue::ImportedCall(ImportedCall {
             namespace: ZORK.into(),
             name: "frobnicate".into(),
             args: vec![Expr::LitStr("sprocket".into())],
@@ -346,7 +346,7 @@ fn an_event_binding_carries_a_named_effect() {
             <Widget id="a" onGrommet={{fb("sprocket")}} />
             "#
         )),
-        AttrValue::NamedEffect(NamedEffect {
+        AttrValue::ImportedCall(ImportedCall {
             namespace: ZORK.into(),
             name: "frobnicate".into(),
             args: vec![Expr::LitStr("sprocket".into())],
@@ -364,7 +364,7 @@ fn an_event_binding_carries_a_named_effect() {
             <Lamp id="a" onXyzzy={{wibble(250, true)}} />
             "#
         )),
-        AttrValue::NamedEffect(NamedEffect {
+        AttrValue::ImportedCall(ImportedCall {
             namespace: GRUE.into(),
             name: "wibble".into(),
             args: vec![Expr::LitS32(250), Expr::LitBool(true)],
@@ -409,7 +409,7 @@ fn an_event_binding_carries_a_named_effect() {
 /// downstream, which is precisely how an effect from a second vocabulary passes
 /// a grant check written against the first.
 ///
-/// The `assert_ne!` is the gate: drop `namespace` from [`NamedEffect`] and it is
+/// The `assert_ne!` is the gate: drop `namespace` from [`ImportedCall`] and it is
 /// the only assertion in the file that fails.
 #[test]
 fn the_same_name_under_two_namespaces_is_two_effects() {
@@ -426,7 +426,7 @@ fn the_same_name_under_two_namespaces_is_two_effects() {
 
     assert_eq!(
         from_zork,
-        AttrValue::NamedEffect(NamedEffect {
+        AttrValue::ImportedCall(ImportedCall {
             namespace: ZORK.into(),
             name: "frobnicate".into(),
             args: vec![Expr::LitStr("sprocket".into())],
@@ -434,7 +434,7 @@ fn the_same_name_under_two_namespaces_is_two_effects() {
     );
     assert_eq!(
         from_grue,
-        AttrValue::NamedEffect(NamedEffect {
+        AttrValue::ImportedCall(ImportedCall {
             namespace: GRUE.into(),
             name: "frobnicate".into(),
             args: vec![Expr::LitStr("sprocket".into())],
@@ -627,7 +627,7 @@ fn arguments_are_checked_against_the_declared_signature() {
 /// encoded shape changed to admit it.
 #[test]
 fn a_binding_path_is_an_effect_argument_and_lowers_to_a_path_read() {
-    let effect = |call: &str| -> NamedEffect {
+    let effect = |call: &str| -> ImportedCall {
         let doc = ctx()
             .parse_tsx(&format!(
                 r#"
@@ -640,7 +640,7 @@ fn a_binding_path_is_an_effect_argument_and_lowers_to_a_path_read() {
             panic!("one element");
         };
         match el.attr("onGrommet") {
-            Some(AttrValue::NamedEffect(e)) => e.clone(),
+            Some(AttrValue::ImportedCall(e)) => e.clone(),
             other => panic!("{other:?}"),
         }
     };
@@ -673,7 +673,7 @@ fn a_binding_path_is_an_effect_argument_and_lowers_to_a_path_read() {
     let Some(Node::Element(el)) = doc.root_nodes.first() else {
         panic!("one element");
     };
-    let Some(AttrValue::NamedEffect(effect)) = el.attr("onGrommet") else {
+    let Some(AttrValue::ImportedCall(effect)) = el.attr("onGrommet") else {
         panic!("an effect");
     };
     assert_eq!(
@@ -887,7 +887,7 @@ fn with_nothing_granted_an_effect_does_not_resolve() {
         "#
     );
     assert_eq!(
-        ParseCtx::builder().enable_effects().build().parse_tsx(&src),
+        ParseCtx::builder().enable_host_imports().build().parse_tsx(&src),
         Err(ParseError::Effect(EffectError::UnknownHostNamespace {
             source: ZORK.into(),
         }))
@@ -945,7 +945,7 @@ fn a_parsed_effect_survives_serde() {
     };
     assert_eq!(
         row.attr("onGrommet"),
-        Some(&AttrValue::NamedEffect(NamedEffect {
+        Some(&AttrValue::ImportedCall(ImportedCall {
             namespace: ZORK.into(),
             name: "frobnicate".into(),
             args: vec![Expr::LitStr("sprocket".into())],
@@ -987,7 +987,7 @@ fn one_context_serves_parse_app_as_well_as_parse_tsx() {
     };
     assert_eq!(
         widget.attr("onGrommet"),
-        Some(&AttrValue::NamedEffect(NamedEffect {
+        Some(&AttrValue::ImportedCall(ImportedCall {
             namespace: ZORK.into(),
             name: "frobnicate".into(),
             args: vec![Expr::LitStr("sprocket".into())],
@@ -1012,7 +1012,7 @@ fn one_context_serves_parse_app_as_well_as_parse_tsx() {
 /// **no binding**: the attribute loop only ever saw
 /// `JSXAttributeItem::Attribute`, so a spread fell off the end and the
 /// event-binding recognition was never consulted. That is the erasure the
-/// `NamedEffect` producer exists to close, arriving by the one route none of
+/// `ImportedCall` producer exists to close, arriving by the one route none of
 /// its refusals watch.
 #[test]
 fn a_spread_attribute_is_refused() {

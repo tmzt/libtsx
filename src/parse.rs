@@ -17,10 +17,10 @@
 //!   not a `HashMap`) so downstream node-graph serialization is stable.
 //! * Expression children (`{binding}`) and string-literal children are
 //!   captured (the old proof-of-concept dropped them).
-//! * **Effect bindings are produced here, not inferred later.** An
+//! * **Imported calls are produced here, not inferred later.** An
 //!   [`is_event_binding`] attribute's value is parsed as one call resolving to
-//!   a granted host import and emitted as [`AttrValue::NamedEffect`]; there is
-//!   no pass that later decides an [`AttrValue::Opaque`] was really an effect
+//!   a granted host import and emitted as [`AttrValue::ImportedCall`]; there is
+//!   no pass that later decides an [`AttrValue::Opaque`] was really a call
 //!   (LIBHBUI_PLAN Rules 46a, 48).
 //! * **Configuration is a context, not a second entry point.** What a load
 //!   offers a source is [`ParseCtx`], built through [`ParseCtx::builder`] and
@@ -28,7 +28,7 @@
 
 use crate::dag::{
     AttrValue, BindingExpr, BindingLiteral, BindingParam, EffectError, BlockArrow, BlockStmt,
-    Element, FieldDecl, FuncSig, ImportDecl, ImportKind, ImportName, InterfaceDecl, NamedEffect,
+    Element, FieldDecl, FuncSig, ImportDecl, ImportKind, ImportName, InterfaceDecl, ImportedCall,
     Node, ParserHost, Resolution, TsxDocument, TypeShape, is_event_binding, is_host_namespace,
 };
 use std::sync::Arc;
@@ -64,7 +64,7 @@ pub enum ParseError {
     /// to name, and inventing one would be a lie about where the text came
     /// from.
     Binding(String),
-    /// An effect binding or a host import that cannot mean what it says
+    /// An event binding or a host import that cannot mean what it says
     /// (LIBHBUI_PLAN Rules 46a, 48).
     Effect(EffectError),
     /// A source [`ParseCtx::parse_app`] required a root JSX element from and
@@ -140,7 +140,7 @@ pub fn parse_tsx(source: &str) -> Result<TsxDocument, Vec<String>> {
 /// beside `parse_tsx(src)` - and the cost of that shape had already been paid:
 /// [`ParseCtx::parse_app`]'s predecessor granted nothing, not by decision but
 /// because it was a third function nobody extended, so the multi-file path
-/// could not express an effect at all.
+/// could not express an imported call at all.
 ///
 /// **What it holds is a provider, not a grant** (Rule 52). The context asks its
 /// [`ParserHost`] what a specifier resolves to and never enumerates the
@@ -164,8 +164,8 @@ pub fn parse_tsx(source: &str) -> Result<TsxDocument, Vec<String>> {
 /// this doctest fail the next time a capability is added - which is the
 /// opposite of what it is here to defend.)
 ///
-/// The default offers **nothing**, which is the honest one: a source calling an
-/// effect it was never given has named a capability it does not have.
+/// The default offers **nothing**, which is the honest one: a source calling a
+/// host import it was never given has named a capability it does not have.
 #[derive(Clone, Default)]
 pub struct ParseCtx {
     /// The embedding's provider, or `None` for a load that offers no host
@@ -194,7 +194,7 @@ pub struct ParseCtxBuilder {
     retain_comments: bool,
 }
 
-/// The provider [`ParseCtxBuilder::enable_effects`] installs: the surface is
+/// The provider [`ParseCtxBuilder::enable_host_imports`] installs: the surface is
 /// offered, and it resolves nothing.
 struct NoGrants;
 
@@ -212,7 +212,7 @@ impl ParseCtxBuilder {
     /// source importing `host:x` gets [`EffectError::EffectsNotOffered`] in the
     /// first case and [`EffectError::UnknownHostNamespace`] in the second.
     /// Neither is a parse that quietly succeeds.
-    pub fn enable_effects(mut self) -> Self {
+    pub fn enable_host_imports(mut self) -> Self {
         self.host.get_or_insert_with(|| Arc::new(NoGrants));
         self
     }
@@ -221,7 +221,7 @@ impl ParseCtxBuilder {
     /// step.
     ///
     /// A provider is the stronger statement, so it implies
-    /// [`Self::enable_effects`] rather than needing it: a caller that sets a
+    /// [`Self::enable_host_imports`] rather than needing it: a caller that sets a
     /// host and forgets to enable would otherwise have configured a capability
     /// the parse ignores, which is the failure mode a single context exists to
     /// remove.
@@ -293,9 +293,9 @@ impl ParseCtx {
     ///
     /// An `on..` attribute ([`is_event_binding`]) is parsed as one call
     /// resolving through the module's import chain to a signature this context
-    /// grants, and becomes [`AttrValue::NamedEffect`]. Nothing about that is
-    /// deferred: an attribute that announced an effect and cannot carry one is
-    /// refused **here**, with a typed [`EffectError`], rather than surviving as
+    /// grants, and becomes [`AttrValue::ImportedCall`]. Nothing about that is
+    /// deferred: an attribute that announced an event binding and cannot carry
+    /// one is refused **here**, with a typed [`EffectError`], rather than surviving as
     /// an [`AttrValue::Opaque`] that silently does nothing (Rule 46a).
     pub fn parse_tsx(&self, source: &str) -> Result<TsxDocument, ParseError> {
         let allocator = Allocator::default();
@@ -316,8 +316,8 @@ impl ParseCtx {
             ));
         }
 
-        // Pass 0: the import edges, and the effect scope they open. This runs
-        // BEFORE any element is converted, because an effect name resolves against
+        // Pass 0: the import edges, and the import scope they open. This runs
+        // BEFORE any element is converted, because a callee resolves against
         // the whole module's imports rather than the ones written above the element
         // that calls it - and because a scope built as the elements go by would
         // depend on statement order for its answers.
@@ -328,7 +328,7 @@ impl ParseCtx {
             }
         }
         let low = Lowering {
-            scope: EffectScope::build(&imports, self)?,
+            scope: ImportScope::build(&imports, self)?,
             comments: self
                 .retain_comments
                 .then(|| Comments::of(source, &ret.program.comments)),
@@ -443,11 +443,11 @@ impl ParseCtx {
     /// are inside a screen's root element and travel with it.
     ///
     /// **The context is what it grants**, and that is the whole reason it
-    /// exists: every file here parses in *this* context, so an effect the
+    /// exists: every file here parses in *this* context, so a host import the
     /// embedding offered is available in a screen file. Its predecessor was a
     /// third free function that granted nothing - not by decision, but because
-    /// nobody extended it - and the multi-file path could not express an effect
-    /// at all (Rule 49).
+    /// nobody extended it - and the multi-file path could not express an
+    /// imported call at all (Rule 49).
     pub fn parse_app(&self, app_src: &str, screens: &[&str]) -> Result<TsxDocument, ParseError> {
         let app_doc = self.parse_tsx(app_src)?;
         let mut imports = app_doc.imports;
@@ -501,7 +501,7 @@ fn root_element(root_nodes: Vec<Node>) -> Option<Element> {
 /// dropped what it carried.
 struct Lowering<'a> {
     /// What each imported name was imported from (Rules 46a, 48).
-    scope: EffectScope<'a>,
+    scope: ImportScope<'a>,
     /// The source's comments, or `None` when this parse does not retain them.
     comments: Option<Comments<'a>>,
 }
@@ -580,7 +580,7 @@ impl<'a> Comments<'a> {
     }
 }
 
-// --- the effect scope (LIBHBUI_PLAN Rules 46a, 48) ----------------------------
+// --- the import scope (LIBHBUI_PLAN Rules 46a, 48) ----------------------------
 
 /// What a module's **import declarations** resolved to, asked of the
 /// embedding's [`ParserHost`] once per parse.
@@ -594,19 +594,19 @@ impl<'a> Comments<'a> {
 /// **The declaration and the signature are two things, chained here.** The
 /// declaration binds a local name; the signature types the call. Nothing may
 /// shortcut from a callee straight to a signature - that would be a name typed
-/// by something it was never imported from - so [`EffectScope::resolve`] walks
+/// by something it was never imported from - so [`ImportScope::resolve`] walks
 /// the declaration to a specifier first and only then to what the provider
 /// declares under it.
 ///
 /// **A name imported from a Script or a package is remembered too**
-/// ([`EffectScope::foreign`]). Only a host namespace can supply an effect, but
+/// ([`ImportScope::foreign`]). Only a host namespace can supply a callable, but
 /// "you never imported that" and "you imported that from something compiled"
 /// are different facts about the source, and the provider is what lets the
 /// parse tell them apart.
-struct EffectScope<'a> {
+struct ImportScope<'a> {
     /// `(local, namespace, signature)` for every name bound from a granted host
     /// namespace, in source order. The namespace is kept because it is half the
-    /// effect's identity (Rule 48) and the only half a callee cannot recover:
+    /// call's identity (Rule 48) and the only half a callee cannot recover:
     /// two granted namespaces may each export a `frobnicate`.
     granted: Vec<(&'a str, &'a str, &'a FuncSig)>,
     /// `(local, specifier)` for every name bound from a Script or a package.
@@ -624,11 +624,11 @@ enum Bound<'a> {
         /// What it declares this name to be.
         sig: &'a FuncSig,
     },
-    /// A Script or a package - imported, and unable to supply an effect.
+    /// A Script or a package - imported, and unable to supply a callable.
     Foreign(&'a str),
 }
 
-impl<'a> EffectScope<'a> {
+impl<'a> ImportScope<'a> {
     /// The scope a module's imports open, refusing the ways an import can fail
     /// to be one the parse can honour (Rules 48, 49, 52).
     ///
@@ -722,16 +722,16 @@ impl<'a> EffectScope<'a> {
     }
 }
 
-/// Lower an `on..` attribute's value into [`AttrValue::NamedEffect`], or refuse
+/// Lower an `on..` attribute's value into [`AttrValue::ImportedCall`], or refuse
 /// it (Rules 46a, 48).
 ///
 /// The attribute already announced itself as an event binding, so every exit
-/// from here is either an effect or an error - there is deliberately no path
-/// that yields [`AttrValue::Opaque`].
-fn effect_attr(
+/// from here is either an [`AttrValue::ImportedCall`] or an error - there is
+/// deliberately no path that yields [`AttrValue::Opaque`].
+fn imported_call_attr(
     attr: &str,
     value: Option<&JSXAttributeValue>,
-    scope: &EffectScope,
+    scope: &ImportScope,
 ) -> Result<AttrValue, EffectError> {
     let not_a_call = || EffectError::NotACall {
         attr: attr.to_string(),
@@ -821,10 +821,10 @@ fn effect_attr(
         args.push(lowered);
     }
 
-    Ok(AttrValue::NamedEffect(NamedEffect {
+    Ok(AttrValue::ImportedCall(ImportedCall {
         // The specifier the grant answered for - the other half of the
         // qualified name, so a reader downstream can tell two namespaces'
-        // same-named effects apart (Rule 48).
+        // same-named imports apart (Rule 48).
         namespace: namespace.to_string(),
         // The RESOLVED name: an alias is spent here and never travels.
         name: sig.name.clone(),
@@ -836,7 +836,7 @@ fn effect_attr(
 enum ArgFail {
     /// Neither a literal nor a binding path - a call, an arithmetic
     /// expression, a template literal, an arrow function, an object or array
-    /// literal. An effect call is not an expression language (Rule 46a); a
+    /// literal. An imported call is not an expression language (Rule 46a); a
     /// computation belongs in a Module.
     NotALiteral,
     /// A literal the declared parameter type cannot hold.
@@ -865,7 +865,7 @@ enum ArgFail {
 /// is not bought is a promise about its type, and pretending otherwise would be
 /// the more expensive of the two mistakes.
 ///
-/// **Optionality is modelled by the caller**, not here: [`effect_attr`] fills
+/// **Optionality is modelled by the caller**, not here: [`imported_call_attr`] fills
 /// parameters positionally and refuses a call that leaves a non-optional one
 /// unfilled, so this is only ever asked about an argument that was actually
 /// written.
@@ -1213,12 +1213,12 @@ fn convert_element(jsx: &JSXElement, low: &Lowering) -> Result<Element, EffectEr
             }
         };
         // **Detection and carriage are one step** (Rule 46a): the name
-        // announces an event binding, so the value is lowered as an effect
-        // right here. There is no later pass that reinterprets an
+        // announces an event binding, so the value is lowered as an imported
+        // call right here. There is no later pass that reinterprets an
         // `AttrValue::Opaque`, which is exactly why an `on..` attribute can
         // never quietly become one.
         let value = if is_event_binding(&key) {
-            effect_attr(&key, a.value.as_ref(), &low.scope)?
+            imported_call_attr(&key, a.value.as_ref(), &low.scope)?
         } else {
             match &a.value {
                 None => AttrValue::Bool(true),
@@ -1494,8 +1494,8 @@ fn child_form(expr: &Expression) -> &'static str {
 /// # The scope is empty, and that is the right scope
 ///
 /// A bare fragment declares no imports, so there is nothing for an
-/// [`EffectScope`] to hold. Nothing on this path consults one either: a scope
-/// is read only by the `on..` EVENT grammar ([`effect_attr`]), which resolves a
+/// [`ImportScope`] to hold. Nothing on this path consults one either: a scope
+/// is read only by the `on..` EVENT grammar ([`imported_call_attr`]), which resolves a
 /// callee to a granted host import. An ordinary binding expression carries its
 /// callee as a name, and is the same node whatever a module imported.
 #[allow(rustdoc::private_intra_doc_links)]
@@ -1522,7 +1522,7 @@ impl TryFrom<&str> for BindingExpr {
         };
         lower_binding_expr(
             &statement.expression,
-            &EffectScope {
+            &ImportScope {
                 granted: Vec::new(),
                 foreign: Vec::new(),
             },
@@ -1539,7 +1539,7 @@ impl TryFrom<&str> for BindingExpr {
 /// **It takes one expression subtree root and no document**, which is the whole
 /// reason `impl TryFrom<&str> for BindingExpr` above can exist: the seam was
 /// always here, and only its `&oxc_ast::Expression` parameter kept it private.
-fn lower_binding_expr(expr: &Expression, _scope: &EffectScope) -> Result<BindingExpr, String> {
+fn lower_binding_expr(expr: &Expression, _scope: &ImportScope) -> Result<BindingExpr, String> {
     use BindingExpr as B;
     let expr = unparen(expr);
     match expr {
@@ -1751,7 +1751,7 @@ fn lower_binding_expr(expr: &Expression, _scope: &EffectScope) -> Result<Binding
 /// `LogicalExpression` with the `||` operator, which the recursion refuses.
 fn flatten_coalesce(
     expr: &Expression,
-    scope: &EffectScope,
+    scope: &ImportScope,
     out: &mut Vec<BindingExpr>,
 ) -> Result<(), String> {
     if let Expression::LogicalExpression(logical) = unparen(expr) {
@@ -1789,7 +1789,7 @@ fn static_call_parts(expr: &Expression) -> Result<(String, String), String> {
 
 fn lower_async_arrow(
     arrow: &ArrowFunctionExpression,
-    scope: &EffectScope,
+    scope: &ImportScope,
 ) -> Result<BlockArrow, String> {
     if arrow.expression {
         return Err("async expression-bodied arrows are unsupported; use an explicit block".into());
@@ -1831,7 +1831,7 @@ fn arrow_params(arrow: &ArrowFunctionExpression) -> Result<Vec<BindingParam>, St
 
 fn lower_block_body(
     statements: &[Statement],
-    scope: &EffectScope,
+    scope: &ImportScope,
 ) -> Result<Vec<BlockStmt>, String> {
     let mut out = Vec::new();
     for statement in statements {
@@ -1842,7 +1842,7 @@ fn lower_block_body(
 
 fn lower_block_statement(
     statement: &Statement,
-    scope: &EffectScope,
+    scope: &ImportScope,
 ) -> Result<Vec<BlockStmt>, String> {
     use BlockStmt as S;
     match statement {

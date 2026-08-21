@@ -23,7 +23,7 @@ use crate::dag::{
 ///
 /// The output preserves the semantic structure of the document: imports in order,
 /// interfaces in order, and the element tree with all attributes and children in
-/// their authored order. Type arguments, effect bindings, and all attribute value
+/// their authored order. Type arguments, imported calls, and all attribute value
 /// variants are correctly re-emitted.
 pub fn emit_tsx_document(doc: &TsxDocument) -> String {
     let mut out = String::new();
@@ -234,15 +234,15 @@ fn emit_attr_value(out: &mut String, value: &AttrValue) {
             emit_binding_expr(out, expr);
             out.push('}');
         }
-        AttrValue::NamedEffect(effect) => {
+        AttrValue::ImportedCall(call) => {
             out.push_str("={");
-            // Emit just the effect name, not the namespace.
+            // Emit just the imported name, not the namespace.
             // The namespace is established by the import and should not appear
             // in the JSX expression (e.g., emit "navigate(...)" not "host:effects.navigate(...)")
-            out.push_str(&effect.name);
+            out.push_str(&call.name);
             out.push('(');
 
-            for (i, arg) in effect.args.iter().enumerate() {
+            for (i, arg) in call.args.iter().enumerate() {
                 if i > 0 {
                     out.push_str(", ");
                 }
@@ -294,7 +294,7 @@ impl From<&BindingExpr> for String {
     }
 }
 
-/// Emit one owned object-binding expression. Unlike [`AttrValue::NamedEffect`],
+/// Emit one owned object-binding expression. Unlike [`AttrValue::ImportedCall`],
 /// this vocabulary is not used by the legacy event parser; it is emitted only
 /// when a caller has already constructed the owned semantic IR.
 ///
@@ -725,7 +725,7 @@ fn emit_block_statements(out: &mut String, statements: &[BlockStmt], indent: usi
     }
 }
 
-/// Emit an expression (for effect arguments).
+/// Emit an expression (for imported-call arguments).
 fn emit_expr(out: &mut String, expr: &crate::dag::Expr) {
     use crate::dag::Expr;
 
@@ -735,7 +735,7 @@ fn emit_expr(out: &mut String, expr: &crate::dag::Expr) {
         Expr::LitS64(n) => out.push_str(&n.to_string()),
         Expr::LitF32(n) => out.push_str(&n.to_string()),
         Expr::LitF64(n) => out.push_str(&n.to_string()),
-        // The same writer the binding vocabulary uses: an effect argument is
+        // The same writer the binding vocabulary uses: a call argument is
         // spliced into a JSX expression container, so it is JavaScript text and
         // takes JavaScript's escapes. (An `AttrValue::Str` is NOT - it is a JSX
         // attribute string, where a backslash is a backslash and `"` would need
