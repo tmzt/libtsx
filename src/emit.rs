@@ -808,6 +808,19 @@ fn emit_type_shape(out: &mut String, shape: &TypeShape) {
         TypeShape::S64 => out.push_str("bigint"),
         TypeShape::F32 => out.push_str("number"),
         TypeShape::F64 => out.push_str("number"),
+        // **The unsigned pair widens too, and `U64` does NOT take `bigint`.**
+        // TypeScript has no unsigned type, so neither has a spelling here - the
+        // same position `S32` and `F32` are in, and they take the same answer.
+        //
+        // `bigint` is the tempting one for `U64` because it keeps the width,
+        // and it is the wrong answer: `type_shape` lowers `bigint` to `S64`, so
+        // the emitted text would re-parse SIGNED while looking like a clean
+        // round trip, and a u64 past i64::MAX would come back negative. A shape
+        // that widens to `F64` is a loss the reader can see coming from the
+        // rule above; a shape that silently changes sign is the defect the
+        // unsigned variants were added to prevent.
+        TypeShape::U32 => out.push_str("number"),
+        TypeShape::U64 => out.push_str("number"),
         TypeShape::String => out.push_str("string"),
         TypeShape::List(inner) => {
             out.push_str("Array<");

@@ -846,6 +846,14 @@ enum ArgFail {
 /// Lower one argument **against its declared type**, so the signature decides
 /// what a number becomes rather than the parser guessing (Rule 48).
 ///
+/// **The declared type chooses the width, and a literal that cannot be
+/// represented in it exactly is [`ArgFail::WrongType`] - never a rounded,
+/// truncated or wrapped value.** That is this function's contract, not a
+/// property of one arm: it is what stops a silently rounded id or navigation
+/// destination from being written into the graph and only failing much later,
+/// somewhere with no view of the source text that caused it. Refusing costs an
+/// error at parse time, which is the cheap end of that trade.
+///
 /// Two forms are admitted, and they are two forms rather than one:
 ///
 /// * a **literal**, checked against the declared [`TypeShape`];
@@ -892,6 +900,13 @@ fn lower_arg(expr: &Expression, declared: &TypeShape) -> Result<crate::dag::Expr
                 .ok_or(ArgFail::WrongType),
             TypeShape::F32 => Ok(E::LitF32(n.value as f32)),
             TypeShape::F64 => Ok(E::LitF64(n.value)),
+            // NO `U32`/`U64` ARM ON PURPOSE. Neither has an authored spelling
+            // (see `dag::TypeShape`), so no TS parameter can declare one and no
+            // literal can reach it - an arm here would have no consumer and no
+            // test that could exercise it, which is the speculative half this
+            // project refuses. They fall to the catch-all and are refused,
+            // which is the correct answer while nothing can be declared as
+            // them. The arm lands with the spelling, bounded the way `S64` is.
             _ => Err(ArgFail::WrongType),
         },
         // A BINDING PATH. `expr_path` recovers an identifier or a static member
@@ -1096,6 +1111,17 @@ fn type_shape(ty: &TSType) -> Result<TypeShape, String> {
         // TS `number` lowers to F64 by default (see dag::TypeShape docs).
         TSType::TSNumberKeyword(_) => TypeShape::F64,
         TSType::TSBigIntKeyword(_) => TypeShape::S64,
+        // THESE TWO ARMS ARE THE WHOLE TS->TypeShape NUMERIC SURFACE. `bigint`
+        // above and `number` on the line before it are the only ways a numeric
+        // TypeShape is reached from source, so `S32`, `F32`, `U32` and `U64`
+        // have NO authored spelling and arrive only from a declared `FuncSig`
+        // or another non-TS producer. TypeScript has neither unsigned types nor
+        // width annotations, so a spelling needs a convention the language does
+        // not supply - a branded alias, a declared alias this parser
+        // recognises, or a decorator - and that choice is DEFERRED rather than
+        // guessed at (`dag::TypeShape`). This is where it lands when it is
+        // made; nothing above should quietly grow a fifth reading in the
+        // meantime.
         TSType::TSStringKeyword(_) => TypeShape::String,
         TSType::TSArrayType(arr) => TypeShape::List(Box::new(type_shape(&arr.element_type)?)),
         TSType::TSParenthesizedType(p) => type_shape(&p.type_annotation)?,

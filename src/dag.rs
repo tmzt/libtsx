@@ -1468,6 +1468,13 @@ pub struct FieldDecl {
 }
 
 /// The shape of a type as it crosses the edge. Maps 1:1 onto WIT types.
+///
+/// **`S` is SIGNED - WIT's spelling, not Rust's.** WIT writes the pair as
+/// `s32`/`u32` where Rust writes it `i32`/`u32`, so [`TypeShape::S32`] and Rust
+/// `i32` are the same type, and [`TypeShape::U32`] is the other half of that
+/// pair. Recorded here because the letter reads like an abbreviation for
+/// "scalar" or "size" to anyone who has not met WIT, and the wrong reading
+/// costs a sign.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum TypeShape {
     Bool,
@@ -1496,6 +1503,42 @@ pub enum TypeShape {
         constructor: String,
         args: Vec<TypeShape>,
     },
+    // THE UNSIGNED PAIR. Both **appended last**, for the reason `Apply` states:
+    // TypeShape is persisted positionally, so a variant inserted next to `S32`
+    // where it reads better would change what every already-committed byte
+    // decodes to. Appending keeps old bytes readable, which is the whole of the
+    // placement rule.
+    //
+    // WHY UNSIGNED EXISTS AT ALL. This is the umbrella type consumed by
+    // `nocap-witgen`, and the WIT it generates is already unsigned:
+    // `deps/libnocap/wit/state.wit` and `net.wit` use `u8` (`list<u8>` payloads
+    // and bodies), `u16` (an HTTP status), and `u64` - the last carrying the
+    // `{hi, lo}` pair a 128-bit nocap handle is split into, because "WIT has no
+    // u128" (state.wit's own header). Without these variants the vocabulary
+    // cannot describe the interface it emits, and every such value would have
+    // to arrive as `S32`/`S64`. An unsigned value silently becoming signed is
+    // the same class of defect as an integer silently becoming a float: the
+    // declaration is quietly replaced by a different one, and the loss shows up
+    // as a wrapped handle half or a negative length far from here.
+    //
+    // THE AUTHORING SPELLING IS DEFERRED, NOT OMITTED. `type_shape` in
+    // `parse.rs` reaches this enum from TS source in exactly two places -
+    // `TSBigIntKeyword => S64`, and plain `number` defaulting to `F64` - so
+    // `S32`, `F32` and now `U32`/`U64` have NO authored spelling and are
+    // reachable only when a TypeShape arrives from somewhere other than TS
+    // text. TypeScript has neither unsigned types nor width annotations, so a
+    // spelling needs a convention the language does not supply: a branded
+    // alias, a declared alias the system recognises, or a decorator. The
+    // capability is wanted; no host language hands us the spelling; the choice
+    // of which is deliberately left open rather than guessed at here, because
+    // an authoring convention invented to fill a blank is the one thing a
+    // corpus of user source cannot later be talked out of.
+    /// WIT `u32`. No authored spelling yet - see the note above.
+    U32,
+    /// WIT `u64`, the width the generated interface leans on hardest: a
+    /// nocap handle crosses as two of these. No authored spelling yet - see
+    /// the note above.
+    U64,
 }
 
 /// A function signature (handler export or host import).
