@@ -42,7 +42,7 @@
 //! one [`Element`] as its UI (Rule 18) — both of which require the element
 //! tree to be a `dag` type, not a parse-result type.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// A node in the code graph. The umbrella type consumed by `nocap-witgen`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -507,6 +507,219 @@ pub enum BindingExpr {
         params: Vec<BindingParam>,
         body: Box<BindingExpr>,
     },
+}
+
+/// **A top-level identifier an expression CALLS as a value** - the `it` of
+/// `it()`, the `design` of `design().isAuthoring`.
+///
+/// # Why an identifier registry belongs in THIS vocabulary
+///
+/// [`BindingExpr`]'s rule is that a variant is justified by TypeScript having
+/// the FORM and by nothing else, never by a consumer wanting a behaviour. This
+/// type exists to be a parameter of that enum, so it answers to the same rule.
+/// The form it names is **"a call to an identifier, optionally with a member on
+/// it"** - which TypeScript has for every identifier there is. Nothing about
+/// that shape is a reading. What an identifier MEANS - which scope answers
+/// `it()`, whether `design()` varies by surface - stays with the lowering that
+/// asks, `libhbui::attr`, exactly as the rule requires.
+///
+/// The contrast is `Map { source, param, body }`, removed from [`BindingExpr`]
+/// at the cost of a version bump (see its doc): `Map` RESTRUCTURED a call into
+/// three named parts, a shape TypeScript does not have and only a comprehension
+/// READING produces. A symbol variant restructures nothing. A symbol value
+/// spelled `It` and one spelled `Named("it")` denote the same expression, and
+/// neither of them says what `it` means.
+///
+/// # The set is OPEN, and [`Named`](ObjectSymbol::Named) is what says so
+///
+/// The model is HTTP HEADERS. A header's wire value IS its name: `Content-Type`
+/// travels as those characters, well-known names get interned constants, anyone
+/// may send `X-Anything`, and the registry grows without any message becoming
+/// unreadable - and nobody reads a library's `CONTENT_TYPE` constant as that
+/// library adopting a caller's semantics. The variants below are exactly that:
+/// a REGISTRY of the spellings Highbay writes, a compression of a string rather
+/// than an interpretation of one. Which identifiers are worth interning is a
+/// convenience judgement, not a semantic one, and another embedding spells its
+/// own through `Named` and loses nothing.
+///
+/// **That is what this prevents**: an enum without `Named` would make adding a
+/// variant this crate deciding which identifiers may EXIST - a claim about
+/// meaning wearing a claim about form, which is the one thing the vocabulary
+/// rule is here to keep out.
+///
+/// # The encoding is the IDENTIFIER, decided rather than defaulted
+///
+/// `Serialize`/`Deserialize` are hand-written, and the header analogy is the
+/// reason: the bytes are `"it"` whether the value is [`It`](ObjectSymbol::It)
+/// or `Named("it")`, so PROMOTING an identifier into the interned set changes
+/// no committed byte. A derive would encode POSITIONALLY under postcard - which
+/// is how `AttrValue` reaches disk - and then one promotion would make
+/// committed `.hbdef` bytes and a fresh parse two different values for one
+/// expression, costing a fixture regeneration every time the registry grows. A
+/// derive is what you get by NOT deciding; this is the decision, and it is
+/// pinned by `a_symbol_encodes_as_its_identifier_whether_or_not_it_is_interned`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ObjectSymbol {
+    /// `it()` - the enclosing item.
+    It,
+    /// `listItem()` - the iterator's current position, as against its fields.
+    ListItem,
+    /// `design()` - the surface being drawn on.
+    Design,
+    /// `uiSite()` - what this instance is DOING: interaction state owned at the
+    /// site.
+    UiSite,
+    /// `uiComponent()` - the call site that instanced this body, and so what
+    /// the caller handed it.
+    UiComponent,
+    /// Any other identifier, spelled as written.
+    ///
+    /// Not a refusal and not an error. An identifier with no interned variant
+    /// is carried here and means whatever the consumer asking makes of it; a
+    /// recognizer therefore never has to decide that an unknown callee is
+    /// wrong, which is a judgement only the consumer holding a scope can make.
+    Named(String),
+}
+
+impl ObjectSymbol {
+    /// The identifier [`It`](ObjectSymbol::It) is spelled with.
+    pub const IT: &'static str = "it";
+    /// The identifier [`ListItem`](ObjectSymbol::ListItem) is spelled with.
+    pub const LIST_ITEM: &'static str = "listItem";
+    /// The identifier [`Design`](ObjectSymbol::Design) is spelled with.
+    pub const DESIGN: &'static str = "design";
+    /// The identifier [`UiSite`](ObjectSymbol::UiSite) is spelled with.
+    pub const UI_SITE: &'static str = "uiSite";
+    /// The identifier [`UiComponent`](ObjectSymbol::UiComponent) is spelled
+    /// with.
+    pub const UI_COMPONENT: &'static str = "uiComponent";
+
+    /// **The identifier this symbol IS** - the authored spelling and the wire
+    /// value, which are one string (see the type doc).
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::It => Self::IT,
+            Self::ListItem => Self::LIST_ITEM,
+            Self::Design => Self::DESIGN,
+            Self::UiSite => Self::UI_SITE,
+            Self::UiComponent => Self::UI_COMPONENT,
+            Self::Named(name) => name.as_str(),
+        }
+    }
+
+    /// The symbol `name` spells - interned when it is a registered spelling,
+    /// [`Named`](ObjectSymbol::Named) when it is not.
+    ///
+    /// **Total by construction, and that is the point.** There is no identifier
+    /// this refuses, so interning can never turn an authored expression into a
+    /// parse error, and a later promotion can never change which expressions
+    /// are accepted - only which variant carries one.
+    pub fn intern(name: &str) -> Self {
+        match name {
+            Self::IT => Self::It,
+            Self::LIST_ITEM => Self::ListItem,
+            Self::DESIGN => Self::Design,
+            Self::UI_SITE => Self::UiSite,
+            Self::UI_COMPONENT => Self::UiComponent,
+            other => Self::Named(other.to_string()),
+        }
+    }
+}
+
+/// **One member hop off an expression** - the `isAuthoring` of
+/// `design().isAuthoring`, the `props` and the `textColor` of
+/// `uiComponent().props.textColor`.
+///
+/// The same shape as [`ObjectSymbol`] and there for the same reasons: it names
+/// a member ACCESS, which TypeScript has for any identifier, and the interned
+/// variants are a registry of the spellings Highbay writes rather than a claim
+/// about which members exist. Read that type's doc for the vocabulary rule, the
+/// HTTP-header model, and why the encoding is the identifier.
+///
+/// **`Named` is load-bearing HERE for a stronger reason than there.** A
+/// record's fields are arbitrary - they come from whatever interface an author
+/// declared - so no enum could ever enumerate them, and a closed one would make
+/// `it().customerRef` unrepresentable. The interned set is exactly the members
+/// a reader in this workspace already spells as a constant.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum PropertyAccessor {
+    /// `.value` - what an object carries, as against what it IS.
+    Value,
+    /// `.id` - an object's identity.
+    Id,
+    /// `.index` - a position within an iteration.
+    Index,
+    /// `.props` - the namespace a call site's arguments hang under, as in
+    /// `uiComponent().props.NAME`.
+    Props,
+    /// `.isAuthoring` - whether the surface is being authored rather than run.
+    IsAuthoring,
+    /// Any other member, spelled as written - a record's own fields, which are
+    /// arbitrary by definition.
+    Named(String),
+}
+
+impl PropertyAccessor {
+    /// The identifier [`Value`](PropertyAccessor::Value) is spelled with.
+    pub const VALUE: &'static str = "value";
+    /// The identifier [`Id`](PropertyAccessor::Id) is spelled with.
+    pub const ID: &'static str = "id";
+    /// The identifier [`Index`](PropertyAccessor::Index) is spelled with.
+    pub const INDEX: &'static str = "index";
+    /// The identifier [`Props`](PropertyAccessor::Props) is spelled with.
+    pub const PROPS: &'static str = "props";
+    /// The identifier [`IsAuthoring`](PropertyAccessor::IsAuthoring) is spelled
+    /// with.
+    pub const IS_AUTHORING: &'static str = "isAuthoring";
+
+    /// **The identifier this accessor IS** - see [`ObjectSymbol::as_str`].
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Value => Self::VALUE,
+            Self::Id => Self::ID,
+            Self::Index => Self::INDEX,
+            Self::Props => Self::PROPS,
+            Self::IsAuthoring => Self::IS_AUTHORING,
+            Self::Named(name) => name.as_str(),
+        }
+    }
+
+    /// The accessor `name` spells - see [`ObjectSymbol::intern`], which this is
+    /// the member-side twin of.
+    pub fn intern(name: &str) -> Self {
+        match name {
+            Self::VALUE => Self::Value,
+            Self::ID => Self::Id,
+            Self::INDEX => Self::Index,
+            Self::PROPS => Self::Props,
+            Self::IS_AUTHORING => Self::IsAuthoring,
+            other => Self::Named(other.to_string()),
+        }
+    }
+}
+
+impl Serialize for ObjectSymbol {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for ObjectSymbol {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(Self::intern(&String::deserialize(deserializer)?))
+    }
+}
+
+impl Serialize for PropertyAccessor {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for PropertyAccessor {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(Self::intern(&String::deserialize(deserializer)?))
+    }
 }
 
 /// A named parameter of either arrow spelling - [`BlockArrow`]'s and
@@ -1889,5 +2102,72 @@ mod tests {
         let json = r#"{ "name": "f", "params": [] }"#;
         let sig: FuncSig = serde_json::from_str(json).expect("deserialize");
         assert_eq!(sig.result, None);
+    }
+
+    /// **Every registered spelling survives the round trip**, in both
+    /// directions and for both enums.
+    ///
+    /// The half worth pinning is `intern(as_str(x)) == x`: an interned variant
+    /// whose constant disagreed with its `as_str` arm would encode as one
+    /// identifier and decode as a different variant, which is the silent
+    /// corruption a positional encoding was rejected to avoid.
+    #[test]
+    fn an_interned_spelling_round_trips_through_its_identifier() {
+        for symbol in [
+            ObjectSymbol::It,
+            ObjectSymbol::ListItem,
+            ObjectSymbol::Design,
+            ObjectSymbol::UiSite,
+            ObjectSymbol::UiComponent,
+            ObjectSymbol::Named("whateverElse".into()),
+        ] {
+            assert_eq!(ObjectSymbol::intern(symbol.as_str()), symbol);
+        }
+        for accessor in [
+            PropertyAccessor::Value,
+            PropertyAccessor::Id,
+            PropertyAccessor::Index,
+            PropertyAccessor::Props,
+            PropertyAccessor::IsAuthoring,
+            PropertyAccessor::Named("customerRef".into()),
+        ] {
+            assert_eq!(PropertyAccessor::intern(accessor.as_str()), accessor);
+        }
+    }
+
+    /// **The encoding is the identifier, and a PROMOTION changes no byte.**
+    ///
+    /// The whole point of the hand-written impls (see [`ObjectSymbol`]'s doc):
+    /// `Named("it")` and `It` encode identically, so moving an identifier into
+    /// the interned set leaves every committed graph readable and equal. Under
+    /// a derived `Serialize` these two would encode as different variant
+    /// indices, and the promotion would silently make stored bytes and a fresh
+    /// parse two different values for one authored expression.
+    #[test]
+    fn a_symbol_encodes_as_its_identifier_whether_or_not_it_is_interned() {
+        let interned = serde_json::to_string(&ObjectSymbol::It).expect("serialize");
+        let named =
+            serde_json::to_string(&ObjectSymbol::Named("it".into())).expect("serialize");
+        assert_eq!(interned, "\"it\"");
+        assert_eq!(interned, named, "a promotion would have changed the bytes");
+        assert_eq!(
+            serde_json::from_str::<ObjectSymbol>(&named).expect("deserialize"),
+            ObjectSymbol::It,
+            "a registered identifier decodes onto its interned variant",
+        );
+        assert_eq!(
+            serde_json::from_str::<ObjectSymbol>("\"somethingElse\"").expect("deserialize"),
+            ObjectSymbol::Named("somethingElse".into()),
+            "an unregistered identifier decodes without loss",
+        );
+
+        assert_eq!(
+            serde_json::to_string(&PropertyAccessor::IsAuthoring).expect("serialize"),
+            "\"isAuthoring\"",
+        );
+        assert_eq!(
+            serde_json::from_str::<PropertyAccessor>("\"props\"").expect("deserialize"),
+            PropertyAccessor::Props,
+        );
     }
 }
