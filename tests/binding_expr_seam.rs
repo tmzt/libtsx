@@ -20,7 +20,7 @@
 #![cfg(feature = "parse")]
 
 use libtsx::ParseError;
-use libtsx::dag::{BindingExpr, BindingLiteral};
+use libtsx::dag::{BindingExpr, LiteralValue};
 
 /// Text -> node -> text, which is the direction an author's edit travels.
 fn round_trips(source: &str) -> BindingExpr {
@@ -92,7 +92,7 @@ fn a_string_literal_is_emitted_escaped() {
         let expr = round_trips(source);
         assert_eq!(
             expr,
-            BindingExpr::Literal(BindingLiteral::String(value.into())),
+            BindingExpr::Literal(LiteralValue::String(value.into())),
             "{source} did not lower to the string it spells"
         );
     }
@@ -121,7 +121,7 @@ fn a_record_crosses_the_seam_although_a_bare_brace_opens_a_block() {
         BindingExpr::try_from("{a: 1}"),
         Ok(BindingExpr::Record(vec![(
             "a".into(),
-            BindingExpr::Literal(BindingLiteral::Number(1.0))
+            BindingExpr::Literal(LiteralValue::Int64(1))
         )]))
     );
     // The known-bad twin: the wrapper is not a licence to accept a STATEMENT.
@@ -190,7 +190,7 @@ fn a_parenthesised_member_chain_is_one_name() {
     }
 
     // The boundary, and the over-correction this would be if it went further: a
-    // base that is not a name stays a `Member` and keeps the parentheses emit
+    // base that is not a name stays a `MemberOf` and keeps the parentheses emit
     // gives it. `design().isAuthoring` is the shape the variant exists for.
     // (Each source below is emit's OWN spelling, so `round_trips` can assert
     // the text came back unchanged: a non-primary base keeps the parentheses
@@ -199,7 +199,7 @@ fn a_parenthesised_member_chain_is_one_name() {
     for source in ["h().x", "design().isAuthoring", "(a ?? b).c", "([1, 2]).length"] {
         let expr = round_trips(source);
         assert!(
-            matches!(expr, BindingExpr::Member { .. }),
+            matches!(expr, BindingExpr::MemberOf(..)),
             "{source} stopped being a member chain: {expr:?}"
         );
     }

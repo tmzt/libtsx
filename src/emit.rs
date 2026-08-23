@@ -15,8 +15,8 @@
 //! none - which is the publish path, and is why no `.hbdef` can contain one.
 
 use crate::dag::{
-    AttrValue, BindingExpr, BindingLiteral, BindingParam, BlockArrow, BlockStmt, Element,
-    ImportDecl, InterfaceDecl, Node, TsxDocument, TypeShape,
+    AttrValue, BindingExpr, BindingParam, BlockArrow, BlockStmt, Element,
+    ImportDecl, InterfaceDecl, LiteralValue, Node, TsxDocument, TypeShape,
 };
 
 /// Emit a [`TsxDocument`] back to TSX source text.
@@ -263,11 +263,11 @@ fn emit_attr_value(out: &mut String, value: &AttrValue) {
 /// over the image of the parse.**
 ///
 /// ```
-/// use libtsx::dag::{BindingExpr, BindingLiteral};
+/// use libtsx::dag::{BindingExpr, LiteralValue};
 ///
 /// let expr = BindingExpr::Coalesce(vec![
 ///     BindingExpr::Path(vec!["props".into(), "label".into()]),
-///     BindingExpr::Literal(BindingLiteral::String("none".into())),
+///     BindingExpr::Literal(LiteralValue::String("none".into())),
 /// ]);
 /// assert_eq!(String::from(&expr), r#"props.label ?? "none""#);
 /// ```
@@ -303,11 +303,14 @@ impl From<&BindingExpr> for String {
 fn emit_binding_expr(out: &mut String, expr: &BindingExpr) {
     match expr {
         BindingExpr::Literal(literal) => match literal {
-            BindingLiteral::Bool(value) => out.push_str(if *value { "true" } else { "false" }),
-            BindingLiteral::Number(value) => out.push_str(&value.to_string()),
-            BindingLiteral::String(value) => push_string_literal(out, value),
-            BindingLiteral::Null => out.push_str("null"),
+            LiteralValue::Bool(value) => out.push_str(if *value { "true" } else { "false" }),
+            LiteralValue::Int32(value) => out.push_str(&value.to_string()),
+            LiteralValue::Int64(value) => out.push_str(&value.to_string()),
+            LiteralValue::Float32(value) => push_float_literal(out, f64::from(*value)),
+            LiteralValue::Float64(value) => push_float_literal(out, *value),
+            LiteralValue::String(value) => push_string_literal(out, value),
         },
+        BindingExpr::Null => out.push_str("null"),
         BindingExpr::Path(path) => out.push_str(&path.join(".")),
         BindingExpr::Array(items) => {
             out.push('[');
@@ -377,12 +380,14 @@ fn emit_binding_expr(out: &mut String, expr: &BindingExpr) {
             out.push_str(" : ");
             emit_operand(out, other);
         }
-        BindingExpr::Member { base, path } => {
+        BindingExpr::SymbolValue(symbol) => {
+            out.push_str(symbol.as_str());
+            out.push_str("()");
+        }
+        BindingExpr::MemberOf(base, member) => {
             emit_member_base(out, base);
-            for segment in path {
-                out.push('.');
-                out.push_str(segment);
-            }
+            out.push('.');
+            out.push_str(member.as_str());
         }
         BindingExpr::Eq {
             left,
@@ -398,6 +403,32 @@ fn emit_binding_expr(out: &mut String, expr: &BindingExpr) {
             out.push_str(" => ");
             emit_arrow_body(out, body);
         }
+    }
+}
+
+/// **A FLOAT's text, kept a float.**
+///
+/// `f64`'s `Display` writes `1.0` as `1`, and `1` re-parses as
+/// [`LiteralValue::Int64`] - so emitting it bare would break the law this
+/// module states, that emit and parse are inverse OVER THE IMAGE OF THE PARSE.
+/// The parse now distinguishes an integral token from a decimal one, so the
+/// emit has to write a decimal token for a decimal value, whether or not the
+/// value happens to be whole.
+///
+/// The `.0` is appended only when the rendered text is a bare integer -
+/// anything with a point, an exponent or a non-finite spelling already
+/// re-parses as what it is (or, for a non-finite, is not a TypeScript numeric
+/// literal at all and could not have come from a parse).
+fn push_float_literal(out: &mut String, value: f64) {
+    let text = value.to_string();
+    let integral = text
+        .strip_prefix('-')
+        .unwrap_or(&text)
+        .bytes()
+        .all(|b| b.is_ascii_digit());
+    out.push_str(&text);
+    if integral {
+        out.push_str(".0");
     }
 }
 
@@ -547,11 +578,10 @@ fn begins_with_brace(expr: &BindingExpr) -> bool {
         BindingExpr::Cond { cond, .. } => is_primary(cond) && begins_with_brace(cond),
         BindingExpr::Eq { left, .. } => is_primary(left) && begins_with_brace(left),
         // A member chain leads with its base, through the stricter predicate.
-        BindingExpr::Member { base, .. } => {
-            is_bare_member_base(base) && begins_with_brace(base)
-        }
-        // Literal, Path, Array, Call, Arrow and Async each open with a token of
-        // their own - a value, a name, `[`, `(` or `async`.
+        BindingExpr::MemberOf(base, _) => is_bare_member_base(base) && begins_with_brace(base),
+        // Literal, Null, Path, Array, Call, SymbolValue, Arrow and Async each
+        // open with a token of their own - a value, a keyword, a name, `[`,
+        // `(` or `async`.
         _ => false,
     }
 }
@@ -612,7 +642,10 @@ fn emit_member_base(out: &mut String, expr: &BindingExpr) {
 fn is_bare_member_base(expr: &BindingExpr) -> bool {
     matches!(
         expr,
-        BindingExpr::Path(_) | BindingExpr::Call { .. } | BindingExpr::Member { .. }
+        BindingExpr::Path(_)
+            | BindingExpr::Call { .. }
+            | BindingExpr::SymbolValue(_)
+            | BindingExpr::MemberOf(..)
     )
 }
 
@@ -632,11 +665,13 @@ fn is_primary(expr: &BindingExpr) -> bool {
     matches!(
         expr,
         BindingExpr::Literal(_)
+            | BindingExpr::Null
             | BindingExpr::Path(_)
             | BindingExpr::Array(_)
             | BindingExpr::Record(_)
             | BindingExpr::Call { .. }
-            | BindingExpr::Member { .. }
+            | BindingExpr::SymbolValue(_)
+            | BindingExpr::MemberOf(..)
     )
 }
 
@@ -906,7 +941,7 @@ pub fn emit_interface(out: &mut String, iface: &InterfaceDecl) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dag::{ImportName, ImportKind, Node as DagNode};
+    use crate::dag::{ImportName, ImportKind, Node as DagNode, PropertyAccessor};
 
     #[test]
     fn emit_simple_element() {
@@ -980,9 +1015,7 @@ mod tests {
                 AttrValue::BindingExpr(BindingExpr::Record(vec![
                     (
                         "rows".into(),
-                        BindingExpr::Array(vec![BindingExpr::Literal(BindingLiteral::Number(
-                            3.0,
-                        ))]),
+                        BindingExpr::Array(vec![BindingExpr::Literal(LiteralValue::Int64(3))]),
                     ),
                     (
                         "load".into(),
@@ -1097,7 +1130,7 @@ mod tests {
     fn record() -> BindingExpr {
         BindingExpr::Record(vec![(
             "a".into(),
-            BindingExpr::Literal(BindingLiteral::Number(1.0)),
+            BindingExpr::Literal(LiteralValue::Int64(1)),
         )])
     }
 
@@ -1177,7 +1210,7 @@ mod tests {
             // An ARRAY leads with `[`, which is not the hazard.
             (
                 BindingExpr::Coalesce(vec![
-                    BindingExpr::Array(vec![BindingExpr::Literal(BindingLiteral::Number(1.0))]),
+                    BindingExpr::Array(vec![BindingExpr::Literal(LiteralValue::Int64(1))]),
                     name("z"),
                 ]),
                 "(x: number) => [1] ?? z",
@@ -1185,19 +1218,16 @@ mod tests {
             // A member chain on a record: `emit_member_base` already wrapped the
             // record, so the text leads with `(` and needs nothing more.
             (
-                BindingExpr::Member {
-                    base: Box::new(record()),
-                    path: vec!["m".into()],
-                },
+                BindingExpr::MemberOf(Box::new(record()), PropertyAccessor::Named("m".into())),
                 "(x: number) => ({a: 1}).m",
             ),
             // And one level in: a coalesce LED BY that member chain.
             (
                 BindingExpr::Coalesce(vec![
-                    BindingExpr::Member {
-                        base: Box::new(record()),
-                        path: vec!["m".into()],
-                    },
+                    BindingExpr::MemberOf(
+                        Box::new(record()),
+                        PropertyAccessor::Named("m".into()),
+                    ),
                     name("z"),
                 ]),
                 "(x: number) => ({a: 1}).m ?? z",
@@ -1235,7 +1265,7 @@ mod tests {
 
     /// `"<value>"` as the emitter writes it.
     fn literal(value: &str) -> String {
-        String::from(&BindingExpr::Literal(BindingLiteral::String(value.into())))
+        String::from(&BindingExpr::Literal(LiteralValue::String(value.into())))
     }
 
     #[test]
@@ -1255,7 +1285,7 @@ mod tests {
     fn keyed(key: &str) -> String {
         String::from(&BindingExpr::Record(vec![(
             key.into(),
-            BindingExpr::Literal(BindingLiteral::Number(1.0)),
+            BindingExpr::Literal(LiteralValue::Int64(1)),
         )]))
     }
 

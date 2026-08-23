@@ -322,13 +322,154 @@ pub struct ImportedCall {
     pub args: Vec<Expr>,
 }
 
-/// A literal accepted by an owned object/data binding expression.
+/// **A literal accepted by an owned object/data binding expression, at the
+/// width it was captured or declared at.**
+///
+/// # An integer is never silently a float
+///
+/// This replaced a `BindingLiteral` whose numeric arm was a single
+/// `Number(f64)`, and the whole of the change is that one arm becoming four.
+/// Tim, 2026-08-23: *"we should never silently encode integer as floats."* An
+/// f64 carries every i32 exactly and stops carrying i64 at 2^53, so a lone
+/// `Number` made "how wide was this, and was it whole?" unanswerable AFTER the
+/// fact - a row id past 2^53 arrives rounded, and nothing downstream can tell a
+/// rounded id from an id.
+///
+/// Exactness is not new here either: the sibling event vocabulary [`Expr`] has
+/// carried `LitS32`/`LitS64`/`LitF32`/`LitF64` since it existed, and `lower_arg`
+/// in `parse.rs` refuses a literal its declared type cannot hold rather than
+/// rounding it. `Number(f64)` was the odd one out, not the precedent.
+///
+/// # The names, and the ONE place they meet [`TypeShape`]'s
+///
+/// [`TypeShape`] spells its widths WIT's way - `S32`/`S64`/`F32`/`F64`, where
+/// `S` is SIGNED (WIT writes `s32`/`u32` where Rust writes `i32`/`u32`) - at
+/// well over a hundred sites. These are spelled Rust's way, which is what an
+/// author of a literal reads. Two vocabularies for one ladder is a translation
+/// waiting to be written twice, so it is written ONCE:
+/// [`type_shape`](LiteralValue::type_shape) going up and
+/// [`narrow`](LiteralValue::narrow) coming down. No consumer maps a width by
+/// hand.
+///
+/// # There is no `Null`, and that is a distinction rather than a removal
+///
+/// A written `null` is a SOURCE FORM - an author typed the token, and libtsx
+/// captures what an author wrote - so it stays recordable, as
+/// [`BindingExpr::Null`]. What it is NOT is a value with a type, which is what
+/// every variant here is; absence as MODELLING is the type vocabulary's job and
+/// [`TypeShape::Option`] already does it. Tim, 2026-08-23: *"it would be better
+/// to use BindingExpr::Optional<T> instead of null, but null will still need a
+/// way to be recorded."* Keeping `Null` here would have made every consumer
+/// asking "what width is this literal?" answer "none, sometimes", which is the
+/// two-questions-one-type shape this split exists to end.
+///
+/// # APPEND-LAST from here
+///
+/// This enum reaches disk inside [`BindingExpr::Literal`] and is persisted
+/// POSITIONALLY by postcard, so a new variant goes at the END - see
+/// [`BindingExpr`]'s own note for what a removal costs instead.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum BindingLiteral {
+pub enum LiteralValue {
     Bool(bool),
-    Number(f64),
+    /// A whole number that FITS in 32 bits - what a field declaring
+    /// [`TypeShape::S32`] produces, never a default anything narrows into.
+    Int32(i32),
+    /// A whole number. **This is what the parser captures an integral literal
+    /// as**, whatever it is later declared to be. Tim, 2026-08-23: *"it's safe
+    /// to have integers as Int64, then map to floats only if the props require
+    /// a float. 64 bit ints/floats are cheap for us and provide the most
+    /// compatibility."*
+    Int64(i64),
+    /// A 32-bit float - again, what a field DECLARING it produces.
+    Float32(f32),
+    /// A fractional number, and what the parser captures a decimal literal as.
+    Float64(f64),
     String(String),
-    Null,
+}
+
+impl LiteralValue {
+    /// **The [`TypeShape`] this literal already IS** - the up-hill half of the
+    /// one mapping between the two width vocabularies (see the type doc).
+    pub fn type_shape(&self) -> TypeShape {
+        match self {
+            Self::Bool(_) => TypeShape::Bool,
+            Self::Int32(_) => TypeShape::S32,
+            Self::Int64(_) => TypeShape::S64,
+            Self::Float32(_) => TypeShape::F32,
+            Self::Float64(_) => TypeShape::F64,
+            Self::String(_) => TypeShape::String,
+        }
+    }
+
+    /// **This literal as an `f64`, or `None` when it is not a number.**
+    ///
+    /// The READ side, for a consumer whose own value type is `f64` - a layout
+    /// metric, a scalar attribute, a runtime number. It is deliberately the
+    /// ONLY such conversion: a consumer that wrote `as f64` at its own match
+    /// site would be re-deciding, per site, a question this type answers once.
+    ///
+    /// **Lossy past 2^53, and that loss belongs to the CONSUMER's type, not to
+    /// the capture.** The literal still holds the exact integer; what is
+    /// narrowing here is the `f64` the caller asked for. That is the whole
+    /// difference from the vocabulary this replaced, where the capture itself
+    /// was an `f64` and the exact value was gone before any consumer saw it.
+    pub fn as_f64(&self) -> Option<f64> {
+        match self {
+            Self::Int32(value) => Some(f64::from(*value)),
+            Self::Int64(value) => Some(*value as f64),
+            Self::Float32(value) => Some(f64::from(*value)),
+            Self::Float64(value) => Some(*value),
+            Self::Bool(_) | Self::String(_) => None,
+        }
+    }
+
+    /// **This literal AT the declared width, or `None` when it does not fit
+    /// exactly** - the down-hill half, and the only place a capture width
+    /// becomes a declared one.
+    ///
+    /// The refusal is the point and it is [`lower_arg`](crate::parse)'s
+    /// contract restated for the binding vocabulary: a literal the declared
+    /// type cannot hold is refused, never rounded, truncated or wrapped, so a
+    /// silently shortened id fails at the source text that caused it rather
+    /// than somewhere with no view of it. 2^53 is where an f64 stops being the
+    /// integer it was written as, which is why [`TypeShape::S64`] is bounded
+    /// there and not at [`i64::MAX`].
+    ///
+    /// **`F32` is a CAST and not a refusal**, deliberately: that is what the
+    /// event grammar has always done for a declared `F32`, and tightening it
+    /// here would change which sources parse - a decision with its own evidence
+    /// to gather, not a side effect of moving the widths into one place.
+    ///
+    /// `U32`/`U64` have no authored spelling (see [`TypeShape`]), so no
+    /// declaration can name one and there is nothing for an arm here to serve.
+    pub fn narrow(&self, declared: &TypeShape) -> Option<Self> {
+        /// 2^53 - past it an f64 literal is no longer the integer it was
+        /// written as.
+        const EXACT: i64 = 9_007_199_254_740_992;
+        match (self, declared) {
+            (Self::Bool(_), TypeShape::Bool) => Some(self.clone()),
+            (Self::String(_), TypeShape::String) => Some(self.clone()),
+            (Self::Int32(v), _) => Self::Int64(i64::from(*v)).narrow(declared),
+            (Self::Int64(v), TypeShape::S32) => i32::try_from(*v).ok().map(Self::Int32),
+            (Self::Int64(v), TypeShape::S64) => {
+                (-EXACT..=EXACT).contains(v).then_some(Self::Int64(*v))
+            }
+            (Self::Int64(v), TypeShape::F32) => Some(Self::Float32(*v as f32)),
+            (Self::Int64(v), TypeShape::F64) => Some(Self::Float64(*v as f64)),
+            (Self::Float32(v), _) => Self::Float64(f64::from(*v)).narrow(declared),
+            (Self::Float64(v), TypeShape::F32) => Some(Self::Float32(*v as f32)),
+            (Self::Float64(v), TypeShape::F64) => Some(Self::Float64(*v)),
+            // A fractional value is not a whole one, and rounding it here is
+            // exactly what this function refuses to do.
+            (Self::Float64(v), TypeShape::S32) => (v.fract() == 0.0
+                && (f64::from(i32::MIN)..=f64::from(i32::MAX)).contains(v))
+            .then(|| Self::Int32(*v as i32)),
+            (Self::Float64(v), TypeShape::S64) => (v.fract() == 0.0
+                && (-(EXACT as f64)..=(EXACT as f64)).contains(v))
+            .then(|| Self::Int64(*v as i64)),
+            _ => None,
+        }
+    }
 }
 
 /// The owned expression vocabulary for object-valued bindings.
@@ -367,11 +508,22 @@ pub enum BindingLiteral {
 /// `map` as a comprehension is a MEANING and this enum captures forms - and
 /// `xs.map(x => x)` is now a [`Call`](BindingExpr::Call) whose argument is an
 /// [`Arrow`](BindingExpr::Arrow), which is what TypeScript says it is. That
-/// removal is why `libhbui`'s `HBDEF_VERSION` is 2. A future removal is another
+/// removal is why `libhbui`'s `HBDEF_VERSION` was 2. A future removal is another
 /// such event and costs another bump; there is no cheaper way to take one.
+///
+/// **And there has now been a second**: `Member { base, path }` left in favour
+/// of [`MemberOf`](BindingExpr::MemberOf), which subsumes it (Tim, 2026-08-23:
+/// *"Member and MemberOf shouldn't both exist"*), in the SAME change that
+/// appended [`SymbolValue`](BindingExpr::SymbolValue), [`MemberOf`] and
+/// [`Null`](BindingExpr::Null) and reshaped [`LiteralValue`]. One change, one
+/// bump: landing the addition and the removal separately would have cost two
+/// bumps and left a window in which both member forms existed, which is the
+/// duplication the removal was for. `HBDEF_VERSION` is 3 for it.
+///
+/// [`MemberOf`]: BindingExpr::MemberOf
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum BindingExpr {
-    Literal(BindingLiteral),
+    Literal(LiteralValue),
     Path(Vec<String>),
     Array(Vec<BindingExpr>),
     Record(Vec<(String, BindingExpr)>),
@@ -413,31 +565,9 @@ pub enum BindingExpr {
         then: Box<BindingExpr>,
         other: Box<BindingExpr>,
     },
-    /// A static member chain on a NON-identifier base: `f().x.y`.
-    ///
-    /// **Appended after [`Cond`](BindingExpr::Cond) on purpose, and it is the
-    /// genuinely new capture of the three.**
-    ///
-    /// [`Path`](BindingExpr::Path) roots at an identifier, so `props.value` is
-    /// a path and `design().isAuthoring` is not representable by it at all -
-    /// the base is a CALL. The alternative considered and rejected was folding
-    /// the member chain into the call (as extra arguments, or by appending to
-    /// its name): that avoids a variant by writing down something the author
-    /// did not write, and it stops being reversible the moment two accessors
-    /// disagree about what a suffix means. Capturing the member access as a
-    /// member access is what the capture-the-syntax rule asks for, and it
-    /// subsumes every later accessor without a further variant.
-    ///
-    /// `base` is the expression the chain hangs off; `path` is the
-    /// dot-separated static segments after it, in source order, never empty.
-    /// Computed access (`a[b]`) is not this variant and stays refused.
-    Member {
-        base: Box<BindingExpr>,
-        path: Vec<String>,
-    },
     /// `a === b` and `a == b` - an equality test.
     ///
-    /// **Appended after [`Member`](BindingExpr::Member) on purpose.**
+    /// **Appended after [`Cond`](BindingExpr::Cond) on purpose.**
     ///
     /// # Why `strict` is recorded rather than normalised away
     ///
@@ -507,6 +637,143 @@ pub enum BindingExpr {
         params: Vec<BindingParam>,
         body: Box<BindingExpr>,
     },
+    /// **A top-level identifier CALLED as a value** - `it()`, `uiSite()`,
+    /// `design()`.
+    ///
+    /// **Appended after [`Arrow`](BindingExpr::Arrow), in the same change that
+    /// removed `Member`** - see the enum's note on what a removal costs, and
+    /// `SCOPE_TREES.md` step 3 on why the two had to travel together.
+    ///
+    /// The form is a call to a bare identifier: no namespace, no type argument,
+    /// no argument. Anything else is a [`Call`](BindingExpr::Call) and stays
+    /// one - `it` alone is a NAME and lowers as the [`Path`](BindingExpr::Path)
+    /// it is, `propsOf<T>()` carries a type argument, `ns.design()` is somebody
+    /// else's `design`. That strictness is what keeps ONE source spelling to
+    /// ONE shape: a lenient capture would give `it(x)` the bare reading and
+    /// silently drop the argument the author wrote.
+    ///
+    /// **This says nothing about what the identifier MEANS.** Which scope
+    /// answers `it()`, whether `design()` varies by surface, whether an
+    /// identifier is known at all - every one of those is the consumer's
+    /// question, asked with a scope in hand (`libhbui::attr`). See
+    /// [`ObjectSymbol`] for why an identifier registry answers to this
+    /// vocabulary's rule rather than breaching it.
+    SymbolValue(ObjectSymbol),
+    /// **ONE member hop off an expression** - the `isAuthoring` of
+    /// `design().isAuthoring`.
+    ///
+    /// **Appended after [`SymbolValue`](BindingExpr::SymbolValue), and it is
+    /// what `Member { base, path }` became.**
+    ///
+    /// # It NESTS; it does not carry a path
+    ///
+    /// `uiComponent().props.x` is
+    /// `MemberOf(MemberOf(SymbolValue(UiComponent), Props), Named("x"))` - the
+    /// one-hop form enclosing itself. Tim, 2026-08-23: *"a nested member
+    /// accessor is the enclosed form recursively."* The `Vec<String>` the old
+    /// variant carried made a chain a LIST hanging off one base, which is a
+    /// second shape for something the enum can already express by recursion,
+    /// and it forced the accessor to be a bare string where a hop off a hop
+    /// wants to be an expression like any other. Resolution is then a fold -
+    /// resolve the innermost expression, then walk outward one
+    /// [`PropertyAccessor`] at a time - and one hop is the overwhelmingly
+    /// common case in the corpus anyway.
+    ///
+    /// # Why `Member` could not stay beside it
+    ///
+    /// Tim, 2026-08-23: *"Member and MemberOf shouldn't both exist."* `Member`
+    /// was added for the base that a [`Path`](BindingExpr::Path) cannot root -
+    /// `design().isAuthoring`, whose base is a CALL - which is this variant's
+    /// entire job. Two forms for member access is one authored spelling with
+    /// two representations, and every consumer then owes both an arm.
+    ///
+    /// The base stays an expression rather than narrowing to a symbol: that is
+    /// what makes the recursion work, and it is also what keeps a member on a
+    /// [`Call`](BindingExpr::Call) result representable. A chain rooted at an
+    /// IDENTIFIER is still a `Path` and must stay one - `props.value` has one
+    /// shape, decided in `parse.rs`.
+    ///
+    /// Computed access (`a[b]`) is not this variant and stays refused.
+    MemberOf(Box<BindingExpr>, PropertyAccessor),
+    /// **The written token `null`.**
+    ///
+    /// **Appended after [`MemberOf`](BindingExpr::MemberOf).** It arrived here
+    /// from `BindingLiteral::Null` when that enum became [`LiteralValue`], and
+    /// the move is the distinction: a literal VALUE has a width and a type,
+    /// and `null` has neither. What it has is a source form, and capturing
+    /// source forms is this vocabulary's whole remit.
+    ///
+    /// **Absence as MODELLING is not this.** Tim, 2026-08-23: *"it would be
+    /// better to use BindingExpr::Optional<T> instead of null, but null will
+    /// still need a way to be recorded."* [`TypeShape::Option`] is where "this
+    /// may be missing" is declared; this variant only records that an author
+    /// typed the four characters. What a consumer MAKES of them - absence, a
+    /// refusal, a runtime null - is the consumer's, and the consumers in this
+    /// workspace already disagree, which is the evidence that it was never one
+    /// meaning.
+    Null,
+}
+
+impl BindingExpr {
+    /// **A dotted NAME as the [`Path`](BindingExpr::Path) it is** -
+    /// `"props.items"` is `Path(["props", "items"])`.
+    ///
+    /// The split and its inverse [`path_spelling`](BindingExpr::path_spelling)
+    /// are written here, once. A `Path` is a name in TWO forms - segments in
+    /// the vocabulary, a dotted string wherever a name is spelled - and a
+    /// consumer splitting or joining at its own call site is a second formula
+    /// for the same correspondence, with nothing to keep the two in step when
+    /// one of them learns about, say, a segment containing a dot.
+    pub fn path(spelling: &str) -> BindingExpr {
+        BindingExpr::Path(spelling.split('.').map(str::to_owned).collect())
+    }
+
+    /// **The dotted name a [`Path`](BindingExpr::Path) SPELLS**, or `None` for
+    /// anything that is not one. The inverse of [`path`](BindingExpr::path).
+    pub fn path_spelling(&self) -> Option<String> {
+        match self {
+            BindingExpr::Path(segments) => Some(segments.join(".")),
+            _ => None,
+        }
+    }
+
+    /// **A member chain on `base`, one nested hop per segment** -
+    /// `member_chain(<f()>, ["x", "y"])` is
+    /// `MemberOf(MemberOf(<f()>, x), y)`.
+    ///
+    /// The nesting is written HERE and nowhere else, with
+    /// [`member_path`](BindingExpr::member_path) as its exact inverse: a
+    /// consumer that spelled the fold itself would be a second formula for the
+    /// shape, and the two would drift in the direction that matters - one of
+    /// them putting the segments back in the wrong order.
+    ///
+    /// An empty `path` answers `base` unchanged, which is what makes a bare
+    /// symbol and a member read one expression rather than two cases.
+    pub fn member_chain<'a>(
+        base: BindingExpr,
+        path: impl IntoIterator<Item = &'a str>,
+    ) -> BindingExpr {
+        path.into_iter().fold(base, |base, segment| {
+            BindingExpr::MemberOf(Box::new(base), PropertyAccessor::intern(segment))
+        })
+    }
+
+    /// **This expression's member chain taken apart**: the innermost base, and
+    /// every accessor written on it in SOURCE order.
+    ///
+    /// The inverse of [`member_chain`](BindingExpr::member_chain), and the one
+    /// walk down the nesting. An expression that is not a member access answers
+    /// `(self, [])`.
+    pub fn member_path(&self) -> (&BindingExpr, Vec<&str>) {
+        let mut path = Vec::new();
+        let mut cursor = self;
+        while let BindingExpr::MemberOf(base, member) = cursor {
+            path.push(member.as_str());
+            cursor = base;
+        }
+        path.reverse();
+        (cursor, path)
+    }
 }
 
 /// **A top-level identifier an expression CALLS as a value** - the `it` of
@@ -2098,7 +2365,7 @@ mod tests {
                 BlockStmt::Let {
                     slot: "rows".into(),
                     value: BindingExpr::Array(vec![
-                        BindingExpr::Literal(BindingLiteral::Bool(true)),
+                        BindingExpr::Literal(LiteralValue::Bool(true)),
                         BindingExpr::Path(vec!["input".into(), "rows".into()]),
                     ]),
                 },
@@ -2113,9 +2380,7 @@ mod tests {
                 },
                 BlockStmt::If {
                     condition: BindingExpr::Path(vec!["saved".into(), "ok".into()]),
-                    then_branch: vec![BlockStmt::Return(BindingExpr::Literal(
-                        BindingLiteral::Null,
-                    ))],
+                    then_branch: vec![BlockStmt::Return(BindingExpr::Null)],
                     else_branch: vec![BlockStmt::Try {
                         body: vec![BlockStmt::Return(BindingExpr::Path(vec![
                             "saved".into(),
@@ -2123,7 +2388,7 @@ mod tests {
                         ]))],
                         error_slot: "error".into(),
                         catch: vec![BlockStmt::Return(BindingExpr::Literal(
-                            BindingLiteral::String("failed".into()),
+                            LiteralValue::String("failed".into()),
                         ))],
                     }],
                 },
@@ -2212,5 +2477,81 @@ mod tests {
             serde_json::from_str::<PropertyAccessor>("\"props\"").expect("deserialize"),
             PropertyAccessor::Props,
         );
+    }
+
+    /// **A literal is refused rather than rounded, at every width.**
+    ///
+    /// [`LiteralValue::narrow`] is the one place the two width vocabularies
+    /// meet, so this is where the contract `lower_arg` documents is actually
+    /// pinned: past 2^53 an f64 stops being the integer it was written as, and
+    /// a rounded id is indistinguishable from an id once it has been written
+    /// down.
+    #[test]
+    fn a_literal_that_does_not_fit_its_declared_width_is_refused_not_rounded() {
+        const EXACT: i64 = 9_007_199_254_740_992;
+        assert_eq!(
+            LiteralValue::Int64(7).narrow(&TypeShape::S32),
+            Some(LiteralValue::Int32(7))
+        );
+        assert_eq!(
+            LiteralValue::Int64(i64::from(i32::MAX) + 1).narrow(&TypeShape::S32),
+            None,
+            "one past i32 is refused, not wrapped"
+        );
+        assert_eq!(
+            LiteralValue::Int64(EXACT).narrow(&TypeShape::S64),
+            Some(LiteralValue::Int64(EXACT))
+        );
+        assert_eq!(
+            LiteralValue::Int64(EXACT + 1).narrow(&TypeShape::S64),
+            None,
+            "past 2^53 is refused, not rounded"
+        );
+        assert_eq!(
+            LiteralValue::Float64(1.5).narrow(&TypeShape::S64),
+            None,
+            "a fractional value is not a whole one, and truncating it is the defect"
+        );
+        assert_eq!(
+            LiteralValue::Float64(2.0).narrow(&TypeShape::S32),
+            Some(LiteralValue::Int32(2)),
+            "a whole float DOES fit a whole declaration - exactly, which is the test"
+        );
+        assert_eq!(
+            LiteralValue::Int64(3).narrow(&TypeShape::F64),
+            Some(LiteralValue::Float64(3.0)),
+            "widening an integer into a float is the one direction that is free"
+        );
+        assert_eq!(
+            LiteralValue::String("s".into()).narrow(&TypeShape::S32),
+            None
+        );
+        assert_eq!(
+            LiteralValue::Int64(1).narrow(&TypeShape::U32),
+            None,
+            "U32 has no authored spelling, so nothing can be declared as one"
+        );
+    }
+
+    /// **Every literal knows the [`TypeShape`] it already is** - the up-hill
+    /// half of the one mapping, and total so a width added on either side
+    /// fails to compile rather than falling through.
+    #[test]
+    fn a_literal_names_its_own_type_shape() {
+        for (literal, shape) in [
+            (LiteralValue::Bool(true), TypeShape::Bool),
+            (LiteralValue::Int32(1), TypeShape::S32),
+            (LiteralValue::Int64(1), TypeShape::S64),
+            (LiteralValue::Float32(1.0), TypeShape::F32),
+            (LiteralValue::Float64(1.0), TypeShape::F64),
+            (LiteralValue::String("s".into()), TypeShape::String),
+        ] {
+            assert_eq!(literal.type_shape(), shape);
+            assert_eq!(
+                literal.narrow(&shape),
+                Some(literal.clone()),
+                "narrowing to the width it already is must be the identity"
+            );
+        }
     }
 }

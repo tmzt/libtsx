@@ -31,7 +31,7 @@
 #![cfg(feature = "parse")]
 
 use libtsx::dag::{
-    AttrValue, BindingExpr, BindingLiteral, EffectError, Expr, FieldDecl, FuncSig, ImportKind,
+    AttrValue, BindingExpr, EffectError, Expr, FieldDecl, FuncSig, ImportKind, LiteralValue,
     ImportedCall, Node, ParserHost, Resolution, TsxDocument, TypeShape,
 };
 use libtsx::{ParseCtx, ParseError, parse_tsx};
@@ -391,7 +391,7 @@ fn an_event_binding_carries_a_named_effect() {
     );
     assert_eq!(
         el.attr("height"),
-        Some(&AttrValue::BindingExpr(BindingExpr::Literal(BindingLiteral::Number(56.0))))
+        Some(&AttrValue::BindingExpr(BindingExpr::Literal(LiteralValue::Int64(56))))
     );
     assert_eq!(
         el.attr("label"),

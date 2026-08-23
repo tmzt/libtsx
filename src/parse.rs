@@ -27,9 +27,10 @@
 //!   passed to whichever parse entry point the caller needs (Rule 49).
 
 use crate::dag::{
-    AttrValue, BindingExpr, BindingLiteral, BindingParam, EffectError, BlockArrow, BlockStmt,
+    AttrValue, BindingExpr, BindingParam, EffectError, BlockArrow, BlockStmt,
     Element, FieldDecl, FuncSig, ImportDecl, ImportKind, ImportName, InterfaceDecl, ImportedCall,
-    Node, ParserHost, Resolution, TsxDocument, TypeShape, is_event_binding, is_host_namespace,
+    LiteralValue, Node, ObjectSymbol, ParserHost, PropertyAccessor, Resolution, TsxDocument,
+    TypeShape, is_event_binding, is_host_namespace,
 };
 use std::sync::Arc;
 use oxc_allocator::Allocator;
@@ -880,35 +881,17 @@ enum ArgFail {
 fn lower_arg(expr: &Expression, declared: &TypeShape) -> Result<crate::dag::Expr, ArgFail> {
     use crate::dag::Expr as E;
     match expr {
-        Expression::StringLiteral(s) => match declared {
-            TypeShape::String => Ok(E::LitStr(s.value.to_string())),
-            _ => Err(ArgFail::WrongType),
-        },
-        Expression::BooleanLiteral(b) => match declared {
-            TypeShape::Bool => Ok(E::LitBool(b.value)),
-            _ => Err(ArgFail::WrongType),
-        },
-        Expression::NumericLiteral(n) => match declared {
-            TypeShape::S32 => whole(n.value, i32::MIN as f64, i32::MAX as f64)
-                .map(|v| E::LitS32(v as i32))
-                .ok_or(ArgFail::WrongType),
-            // 2^53: past it an f64 literal is no longer the integer it was
-            // written as, and a silently rounded destination or id is the
-            // defect Rule 40 refuses for the same reason.
-            TypeShape::S64 => whole(n.value, -9_007_199_254_740_992.0, 9_007_199_254_740_992.0)
-                .map(|v| E::LitS64(v as i64))
-                .ok_or(ArgFail::WrongType),
-            TypeShape::F32 => Ok(E::LitF32(n.value as f32)),
-            TypeShape::F64 => Ok(E::LitF64(n.value)),
-            // NO `U32`/`U64` ARM ON PURPOSE. Neither has an authored spelling
-            // (see `dag::TypeShape`), so no TS parameter can declare one and no
-            // literal can reach it - an arm here would have no consumer and no
-            // test that could exercise it, which is the speculative half this
-            // project refuses. They fall to the catch-all and are refused,
-            // which is the correct answer while nothing can be declared as
-            // them. The arm lands with the spelling, bounded the way `S64` is.
-            _ => Err(ArgFail::WrongType),
-        },
+        // CAPTURE, then NARROW - and the narrowing rules live on
+        // [`LiteralValue::narrow`], not here. The widths of the two
+        // vocabularies meet in exactly one function (see [`LiteralValue`]); a
+        // second copy of "does this fit?" written at this call site is how the
+        // binding side and the event side would come to disagree about 2^53
+        // without either being wrong on its own terms.
+        Expression::StringLiteral(s) => {
+            lower_literal_arg(LiteralValue::String(s.value.to_string()), declared)
+        }
+        Expression::BooleanLiteral(b) => lower_literal_arg(LiteralValue::Bool(b.value), declared),
+        Expression::NumericLiteral(n) => lower_literal_arg(numeric_literal(n), declared),
         // A BINDING PATH. `expr_path` recovers an identifier or a static member
         // chain and NOTHING else, which is exactly the line: a call
         // (`Id({id})`), a computed member (`row[i]`), an arithmetic expression
@@ -920,9 +903,96 @@ fn lower_arg(expr: &Expression, declared: &TypeShape) -> Result<crate::dag::Expr
     }
 }
 
-/// `value` as a whole number inside `[lo, hi]`, or `None`.
-fn whole(value: f64, lo: f64, hi: f64) -> Option<f64> {
-    (value.fract() == 0.0 && (lo..=hi).contains(&value)).then_some(value)
+/// **The literal a numeric token captures as, at CAPTURE width.**
+///
+/// An INTEGRAL literal is [`LiteralValue::Int64`] and a DECIMAL one is
+/// [`LiteralValue::Float64`], decided from the token as it was WRITTEN. Tim,
+/// 2026-08-23: *"it's safe to have integers as Int64, then map to floats only
+/// if the props require a float. 64 bit ints/floats are cheap for us and
+/// provide the most compatibility."*
+///
+/// **Nothing narrows here.** [`LiteralValue::Int32`] and
+/// [`LiteralValue::Float32`] are what a field DECLARING them produces, through
+/// [`LiteralValue::narrow`] at lowering, and they are deliberately not
+/// reachable from a bare token: a parser that guessed a width from the value
+/// would make `1` a different literal from `10_000_000_000` for reasons the
+/// source does not state, and the declaration - the only thing that knows -
+/// would arrive too late to disagree.
+///
+/// # The integer is read from the SOURCE TEXT, not from oxc's `value`
+///
+/// `NumericLiteral::value` is an `f64` - the lexer has already rounded, because
+/// that is what a JavaScript number IS - so a token past 2^53 arrives there as
+/// a DIFFERENT integer with nothing to say so. `4605617453661332513` becomes
+/// `4605617453661332480` before this function is called. Reading `raw` recovers
+/// what the author typed, which is the only reading that makes an `Int64`
+/// capture worth having: an integer that is silently a nearby integer is the
+/// same defect as one that is silently a float.
+///
+/// `raw` is `None` only for a node the parser did not build; the value's own
+/// fractional part is the fallback there, and a hand-built node has no source
+/// text to be faithful to.
+fn numeric_literal(literal: &oxc_ast::ast::NumericLiteral) -> LiteralValue {
+    let Some(raw) = literal.raw.as_ref() else {
+        return match whole_f64(literal.value) {
+            Some(value) => LiteralValue::Int64(value),
+            None => LiteralValue::Float64(literal.value),
+        };
+    };
+    let text = raw.replace('_', "");
+    if text.contains(['.', 'e', 'E']) {
+        return LiteralValue::Float64(literal.value);
+    }
+    // A non-decimal radix is still an integral token; TS spells the three with
+    // a prefix, and each is exact in the source however wide it is.
+    let parsed = match text.get(..2).map(str::to_ascii_lowercase).as_deref() {
+        Some("0x") => i64::from_str_radix(&text[2..], 16),
+        Some("0o") => i64::from_str_radix(&text[2..], 8),
+        Some("0b") => i64::from_str_radix(&text[2..], 2),
+        _ => text.parse::<i64>(),
+    };
+    match parsed {
+        Ok(value) => LiteralValue::Int64(value),
+        // Past i64 an integral token is not an integer this vocabulary can
+        // hold, and rounding it into one is the silent narrowing this change
+        // exists to refuse. It stays the float the lexer already made of it -
+        // lossy, but VISIBLY so, and typed as what it is.
+        Err(_) => LiteralValue::Float64(literal.value),
+    }
+}
+
+/// `value` as an `i64` when it is exactly one - the fallback for a numeric node
+/// with no source text.
+fn whole_f64(value: f64) -> Option<i64> {
+    (value.fract() == 0.0 && value.abs() <= 9_007_199_254_740_992.0).then_some(value as i64)
+}
+
+/// One captured literal, narrowed to `declared` and spelled in the EVENT
+/// vocabulary - [`ArgFail::WrongType`] when it does not fit exactly.
+///
+/// The two vocabularies are the same ladder written twice
+/// ([`LiteralValue`]'s widths against `Expr`'s `Lit*`), so this is the one
+/// place they are transcribed and it is TOTAL: every [`LiteralValue`] variant
+/// has exactly one `Lit*` spelling, so a width added to one side fails to
+/// compile here rather than falling through a catch-all.
+///
+/// `U32`/`U64` cannot arrive: neither has an authored spelling (see
+/// [`TypeShape`]), so no TS parameter can declare one and
+/// [`LiteralValue::narrow`] answers `None` for both - refused, which is the
+/// correct answer while nothing can be declared as them.
+fn lower_literal_arg(
+    captured: LiteralValue,
+    declared: &TypeShape,
+) -> Result<crate::dag::Expr, ArgFail> {
+    use crate::dag::Expr as E;
+    match captured.narrow(declared).ok_or(ArgFail::WrongType)? {
+        LiteralValue::Bool(value) => Ok(E::LitBool(value)),
+        LiteralValue::Int32(value) => Ok(E::LitS32(value)),
+        LiteralValue::Int64(value) => Ok(E::LitS64(value)),
+        LiteralValue::Float32(value) => Ok(E::LitF32(value)),
+        LiteralValue::Float64(value) => Ok(E::LitF64(value)),
+        LiteralValue::String(value) => Ok(E::LitStr(value)),
+    }
 }
 
 /// Unwrap parentheses. `onTap={(navigate("Chat"))}` is the same call.
@@ -1484,14 +1554,14 @@ fn child_form(expr: &Expression) -> &'static str {
 /// expression as a pipeline stage without owning a document.
 ///
 /// ```
-/// use libtsx::dag::{BindingExpr, BindingLiteral};
+/// use libtsx::dag::{BindingExpr, LiteralValue};
 ///
 /// let expr = BindingExpr::try_from(r#"props.label ?? "none""#).expect("lowers");
 /// assert_eq!(
 ///     expr,
 ///     BindingExpr::Coalesce(vec![
 ///         BindingExpr::Path(vec!["props".into(), "label".into()]),
-///         BindingExpr::Literal(BindingLiteral::String("none".into())),
+///         BindingExpr::Literal(LiteralValue::String("none".into())),
 ///     ])
 /// );
 /// // And back, which is the pairing:
@@ -1569,10 +1639,10 @@ fn lower_binding_expr(expr: &Expression, _scope: &ImportScope) -> Result<Binding
     use BindingExpr as B;
     let expr = unparen(expr);
     match expr {
-        Expression::NullLiteral(_) => Ok(B::Literal(BindingLiteral::Null)),
-        Expression::BooleanLiteral(v) => Ok(B::Literal(BindingLiteral::Bool(v.value))),
-        Expression::NumericLiteral(v) => Ok(B::Literal(BindingLiteral::Number(v.value))),
-        Expression::StringLiteral(v) => Ok(B::Literal(BindingLiteral::String(v.value.to_string()))),
+        Expression::NullLiteral(_) => Ok(B::Null),
+        Expression::BooleanLiteral(v) => Ok(B::Literal(LiteralValue::Bool(v.value))),
+        Expression::NumericLiteral(v) => Ok(B::Literal(numeric_literal(v))),
+        Expression::StringLiteral(v) => Ok(B::Literal(LiteralValue::String(v.value.to_string()))),
         Expression::Identifier(_) => {
             let Some(path) = expr_path(expr) else {
                 return Err("computed or private member paths are unsupported".into());
@@ -1618,10 +1688,17 @@ fn lower_binding_expr(expr: &Expression, _scope: &ImportScope) -> Result<Binding
                 rooted.extend(segments);
                 return Ok(B::Path(rooted));
             }
-            Ok(B::Member {
-                base: Box::new(base),
-                path: segments,
-            })
+            // ONE HOP PER NODE, nesting outward. `f().x.y` is
+            // `MemberOf(MemberOf(<f()>, x), y)` - the segments were peeled
+            // inner-first above and reversed, so folding them in source order
+            // rebuilds the chain in the order they were written. A `Vec` of
+            // segments hanging off one base is the shape `Member` had and the
+            // reason it went: it gave a hop off a hop a spelling that is not an
+            // expression.
+            Ok(segments.into_iter().fold(base, |base, segment| B::MemberOf(
+                Box::new(base),
+                PropertyAccessor::intern(&segment),
+            )))
         }
         Expression::ArrayExpression(array) => {
             let mut items = Vec::with_capacity(array.elements.len());
@@ -1667,7 +1744,7 @@ fn lower_binding_expr(expr: &Expression, _scope: &ImportScope) -> Result<Binding
             if call.optional {
                 return Err("optional calls are unsupported".into());
             }
-            let type_args = call
+            let type_args: Vec<TypeShape> = call
                 .type_arguments
                 .as_ref()
                 .map(|args| {
@@ -1683,6 +1760,21 @@ fn lower_binding_expr(expr: &Expression, _scope: &ImportScope) -> Result<Binding
                     return Err("call argument spreads are unsupported".into());
                 };
                 args.push(lower_binding_expr(arg, _scope)?);
+            }
+            // **A BARE identifier call is a SYMBOL, not a `Call`.** `it()`,
+            // `design()`, `uiSite()` - no namespace, no type argument, no
+            // argument - are the form
+            // [`SymbolValue`](crate::dag::BindingExpr::SymbolValue) captures,
+            // and the strictness is what keeps one authored spelling to one
+            // shape: were both spellings producible, `foo()` would have two
+            // representations and every consumer would owe both an arm.
+            //
+            // This decides nothing about what an identifier MEANS. An
+            // identifier with no interned variant becomes
+            // [`ObjectSymbol::Named`], because refusing an unknown callee is a
+            // judgement only a consumer holding a scope can make.
+            if namespace.is_empty() && type_args.is_empty() && args.is_empty() {
+                return Ok(B::SymbolValue(ObjectSymbol::intern(&name)));
             }
             Ok(B::Call { namespace, name, type_args, args })
         }
@@ -2040,7 +2132,7 @@ mod tests {
         );
         assert_eq!(
             list.attrs[1].1,
-            AttrValue::BindingExpr(BindingExpr::Literal(BindingLiteral::Number(3.0)))
+            AttrValue::BindingExpr(BindingExpr::Literal(LiteralValue::Int64(3)))
         );
         assert_eq!(list.attrs[2].1, AttrValue::Bool(true));
         let Node::Element(item) = &list.children[0] else {
@@ -2337,7 +2429,7 @@ mod tests {
         let Node::Element(app_el) = &doc.root_nodes[0] else { panic!() };
         assert_eq!(
             app_el.attr("depth"),
-            Some(&AttrValue::BindingExpr(BindingExpr::Literal(BindingLiteral::Number(2.0))))
+            Some(&AttrValue::BindingExpr(BindingExpr::Literal(LiteralValue::Int64(2))))
         );
         assert_eq!(app_el.children.len(), 1);
     }
@@ -2406,7 +2498,7 @@ mod tests {
         assert_eq!(
             thing.attr("text"),
             Some(&AttrValue::BindingExpr(BindingExpr::Literal(
-                BindingLiteral::String("hello".into())
+                LiteralValue::String("hello".into())
             )))
         );
         assert_eq!(
@@ -2420,9 +2512,9 @@ mod tests {
         assert_eq!(
             thing.attr("values"),
             Some(&AttrValue::BindingExpr(BindingExpr::Array(vec![
-                BindingExpr::Literal(BindingLiteral::Bool(true)),
+                BindingExpr::Literal(LiteralValue::Bool(true)),
                 BindingExpr::Path(vec!["props".into(), "count".into()]),
-                BindingExpr::Literal(BindingLiteral::Null),
+                BindingExpr::Null,
             ])))
         );
         assert_eq!(
@@ -2430,11 +2522,11 @@ mod tests {
             Some(&AttrValue::BindingExpr(BindingExpr::Record(vec![
                 (
                     "first".into(),
-                    BindingExpr::Literal(BindingLiteral::Number(1.0))
+                    BindingExpr::Literal(LiteralValue::Int64(1))
                 ),
                 (
                     "second".into(),
-                    BindingExpr::Literal(BindingLiteral::String("two".into()))
+                    BindingExpr::Literal(LiteralValue::String("two".into()))
                 ),
             ])))
         );
@@ -2460,7 +2552,7 @@ mod tests {
                 ],
                 args: vec![
                     BindingExpr::Path(vec!["props".into(), "id".into()]),
-                    BindingExpr::Literal(BindingLiteral::String("fallback".into())),
+                    BindingExpr::Literal(LiteralValue::String("fallback".into())),
                 ],
             }))
         );
@@ -2581,38 +2673,114 @@ mod tests {
         );
     }
 
-    /// `design().isAuthoring` - the shape `Member` exists for.
+    /// `design().isAuthoring` - the shape `MemberOf` exists for.
     ///
-    /// Two facts in one: an UNQUALIFIED callee is captured with an empty
-    /// namespace (writing down a namespace nobody spelled would be an
-    /// invention), and the member access hangs off the call rather than being
-    /// folded into its name.
+    /// Two facts in one: a BARE identifier call is captured as a
+    /// `SymbolValue` (a namespace nobody spelled would be an invention, and a
+    /// `Call` carrying three empty fields is the same expression written a
+    /// second way), and the member access hangs off it rather than being folded
+    /// into its name.
     #[test]
-    fn a_member_chain_on_a_call_result_lowers_to_member() {
+    fn a_member_chain_on_a_call_result_lowers_to_member_of() {
         assert_eq!(
             binding_of(r#"<Thing value={design().isAuthoring}/>"#),
-            BindingExpr::Member {
-                base: Box::new(BindingExpr::Call {
-                    namespace: String::new(),
-                    name: "design".into(),
-                    type_args: vec![],
-                    args: vec![],
-                }),
-                path: vec!["isAuthoring".into()],
-            }
+            BindingExpr::MemberOf(
+                Box::new(BindingExpr::SymbolValue(ObjectSymbol::Design)),
+                PropertyAccessor::IsAuthoring,
+            )
         );
         assert_eq!(
             binding_of(r#"<Thing value={design().avatar.sm.box}/>"#),
-            BindingExpr::Member {
-                base: Box::new(BindingExpr::Call {
-                    namespace: String::new(),
-                    name: "design".into(),
-                    type_args: vec![],
-                    args: vec![],
-                }),
-                path: vec!["avatar".into(), "sm".into(), "box".into()],
+            BindingExpr::MemberOf(
+                Box::new(BindingExpr::MemberOf(
+                    Box::new(BindingExpr::MemberOf(
+                        Box::new(BindingExpr::SymbolValue(ObjectSymbol::Design)),
+                        PropertyAccessor::Named("avatar".into()),
+                    )),
+                    PropertyAccessor::Named("sm".into()),
+                )),
+                PropertyAccessor::Named("box".into()),
+            ),
+            "a deep chain NESTS one hop per node, outermost last"
+        );
+    }
+
+    /// **An integral literal captures as `Int64`, a decimal one as `Float64`.**
+    ///
+    /// Capture width is decided by the TOKEN, never by the value and never by
+    /// a declaration that has not arrived yet: `Int32`/`Float32` are what a
+    /// field DECLARING them produces, through `LiteralValue::narrow` at
+    /// lowering. A parser that guessed a narrow width from a small value would
+    /// make `1` a different literal from `10000000000` for a reason the source
+    /// does not state.
+    #[test]
+    fn an_integral_literal_captures_as_int64_and_a_decimal_one_as_float64() {
+        for (source, expected) in [
+            ("0", LiteralValue::Int64(0)),
+            ("7", LiteralValue::Int64(7)),
+            ("0x10", LiteralValue::Int64(16)),
+            // **Past 2^53 the LEXER has already rounded**, so this reads the
+            // source text: oxc's `value` for this token is
+            // 4605617453661332480, a different integer with nothing to say so.
+            ("4605617453661332513", LiteralValue::Int64(4605617453661332513)),
+            ("1.5", LiteralValue::Float64(1.5)),
+            // A DECIMAL POINT is part of the token, so `1.0` is a float even
+            // though its value is whole. The alternative - reading the value -
+            // would silently retype what the author wrote.
+            ("1.0", LiteralValue::Float64(1.0)),
+            ("1e3", LiteralValue::Float64(1000.0)),
+        ] {
+            assert_eq!(
+                binding_of(&format!("<Thing value={{{source}}}/>")),
+                BindingExpr::Literal(expected),
+                "{source} captured at the wrong width",
+            );
+        }
+    }
+
+    /// **A written `null` is a source form, not a literal value.**
+    ///
+    /// It has no width and no type, which is what took it out of
+    /// `LiteralValue`; what a consumer MAKES of it - absence, a refusal, a
+    /// runtime null - stays the consumer's, and the consumers in this
+    /// workspace already disagree.
+    #[test]
+    fn a_written_null_is_its_own_form() {
+        assert_eq!(binding_of(r#"<Thing value={null}/>"#), BindingExpr::Null);
+    }
+
+    /// **A bare identifier call is a `SymbolValue`, and only a bare one.**
+    ///
+    /// The strictness is the whole matching rule: were `Call` also producible
+    /// for `it()`, one authored spelling would have two shapes and every
+    /// consumer would owe both an arm. Anything carrying a namespace, a type
+    /// argument or an argument stays a `Call`, and `it` alone stays the NAME it
+    /// is.
+    #[test]
+    fn a_bare_identifier_call_is_a_symbol_value() {
+        assert_eq!(
+            binding_of(r#"<Thing value={it()}/>"#),
+            BindingExpr::SymbolValue(ObjectSymbol::It)
+        );
+        assert_eq!(
+            binding_of(r#"<Thing value={frobnicate()}/>"#),
+            BindingExpr::SymbolValue(ObjectSymbol::Named("frobnicate".into())),
+            "an unregistered identifier is carried, never refused"
+        );
+        assert_eq!(
+            binding_of(r#"<Thing value={it}/>"#),
+            BindingExpr::Path(vec!["it".into()]),
+            "a bare name is a path, not a call"
+        );
+        assert_eq!(
+            binding_of(r#"<Thing value={ns.it()}/>"#),
+            BindingExpr::Call {
+                namespace: "ns".into(),
+                name: "it".into(),
+                type_args: vec![],
+                args: vec![],
             },
-            "a deep chain is ONE member node, in source order"
+            "a qualified call is somebody else's symbol"
         );
     }
 
@@ -2645,16 +2813,11 @@ mod tests {
         assert_eq!(
             binding_of(r#"<Thing value={design().fidelity === "lofi"}/>"#),
             BindingExpr::Eq {
-                left: Box::new(BindingExpr::Member {
-                    base: Box::new(BindingExpr::Call {
-                        namespace: String::new(),
-                        name: "design".into(),
-                        type_args: vec![],
-                        args: vec![],
-                    }),
-                    path: vec!["fidelity".into()],
-                }),
-                right: Box::new(BindingExpr::Literal(BindingLiteral::String("lofi".into()))),
+                left: Box::new(BindingExpr::MemberOf(
+                    Box::new(BindingExpr::SymbolValue(ObjectSymbol::Design)),
+                    PropertyAccessor::Named("fidelity".into()),
+                )),
+                right: Box::new(BindingExpr::Literal(LiteralValue::String("lofi".into()))),
                 strict: true,
             }
         );
@@ -2662,7 +2825,7 @@ mod tests {
             binding_of(r#"<Thing value={props.kind == "row"}/>"#),
             BindingExpr::Eq {
                 left: Box::new(path(&["props", "kind"])),
-                right: Box::new(BindingExpr::Literal(BindingLiteral::String("row".into()))),
+                right: Box::new(BindingExpr::Literal(LiteralValue::String("row".into()))),
                 strict: false,
             },
             "a loose equality is recorded as a loose equality"
@@ -3089,7 +3252,7 @@ mod tests {
         assert!(matches!(&program.body[1], BlockStmt::If { .. }));
         assert!(matches!(
             &program.body[2],
-            BlockStmt::Return(BindingExpr::Literal(BindingLiteral::Null))
+            BlockStmt::Return(BindingExpr::Null)
         ));
     }
 
