@@ -85,11 +85,24 @@ pub struct DagModule {
     pub handlers: Vec<HandlerDecl>,
 }
 
-/// A TS `interface` declaration: `interface Name { fields… }`.
+/// A TS `interface` declaration: `interface Name extends … { fields… }`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct InterfaceDecl {
     pub name: String,
     pub fields: Vec<FieldDecl>,
+    /// The `extends` clause, one [`TypeShape::Extends`] per heritage entry, in
+    /// source order.
+    ///
+    /// **A TYPE EXPRESSION, not a name list** (Tim, 2026-08-27: *"encode it as
+    /// a type expression node Extends{base}"*). `extends Omit<ContainerProps,
+    /// "direction">` is the whole point of the clause for this project, and a
+    /// `Vec<String>` could not hold it - the base is an expression that has to
+    /// be evaluated like any other, by the one evaluator.
+    ///
+    /// `#[serde(default)]` so every already-committed definition, which has no
+    /// such clause, still decodes.
+    #[serde(default)]
+    pub extends: Vec<TypeShape>,
 }
 
 /// An ES `import { a, b as c } from "src"` declaration — the **typed reference**
@@ -1857,6 +1870,32 @@ pub enum TypeShape {
         base: Box<TypeShape>,
         picked: Vec<String>,
     },
+    /// **One entry of an `extends` clause** - `interface P extends Base {}`.
+    ///
+    /// # It was DROPPED SILENTLY, and that was the blocker
+    ///
+    /// `interface HBoxProps extends Omit<ContainerProps, "direction"> {}` is
+    /// the idiomatic TypeScript for exactly what a container's props are, and
+    /// `convert_interface` had no arm for the clause: it produced an interface
+    /// with NO FIELDS and no error. A container packed from one carried an
+    /// empty shape, so `#[container]`'s fixed-attribute check would have
+    /// compared against the empty set and passed anything - a check reporting
+    /// success having checked nothing. That is why the check shipped absent.
+    ///
+    /// # Why a node and not a `Vec<String>` on the interface
+    ///
+    /// Because the useful cases are not names. `extends Omit<..>`,
+    /// `extends Pick<..>` and `extends Partial<..>` all have to be admissible,
+    /// and each is an expression that has to be evaluated the way every other
+    /// expression is - by the one evaluator, with the same key checking and the
+    /// same rejection of an unknown base. Storing a name would need a second,
+    /// weaker resolution path beside it.
+    ///
+    /// **It evaluates to its base's fields**, which the interface's own fields
+    /// are then merged onto. See `libhbdata::typeexpr`.
+    Extends {
+        base: Box<TypeShape>,
+    },
 }
 
 /// **The TypeScript spelling of a key operator**, given an ALREADY-RENDERED
@@ -1965,6 +2004,7 @@ mod tests {
         DagModule {
             name: "counter".into(),
             interfaces: vec![InterfaceDecl {
+            extends: Vec::new(),
                 name: "CounterProps".into(),
                 fields: vec![
                     FieldDecl { name: "label".into(), ty: TypeShape::String, optional: false },
@@ -2221,6 +2261,7 @@ mod tests {
 
     fn user_card_props() -> Vec<InterfaceDecl> {
         vec![InterfaceDecl {
+            extends: Vec::new(),
             name: "UserCardProps".into(),
             fields: vec![FieldDecl {
                 name: "name".into(),

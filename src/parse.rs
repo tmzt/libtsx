@@ -1131,13 +1131,62 @@ pub fn extract_interfaces(source: &str) -> Result<Vec<InterfaceDecl>, Vec<String
     }
 }
 
+/// One `interface`, INCLUDING its `extends` clause.
+///
+/// # The clause used to be dropped, silently
+///
+/// This function read `decl.body` and nothing else, so
+/// `interface P extends Omit<B, "a"> {}` produced
+/// `InterfaceDecl { extends: Vec::new(), name: "P", fields: [] }` - no fields, no diagnostic. See [`TypeShape::Extends`] for what
+/// that cost.
+///
+/// Each heritage entry is lowered through the SAME [`type_shape`] a field's
+/// annotation takes, so `extends Omit<..>` and `field: Omit<..>` cannot
+/// disagree about what `Omit` means, and a clause this vocabulary cannot hold
+/// is refused here rather than silently discarded.
 fn convert_interface(
     decl: &oxc_ast::ast::TSInterfaceDeclaration,
 ) -> Result<InterfaceDecl, String> {
+    let name = decl.id.name.to_string();
+    let extends = decl
+        .extends
+        .iter()
+        .map(|heritage| {
+            Ok(TypeShape::Extends {
+                base: Box::new(heritage_shape(heritage).map_err(|why| format!("`{name}`: {why}"))?),
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
     Ok(InterfaceDecl {
-        name: decl.id.name.to_string(),
+        name,
         fields: signatures_to_fields(&decl.body.body)?,
+        extends,
     })
+}
+
+/// One heritage entry as a type expression.
+///
+/// oxc models `extends Foo<Bar>` as an EXPRESSION plus separate type arguments
+/// rather than as a `TSType`, so it cannot be handed straight to [`type_shape`].
+/// This rebuilds the two halves into the shape that spelling means - which is
+/// exactly what [`reference_shape`] answers for the same text written in field
+/// position, `Omit`/`Pick` handling included.
+fn heritage_shape(
+    heritage: &oxc_ast::ast::TSInterfaceHeritage,
+) -> Result<TypeShape, String> {
+    let Expression::Identifier(id) = &heritage.expression else {
+        return Err(
+            "an `extends` entry is a named type; a qualified or computed one is not modelled"
+                .to_string(),
+        );
+    };
+    let name = id.name.to_string();
+    let Some(type_arguments) = &heritage.type_arguments else {
+        return Ok(TypeShape::Named(name));
+    };
+    // Through the same lowering the field position takes, by handing it the
+    // same two pieces `reference_shape` reads.
+    key_operator_or_apply(&name, &type_arguments.params)
 }
 
 fn signatures_to_fields(sigs: &[TSSignature]) -> Result<Vec<FieldDecl>, String> {
@@ -1261,38 +1310,39 @@ fn reference_shape(r: &oxc_ast::ast::TSTypeReference) -> Result<TypeShape, Strin
     let Some(type_arguments) = &r.type_arguments else {
         return Ok(TypeShape::Named(name));
     };
-    if matches!(name.as_str(), "Omit" | "Pick") {
-        let [base, keys] = type_arguments.params.as_slice() else {
+    key_operator_or_apply(&name, &type_arguments.params)
+}
+
+/// **`Name<args…>`, however it was written.** Shared by the field position
+/// ([`reference_shape`]) and the `extends` clause ([`heritage_shape`]), because
+/// `Omit<B, "a">` must mean the same thing in both and oxc hands them over as
+/// two different node types.
+fn key_operator_or_apply(
+    name: &str,
+    params: &oxc_allocator::Vec<'_, TSType<'_>>,
+) -> Result<TypeShape, String> {
+    if matches!(name, "Omit" | "Pick") {
+        let [base, keys] = params.as_slice() else {
             return Err(format!(
                 "`{name}` takes exactly 2 type arguments, this one has {}",
-                type_arguments.params.len()
+                params.len()
             ));
         };
         let base = Box::new(type_shape(base)?);
-        let keys = key_names(keys, &name)?;
+        let keys = key_names(keys, name)?;
         return Ok(if name == "Omit" {
-            TypeShape::Omit {
-                base,
-                omitted: keys,
-            }
+            TypeShape::Omit { base, omitted: keys }
         } else {
             TypeShape::Pick { base, picked: keys }
         });
     }
-    let args = type_arguments
-        .params
-        .iter()
-        .map(type_shape)
-        .collect::<Result<Vec<_>, _>>()?;
+    let args = params.iter().map(type_shape).collect::<Result<Vec<_>, _>>()?;
     if name == "Array" {
         if let Some(first) = args.first() {
             return Ok(TypeShape::List(Box::new(first.clone())));
         }
     }
-    Ok(TypeShape::Apply {
-        constructor: name,
-        args,
-    })
+    Ok(TypeShape::Apply { constructor: name.to_string(), args })
 }
 
 /// The key argument of `Omit`/`Pick`: one string literal, or a union of them.
@@ -2342,6 +2392,61 @@ mod tests {
                 picked: vec!["b".into()],
             },
         );
+    }
+
+    /// **The `extends` clause reaches the IR** - it used to be dropped with no
+    /// error at all, which is the defect `TypeShape::Extends` exists for.
+    ///
+    /// The `assert!(!.extends.is_empty())` is the specific thing that was false:
+    /// `interface P extends B {}` parsed to an interface with no fields AND no
+    /// record of the clause, so nothing downstream could tell it apart from
+    /// `interface P {}`.
+    #[test]
+    fn an_extends_clause_is_not_dropped() {
+        let interfaces = extract_interfaces(
+            r#"
+                interface HBoxProps extends Omit<ContainerProps, "direction"> {}
+                interface Two extends A, B { own: string }
+            "#,
+        )
+        .expect("the clause parses");
+
+        assert!(
+            !interfaces[0].extends.is_empty(),
+            "the clause was dropped - the exact silent failure this closed",
+        );
+        assert_eq!(
+            interfaces[0].extends,
+            vec![TypeShape::Extends {
+                base: Box::new(TypeShape::Omit {
+                    base: Box::new(TypeShape::Named("ContainerProps".into())),
+                    omitted: vec!["direction".into()],
+                }),
+            }],
+            "an operator in the clause is the SAME tree it is in field position",
+        );
+
+        assert_eq!(
+            interfaces[1].extends,
+            vec![
+                TypeShape::Extends { base: Box::new(TypeShape::Named("A".into())) },
+                TypeShape::Extends { base: Box::new(TypeShape::Named("B".into())) },
+            ],
+            "several entries, in source order",
+        );
+        assert_eq!(
+            interfaces[1].fields.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(),
+            vec!["own"],
+            "the body is still read alongside the clause",
+        );
+    }
+
+    /// An interface with NO clause records none - absent is not a default.
+    #[test]
+    fn a_plain_interface_extends_nothing() {
+        let interfaces =
+            extract_interfaces("interface P { a: string }").expect("it parses");
+        assert!(interfaces[0].extends.is_empty());
     }
 
     /// **`Partial` is deliberately NOT one of them.** Its argument is a type,

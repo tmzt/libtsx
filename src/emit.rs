@@ -914,6 +914,11 @@ fn emit_type_shape(out: &mut String, shape: &TypeShape) {
         // calls, so the keys cannot come out spelled two ways.
         TypeShape::Omit { base, omitted } => emit_key_operator(out, "Omit", base, omitted),
         TypeShape::Pick { base, picked } => emit_key_operator(out, "Pick", base, picked),
+        // An `extends` entry in TYPE position has no TypeScript spelling of its
+        // own - the keyword belongs to the interface, not to the type. So it
+        // emits as its base, which is the text that was inside the clause.
+        // `emit_interface` writes the `extends` itself.
+        TypeShape::Extends { base } => emit_type_shape(out, base),
     }
 }
 
@@ -936,6 +941,13 @@ fn emit_indent(out: &mut String, level: usize) {
 pub fn emit_interface(out: &mut String, iface: &InterfaceDecl) {
     out.push_str("interface ");
     out.push_str(&iface.name);
+    // The clause, so a parse/emit round trip does not quietly drop it - which
+    // is the exact failure `TypeShape::Extends` exists to fix, and it would
+    // reappear here if only the parser learned it.
+    for (index, entry) in iface.extends.iter().enumerate() {
+        out.push_str(if index == 0 { " extends " } else { ", " });
+        emit_type_shape(out, entry);
+    }
     out.push_str(" {\n");
 
     for field in &iface.fields {
