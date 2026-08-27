@@ -1806,6 +1806,75 @@ pub enum TypeShape {
     /// nocap handle crosses as two of these. No authored spelling yet - see
     /// the note above.
     U64,
+    // THE KEY OPERATORS. Appended last, same rule as everything above.
+    //
+    // WHY THESE TWO AND NOT `Partial`. The line is not "which utility types
+    // matter" - it is WHAT KIND OF ARGUMENT THE OPERATOR TAKES. `Apply` holds
+    // `args: Vec<TypeShape>`, so it can carry any operator whose arguments are
+    // TYPES: `Result<A, B>` is faithful there, and so is `Partial<X>`, which is
+    // why `Partial` gets no variant. It is an application of Optional to each
+    // of X's fields, and `Option` already spells that; the reduction belongs to
+    // resolution, not to a node here.
+    //
+    // `Omit` and `Pick` take FIELD NAMES. `Apply` demands a type in that slot,
+    // so the parser has to invent one, and it does: `type_shape` falls to its
+    // `_ =>` arm and produces `Named("unknown")`. MEASURED, before this
+    // existed:
+    //
+    //     Omit<ContainerProps, "direction">
+    //       -> Apply { "Omit", [Named("ContainerProps"), Named("unknown")] }
+    //
+    // The name is not merely unresolved, it is GONE - two Omits over one base
+    // that hide different fields decode to identical bytes. These variants are
+    // not extra expressiveness; they are the repair of a node that cannot hold
+    // a name where it requires a type.
+    //
+    // UNRESOLVED IS THE POINT. Both are the AUTHORED form and both survive into
+    // `.hbtypes` unreduced, because reducing them needs the base's field list
+    // and that may live in a layer this pack never loaded. A type expression
+    // tree resolves the way any expression tree does (Tim, 2026-08-27), and a
+    // key naming no field of the resolved base is rejected THERE - one place,
+    // with the whole document in hand, rather than here with a fragment of it.
+    /// `Omit<Base, "a" | "b">` - Base without the named fields.
+    ///
+    /// `base` is boxed rather than a bare name so the operators compose:
+    /// `Omit<Omit<X, "a">, "b">` and `Pick<Omit<X, "a">, "b">` are both this
+    /// tree, nested.
+    ///
+    /// `omitted` is `Vec<String>` and not `Vec<TypeShape>` on purpose. A field
+    /// name is not a type, and a slot that can hold a type is a slot that can
+    /// hold `Named("unknown")` - which is the exact defect this variant exists
+    /// to fix. The narrower field makes that state unrepresentable.
+    Omit {
+        base: Box<TypeShape>,
+        omitted: Vec<String>,
+    },
+    /// `Pick<Base, "a" | "b">` - Base with ONLY the named fields.
+    ///
+    /// The dual of [`TypeShape::Omit`]: same shape, opposite fold. See its
+    /// documentation for why the key list is `Vec<String>`.
+    Pick {
+        base: Box<TypeShape>,
+        picked: Vec<String>,
+    },
+}
+
+/// **The TypeScript spelling of a key operator**, given an ALREADY-RENDERED
+/// base - `Omit<Props, "a" | "b">`.
+///
+/// One function because there are a dozen places that render a `TypeShape` as
+/// text (a WIT name, a drawn label, a change-detection token, a canonical
+/// identity string) and each renders the BASE its own way, but none of them has
+/// a reason to spell the KEYS differently. Every such site calls this with its
+/// own base rendering, so a key list cannot come out quoted in one surface and
+/// bare in another.
+///
+/// An empty key list spells `never`, TypeScript's own name for it, because
+/// `Omit<Props, >` reparses as nothing.
+pub fn key_operator_spelling(operator: &str, base: &str, keys: &[String]) -> String {
+    let keys: Vec<String> = keys.iter().map(|key| format!("\"{key}\"")).collect();
+    let keys = if keys.is_empty() { "never".to_string() } else { keys.join(" | ") };
+    format!("{operator}<{base}, {keys}>")
 }
 
 /// A function signature (handler export or host import).

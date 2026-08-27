@@ -908,7 +908,21 @@ fn emit_type_shape(out: &mut String, shape: &TypeShape) {
             }
             out.push('>');
         }
+        // The key operators re-emit as the TypeScript they were read from, so a
+        // parse/emit round trip is the identity on them - through the shared
+        // `key_operator_spelling`, which every other rendering surface also
+        // calls, so the keys cannot come out spelled two ways.
+        TypeShape::Omit { base, omitted } => emit_key_operator(out, "Omit", base, omitted),
+        TypeShape::Pick { base, picked } => emit_key_operator(out, "Pick", base, picked),
     }
+}
+
+/// `Omit<Base, "a" | "b">` - this module's base rendering, the shared key
+/// rendering.
+fn emit_key_operator(out: &mut String, operator: &str, base: &TypeShape, keys: &[String]) {
+    let mut rendered = String::new();
+    emit_type_shape(&mut rendered, base);
+    out.push_str(&crate::dag::key_operator_spelling(operator, &rendered, keys));
 }
 
 /// Emit indentation (spaces).

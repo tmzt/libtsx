@@ -1238,8 +1238,21 @@ fn union_shape(u: &oxc_ast::ast::TSUnionType) -> Result<TypeShape, String> {
     }
 }
 
-/// `Array<T>` → `List<T>`; every other generic reference preserves its
-/// constructor and all arguments as [`TypeShape::Apply`].
+/// `Array<T>` → `List<T>`; `Omit`/`Pick` → the key operators; every other
+/// generic reference preserves its constructor and all arguments as
+/// [`TypeShape::Apply`].
+///
+/// # The key operators are read BEFORE the arguments are lowered
+///
+/// `Omit<X, "a" | "b">`'s second argument is not a type, and lowering it as one
+/// destroys it two different ways: a single `"a"` reaches `type_shape`'s `_ =>`
+/// arm and becomes `Named("unknown")`, and `"a" | "b"` reaches [`union_shape`],
+/// which REFUSES a two-member union outright (correctly - the vocabulary has no
+/// sum type). So the general path can only mangle this argument or reject the
+/// whole declaration.
+///
+/// Hence the branch above the `map(type_shape)`: the keys are read
+/// syntactically, as the names they are.
 fn reference_shape(r: &oxc_ast::ast::TSTypeReference) -> Result<TypeShape, String> {
     let name = match &r.type_name {
         oxc_ast::ast::TSTypeName::IdentifierReference(id) => id.name.to_string(),
@@ -1248,6 +1261,24 @@ fn reference_shape(r: &oxc_ast::ast::TSTypeReference) -> Result<TypeShape, Strin
     let Some(type_arguments) = &r.type_arguments else {
         return Ok(TypeShape::Named(name));
     };
+    if matches!(name.as_str(), "Omit" | "Pick") {
+        let [base, keys] = type_arguments.params.as_slice() else {
+            return Err(format!(
+                "`{name}` takes exactly 2 type arguments, this one has {}",
+                type_arguments.params.len()
+            ));
+        };
+        let base = Box::new(type_shape(base)?);
+        let keys = key_names(keys, &name)?;
+        return Ok(if name == "Omit" {
+            TypeShape::Omit {
+                base,
+                omitted: keys,
+            }
+        } else {
+            TypeShape::Pick { base, picked: keys }
+        });
+    }
     let args = type_arguments
         .params
         .iter()
@@ -1262,6 +1293,41 @@ fn reference_shape(r: &oxc_ast::ast::TSTypeReference) -> Result<TypeShape, Strin
         constructor: name,
         args,
     })
+}
+
+/// The key argument of `Omit`/`Pick`: one string literal, or a union of them.
+///
+/// **Refuses anything else, rather than falling back.** A key position holding
+/// something this cannot name is the defect the operators were added to fix; a
+/// best-effort reading here would put `unknown` back by a different door. The
+/// two forms admitted are the two TypeScript itself uses, and a key that names
+/// no field of the base is not this function's to catch - that needs the base
+/// RESOLVED, and resolution is where it is rejected.
+fn key_names(ty: &TSType, operator: &str) -> Result<Vec<String>, String> {
+    fn one(ty: &TSType) -> Option<String> {
+        let TSType::TSLiteralType(lit) = ty else {
+            return None;
+        };
+        match &lit.literal {
+            oxc_ast::ast::TSLiteral::StringLiteral(s) => Some(s.value.to_string()),
+            _ => None,
+        }
+    }
+    let members: Vec<&TSType> = match ty {
+        TSType::TSUnionType(u) => u.types.iter().collect(),
+        single => vec![single],
+    };
+    members
+        .into_iter()
+        .map(|member| {
+            one(member).ok_or_else(|| {
+                format!(
+                    "`{operator}`'s key argument is a string literal or a union of them, \
+                     not every type is a field name"
+                )
+            })
+        })
+        .collect()
 }
 
 fn convert_element(jsx: &JSXElement, low: &Lowering) -> Result<Element, EffectError> {
@@ -2207,6 +2273,116 @@ mod tests {
                     TypeShape::Named("Error".into()),
                 ],
             }))
+        );
+    }
+
+    /// **The key operators keep the KEYS**, which is the whole reason they are
+    /// variants rather than `Apply`.
+    ///
+    /// Before this existed, `Omit<ContainerProps, "direction">` measured as
+    /// `Apply { "Omit", [Named("ContainerProps"), Named("unknown")] }` - the
+    /// field name replaced by the parser's word for "not modelled", so two
+    /// Omits hiding DIFFERENT fields of one base were byte-identical. The
+    /// `assert_ne` below is the specific thing that used to be an `assert_eq`.
+    #[test]
+    fn the_key_operators_keep_their_field_names() {
+        let interfaces = extract_interfaces(
+            r#"
+                interface Props {
+                    row: Omit<ContainerProps, "direction">;
+                    pair: Omit<ContainerProps, "direction" | "gap">;
+                    just: Pick<ContainerProps, "gap">;
+                    other: Omit<ContainerProps, "gap">;
+                }
+            "#,
+        )
+        .expect("the key operators parse");
+        let base = || Box::new(TypeShape::Named("ContainerProps".into()));
+
+        assert_eq!(
+            interfaces[0].fields[0].ty,
+            TypeShape::Omit { base: base(), omitted: vec!["direction".into()] },
+        );
+        assert_eq!(
+            interfaces[0].fields[1].ty,
+            TypeShape::Omit {
+                base: base(),
+                omitted: vec!["direction".into(), "gap".into()],
+            },
+            "a union of literals is several keys, not a refused union",
+        );
+        assert_eq!(
+            interfaces[0].fields[2].ty,
+            TypeShape::Pick { base: base(), picked: vec!["gap".into()] },
+        );
+        assert_ne!(
+            interfaces[0].fields[0].ty, interfaces[0].fields[3].ty,
+            "two Omits over one base hiding different fields must not be equal",
+        );
+        assert_ne!(
+            interfaces[0].fields[2].ty, interfaces[0].fields[3].ty,
+            "Pick and Omit over one base with one key are duals, not the same",
+        );
+    }
+
+    /// They NEST, which is why `base` is boxed rather than a bare name.
+    #[test]
+    fn the_key_operators_compose() {
+        let interfaces = extract_interfaces(
+            r#"interface Props { narrowed: Pick<Omit<Full, "a">, "b">; }"#,
+        )
+        .expect("nested operators parse");
+        assert_eq!(
+            interfaces[0].fields[0].ty,
+            TypeShape::Pick {
+                base: Box::new(TypeShape::Omit {
+                    base: Box::new(TypeShape::Named("Full".into())),
+                    omitted: vec!["a".into()],
+                }),
+                picked: vec!["b".into()],
+            },
+        );
+    }
+
+    /// **`Partial` is deliberately NOT one of them.** Its argument is a type,
+    /// so `Apply` carries it faithfully and there is nothing to repair; it
+    /// reduces at resolution by applying Optional to each field of the resolved
+    /// base, which `TypeShape::Option` already spells.
+    ///
+    /// Asserted so that "add Partial too, for symmetry" fails a test that says
+    /// why not to, rather than looking like an oversight.
+    #[test]
+    fn partial_stays_an_ordinary_application() {
+        let interfaces =
+            extract_interfaces(r#"interface Props { draft: Partial<User>; }"#).expect("parses");
+        assert_eq!(
+            interfaces[0].fields[0].ty,
+            TypeShape::Apply {
+                constructor: "Partial".into(),
+                args: vec![TypeShape::Named("User".into())],
+            },
+        );
+    }
+
+    /// A key position that is not a field name is REFUSED, not read
+    /// best-effort. Falling back would reintroduce `Named("unknown")` in the
+    /// slot these variants exist to protect.
+    #[test]
+    fn a_key_that_is_not_a_name_is_refused() {
+        let err = extract_interfaces(r#"interface Props { bad: Omit<Base, number>; }"#)
+            .expect_err("a non-literal key is refused")
+            .join("; ");
+        assert!(
+            err.contains("key argument"),
+            "the diagnostic should name the key argument, got: {err}"
+        );
+
+        let err = extract_interfaces(r#"interface Props { bad: Omit<Base>; }"#)
+            .expect_err("a one-argument Omit is refused")
+            .join("; ");
+        assert!(
+            err.contains("exactly 2"),
+            "the diagnostic should name the arity, got: {err}"
         );
     }
 
