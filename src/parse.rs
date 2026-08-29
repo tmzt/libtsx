@@ -1493,6 +1493,100 @@ fn jsx_member_object(obj: &oxc_ast::ast::JSXMemberExpressionObject) -> String {
     }
 }
 
+/// **JSX text whitespace, as JSX defines it.**
+///
+/// This was `t.value.trim()` until 2026-08-29, which destroyed the space
+/// beside an element child at the parse: `<Content>When <Text/> in the
+/// table.</Content>` reached the tree as `Text("When")`, the element,
+/// `Text("in the table.")` and drew welded as `Whenin`. The loss was at the
+/// parse, so nothing downstream could recover it, and inline placement
+/// (`designs/NEW_CONTENT_LAYOUT.md` step 7) could not be spelled with a space.
+///
+/// The rule implemented here is the standard one - Babel's
+/// `cleanJSXElementLiteralChild`, which is what every JSX author already
+/// expects - and NOT a variant:
+///
+/// 1. split the text child on line breaks (`\r\n`, `\n`, `\r`);
+/// 2. tabs become spaces;
+/// 3. strip leading spaces on every line EXCEPT the first;
+/// 4. strip trailing spaces on every line EXCEPT the last;
+/// 5. drop lines that are then empty;
+/// 6. join the survivors with one space between them - every surviving line
+///    except the LAST NON-EMPTY one gains a single trailing space;
+/// 7. if nothing survives, emit no text node at all (`None`).
+///
+/// Rules 3 and 4 are what make this agree with `trim()` for pretty-printed
+/// TSX, which is the whole blast radius argument: a child on its own indented
+/// line arrives as `"\n      A paragraph.\n    "`, whose first and last lines
+/// are empty and dropped and whose middle line is both stripped of its indent
+/// and the last non-empty one, so it gains no trailing space. The two rules
+/// differ in exactly three places, and the corpus has none of them: the inline
+/// case above; a single-line child with deliberate inner padding, where
+/// `<Text> Hello </Text>` is `" Hello "` here and was `"Hello"` under `trim()`
+/// because one line is both the first and the last so neither strip applies;
+/// and a child whose PROSE spans lines, where `trim()` kept the newline and
+/// the next line's indent inside the string and this joins them with one
+/// space. MEASURED 2026-08-29 over all 66 authored `.tsx` under `crates/` and
+/// `data/` plus this crate's own fixtures: ZERO text children change.
+fn clean_jsx_text(raw: &str) -> Option<String> {
+    let lines = split_jsx_lines(raw);
+    // "Empty" for the join is judged on the RAW line - spaces and tabs only -
+    // which is the same question rule 5 asks after the strips, except for the
+    // one line that is both first and last and so keeps its padding.
+    let last_non_empty = lines
+        .iter()
+        .rposition(|line| line.bytes().any(|b| b != b' ' && b != b'\t'))
+        .unwrap_or(0);
+
+    let mut out = String::new();
+    for (i, line) in lines.iter().enumerate() {
+        let mut piece = line.replace('\t', " ");
+        if i != 0 {
+            // whitespace touching a newline on its left
+            piece = piece.trim_start_matches(' ').to_string();
+        }
+        if i + 1 != lines.len() {
+            // whitespace touching a newline on its right
+            piece = piece.trim_end_matches(' ').to_string();
+        }
+        if piece.is_empty() {
+            continue;
+        }
+        out.push_str(&piece);
+        if i != last_non_empty {
+            out.push(' ');
+        }
+    }
+
+    if out.is_empty() { None } else { Some(out) }
+}
+
+/// The line split rule 1 asks for: `\r\n`, `\n` and `\r` each end a line, and
+/// a trailing break yields a final empty line (which is what makes the last
+/// line of `"text\n    "` droppable rather than the text's own trailing run).
+fn split_jsx_lines(raw: &str) -> Vec<&str> {
+    let bytes = raw.as_bytes();
+    let mut lines = Vec::new();
+    let (mut start, mut i) = (0usize, 0usize);
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\r' => {
+                lines.push(&raw[start..i]);
+                i += if bytes.get(i + 1) == Some(&b'\n') { 2 } else { 1 };
+                start = i;
+            }
+            b'\n' => {
+                lines.push(&raw[start..i]);
+                i += 1;
+                start = i;
+            }
+            _ => i += 1,
+        }
+    }
+    lines.push(&raw[start..]);
+    lines
+}
+
 fn push_child(
     out: &mut Vec<Node>,
     child: &JSXChild,
@@ -1502,9 +1596,8 @@ fn push_child(
     match child {
         JSXChild::Element(e) => out.push(Node::Element(convert_element(e, low)?)),
         JSXChild::Text(t) => {
-            let txt = t.value.trim();
-            if !txt.is_empty() {
-                out.push(Node::Text(txt.to_string()));
+            if let Some(txt) = clean_jsx_text(t.value.as_str()) {
+                out.push(Node::Text(txt));
             }
         }
         JSXChild::ExpressionContainer(c) => {
@@ -3553,5 +3646,182 @@ mod tests {
             parse_app("// no app root", &[r#"<Screen name="A" />"#]).unwrap_err(),
             vec!["app source has no root element".to_string()],
         );
+    }
+
+    // ---------------------------------------------------------------
+    // JSX text whitespace (`clean_jsx_text`) - the rule, from the spec.
+    // ---------------------------------------------------------------
+
+    /// Rules 1-7 exercised one at a time, on the raw text child that oxc hands
+    /// `push_child`. `None` is rule 7: no text node at all.
+    #[test]
+    fn jsx_text_whitespace_follows_the_babel_rule() {
+        // 7. nothing survives -> no node. The whitespace BETWEEN two elements
+        //    on separate source lines, which is the commonest text child there
+        //    is, and the reason pretty-printed TSX does not move.
+        assert_eq!(clean_jsx_text("\n      "), None);
+        assert_eq!(clean_jsx_text("\n"), None);
+        assert_eq!(clean_jsx_text("\n\n   \n"), None);
+        assert_eq!(clean_jsx_text(""), None);
+
+        // 3 + 4 + 5: a child on its own indented line. First line empty and
+        // dropped; middle line loses its indent (it is not the first) and is
+        // the last non-empty one so gains no trailing space; final line empty
+        // and dropped. Exactly what `trim()` gave.
+        assert_eq!(
+            clean_jsx_text("\n      A paragraph.\n    ").as_deref(),
+            Some("A paragraph.")
+        );
+
+        // 6. surviving lines join with ONE space, however they were indented,
+        //    and the last non-empty line gains none.
+        assert_eq!(
+            clean_jsx_text("\n  one\n     two\n  three\n").as_deref(),
+            Some("one two three")
+        );
+
+        // 4. the LAST line keeps its trailing spaces - this is the bug's fix.
+        //    `When ` before an element child arrives as "\n  When ".
+        assert_eq!(clean_jsx_text("\n  When ").as_deref(), Some("When "));
+        // and the text AFTER the element arrives as " in the table.\n".
+        assert_eq!(
+            clean_jsx_text(" in the table.\n").as_deref(),
+            Some(" in the table.")
+        );
+
+        // 3. the FIRST line keeps its leading spaces.
+        assert_eq!(clean_jsx_text("  a\n  b").as_deref(), Some("  a b"));
+
+        // 2. tabs are spaces, and a tab-only line is empty like a space-only
+        //    one.
+        assert_eq!(clean_jsx_text("\n\ta\tb\n").as_deref(), Some("a b"));
+        assert_eq!(clean_jsx_text("\n\t\n").is_none(), true);
+
+        // 1. all three line breaks split, and \r\n counts once.
+        assert_eq!(clean_jsx_text("\r\n  a\r\n  b\r\n").as_deref(), Some("a b"));
+        assert_eq!(clean_jsx_text("\r  a\r  b\r").as_deref(), Some("a b"));
+    }
+
+    /// The single-line child is where the rule and `trim()` part company, and
+    /// it is deliberate: one line is BOTH the first and the last, so neither
+    /// strip applies and the padding is the author's.
+    #[test]
+    fn a_single_line_text_child_keeps_its_own_padding() {
+        assert_eq!(clean_jsx_text(" Hello ").as_deref(), Some(" Hello "));
+        assert_eq!(clean_jsx_text("Hello").as_deref(), Some("Hello"));
+        // A lone space between two elements on ONE source line is a real word
+        // boundary and survives; the same gap spread over lines does not.
+        assert_eq!(clean_jsx_text(" ").as_deref(), Some(" "));
+        assert_eq!(clean_jsx_text(" \n "), None);
+    }
+
+    /// Interior whitespace is never touched - only the runs that touch a line
+    /// break are. A doubled space inside a sentence is the author's.
+    #[test]
+    fn interior_whitespace_is_the_authors() {
+        assert_eq!(
+            clean_jsx_text("\n  a  b   c\n").as_deref(),
+            Some("a  b   c")
+        );
+    }
+
+    /// The third place the rules differ, and the one nothing in the corpus
+    /// exercises: prose that spans source lines. `trim()` only touched the
+    /// ENDS, so the newline and the following indent survived INSIDE the
+    /// string and reached the draw pass as characters; the rule collapses each
+    /// break to the single space a reader sees.
+    #[test]
+    fn prose_wrapped_across_source_lines_joins_with_one_space() {
+        let raw = "two\n  lines";
+        assert_eq!(raw.trim(), "two\n  lines", "what trim() used to hand on");
+        assert_eq!(clean_jsx_text(raw).as_deref(), Some("two lines"));
+    }
+
+    /// The bug, end to end: the space beside an element child now reaches the
+    /// tree, on one source line and on three, and `{" "}` produces the same
+    /// text so the escape hatch and the space are interchangeable.
+    #[test]
+    fn a_space_beside_an_element_child_survives_the_parse() {
+        let one_line =
+            parse_tsx(r#"<Content>When <Text id="a" /> in the Water Logs table.</Content>"#)
+                .expect("parse");
+        let Node::Element(content) = &one_line.root_nodes[0] else { panic!("expected element") };
+        assert_eq!(content.children[0], Node::Text("When ".into()));
+        assert!(matches!(content.children[1], Node::Element(_)));
+        assert_eq!(
+            content.children[2],
+            Node::Text(" in the Water Logs table.".into())
+        );
+
+        // The SAME authored text with the element on its own line still welds,
+        // and that is the rule working rather than the bug surviving: a line
+        // break between text and an element is not a space in JSX (rules 3-4
+        // strip exactly the whitespace that touches a break). The space has to
+        // be on the same source line as the element, which is the JSX author's
+        // long-standing rule and the reason `{" "}` exists at all.
+        let three_lines = parse_tsx(
+            "<Content>\n  When\n  <Text id=\"a\" />\n  in the Water Logs table.\n</Content>",
+        )
+        .expect("parse");
+        let Node::Element(split) = &three_lines.root_nodes[0] else { panic!() };
+        assert_eq!(split.children[0], Node::Text("When".into()));
+        assert_eq!(
+            split.children[2],
+            Node::Text("in the Water Logs table.".into())
+        );
+
+        // And the escape hatch it replaces yields the identical children.
+        let hatch = parse_tsx(
+            r#"<Content>When{" "}<Text id="a" />{" "}in the Water Logs table.</Content>"#,
+        )
+        .expect("parse");
+        let Node::Element(hatched) = &hatch.root_nodes[0] else { panic!() };
+        let joined = |el: &Element| {
+            el.children
+                .iter()
+                .filter_map(|n| match n {
+                    Node::Text(t) => Some(t.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("|")
+        };
+        assert_eq!(joined(content), "When | in the Water Logs table.");
+        assert_eq!(joined(hatched), "When| | |in the Water Logs table.");
+        // Same characters in the same order once the run boundaries are gone -
+        // which is what the rendered frame sees.
+        let flat = |el: &Element| {
+            el.children
+                .iter()
+                .filter_map(|n| match n {
+                    Node::Text(t) => Some(t.clone()),
+                    _ => None,
+                })
+                .collect::<String>()
+        };
+        assert_eq!(flat(content), flat(hatched));
+    }
+
+    /// The pretty-printed corpus MUST NOT MOVE. Every shape the authored `.tsx`
+    /// files actually use, asserted to agree with what `trim()` gave.
+    #[test]
+    fn pretty_printed_children_are_unchanged_by_the_new_rule() {
+        for raw in [
+            "\n    ",
+            "\n        ",
+            "Hi",
+            "Decorated runs are addressed",
+            "\n    A paragraph on its own line.\n    ",
+            "\n\n    ",
+            "\n            two words\n        ",
+        ] {
+            let trimmed = raw.trim();
+            let cleaned = clean_jsx_text(raw);
+            assert_eq!(
+                cleaned.as_deref().unwrap_or(""),
+                trimmed,
+                "the new rule moved a pretty-printed child: {raw:?}"
+            );
+        }
     }
 }
