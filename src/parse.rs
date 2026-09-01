@@ -1247,9 +1247,58 @@ fn type_shape(ty: &TSType) -> Result<TypeShape, String> {
         TSType::TSTypeLiteral(lit) => TypeShape::Record(signatures_to_fields(&lit.members)?),
         TSType::TSUnionType(u) => union_shape(u)?,
         TSType::TSTypeReference(r) => reference_shape(r)?,
+        TSType::TSIndexedAccessType(idx) => indexed_shape(idx)?,
         // Anything else we don't model becomes an opaque named reference.
         _ => TypeShape::Named("unknown".to_string()),
     })
+}
+
+/// `Outer["field"]` - TypeScript's indexed access, as the SPELLING it is.
+///
+/// # Why a `Named` holding brackets, and not a variant
+///
+/// It is how an ANONYMOUS member type is written. A nested object literal
+/// (`interface Home { user: { name: string } }`) declares a shape with no name
+/// of its own, and `Home["user"]` is the only way TypeScript has to say it - so
+/// a consumer projecting that step needs the spelling, not a resolution.
+///
+/// `TypeShape::Named` is documented as "a reference to another interface by
+/// name", and this widens what a name may be to include a member path. The
+/// alternative - a `TypeShape::Index { base, key }` variant - is the more
+/// faithful node and is DEFERRED rather than rejected: this enum is persisted
+/// positionally into `.hbtypes`, and every resolver in the tree
+/// (`libhbdata::typeexpr::eval`, witgen, `emit`) would owe it an arm on the same
+/// commit. That is a vocabulary change to make deliberately.
+///
+/// **The reason it is admitted at all is that the spelling was ALREADY the
+/// carrier.** `highbay_ui::zui::forms` assembles a form step's rows in Rust and
+/// writes exactly `Named("HomeProps[\"user\"]")`; `libhbui::app`'s `fields_of`
+/// takes those brackets apart. So an authored document and a Rust-built tree now
+/// produce the same node for the same type, which is what let the last string
+/// splitter go. Before this arm, the authored spelling fell to `_ =>` and became
+/// `Named("unknown")` - the base GONE, exactly the defect `Omit`/`Pick` were
+/// added to repair, and it drew an EMPTY form step rather than an error.
+///
+/// The key must be a string literal, for the reason [`key_names`] refuses a
+/// non-literal: `Home[keyof X]` names something this cannot spell, and inventing
+/// a spelling for it would put `unknown` back through a different door.
+fn indexed_shape(idx: &oxc_ast::ast::TSIndexedAccessType) -> Result<TypeShape, String> {
+    let TSType::TSLiteralType(lit) = &idx.index_type else {
+        return Err("an indexed access `T[K]` takes a string literal key".to_string());
+    };
+    let oxc_ast::ast::TSLiteral::StringLiteral(key) = &lit.literal else {
+        return Err("an indexed access `T[K]` takes a string literal key".to_string());
+    };
+    let base = match type_shape(&idx.object_type)? {
+        TypeShape::Named(name) => name,
+        other => {
+            return Err(format!(
+                "an indexed access `T[\"{}\"]` needs a named base, this one is {other:?}",
+                key.value
+            ));
+        }
+    };
+    Ok(TypeShape::Named(format!("{base}[\"{}\"]", key.value)))
 }
 
 /// `T | undefined` / `T | null` -> `Option<T>`; **any other union is refused.**
@@ -2560,6 +2609,47 @@ mod tests {
                 args: vec![TypeShape::Named("User".into())],
             },
         );
+    }
+
+    /// **An indexed access keeps its SPELLING**, which is what an anonymous
+    /// member type has instead of a name.
+    ///
+    /// Before `indexed_shape` existed this fell to `type_shape`'s `_ =>` arm
+    /// and measured as `Named("unknown")` - the base gone - so a `Pick` over a
+    /// nested shape resolved against nothing and drew an EMPTY form step. The
+    /// `assert_ne` at the end is that exact state.
+    #[test]
+    fn an_indexed_access_keeps_the_member_path_it_names() {
+        let interfaces = extract_interfaces(
+            r#"
+                interface Props {
+                    user: Home["user"];
+                    picked: Pick<Home["user"], "name" | "email">;
+                }
+            "#,
+        )
+        .expect("an indexed access parses");
+        assert_eq!(interfaces[0].fields[0].ty, TypeShape::Named("Home[\"user\"]".into()));
+        assert_eq!(
+            interfaces[0].fields[1].ty,
+            TypeShape::Pick {
+                base: Box::new(TypeShape::Named("Home[\"user\"]".into())),
+                picked: vec!["name".into(), "email".into()],
+            }
+        );
+        assert_ne!(interfaces[0].fields[0].ty, TypeShape::Named("unknown".into()));
+    }
+
+    /// A key that is not a string literal is REFUSED rather than spelled
+    /// best-effort: `Home[keyof X]` names something this vocabulary cannot
+    /// write down, and inventing a spelling puts `unknown` back by another
+    /// door.
+    #[test]
+    fn an_indexed_access_with_a_computed_key_is_refused() {
+        let err = extract_interfaces(r#"interface Props { bad: Home[keyof Home]; }"#)
+            .expect_err("a computed key is refused")
+            .join("; ");
+        assert!(err.contains("string literal key"), "got: {err}");
     }
 
     /// A key position that is not a field name is REFUSED, not read
