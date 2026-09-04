@@ -403,6 +403,23 @@ fn emit_binding_expr(out: &mut String, expr: &BindingExpr) {
             out.push_str(" => ");
             emit_arrow_body(out, body);
         }
+        // `!` binds tighter than every operator in this vocabulary, so its
+        // operand goes through the same conservative wrap the others use:
+        // `!(a === b)` must keep its brackets or the re-parse is `(!a) === b`,
+        // which is a different tree.
+        BindingExpr::Not(inner) => {
+            out.push('!');
+            emit_operand(out, inner);
+        }
+        BindingExpr::Ne {
+            left,
+            right,
+            strict,
+        } => {
+            emit_operand(out, left);
+            out.push_str(if *strict { " !== " } else { " != " });
+            emit_operand(out, right);
+        }
     }
 }
 
@@ -577,11 +594,12 @@ fn begins_with_brace(expr: &BindingExpr) -> bool {
             .is_some_and(|first| is_primary(first) && begins_with_brace(first)),
         BindingExpr::Cond { cond, .. } => is_primary(cond) && begins_with_brace(cond),
         BindingExpr::Eq { left, .. } => is_primary(left) && begins_with_brace(left),
+        BindingExpr::Ne { left, .. } => is_primary(left) && begins_with_brace(left),
         // A member chain leads with its base, through the stricter predicate.
         BindingExpr::MemberOf(base, _) => is_bare_member_base(base) && begins_with_brace(base),
         // Literal, Null, Path, Array, Call, SymbolValue, Arrow and Async each
         // open with a token of their own - a value, a keyword, a name, `[`,
-        // `(` or `async`.
+        // `(` or `async`. So does `Not`, whose text always opens with `!`.
         _ => false,
     }
 }
@@ -656,6 +674,13 @@ fn is_bare_member_base(expr: &BindingExpr) -> bool {
 /// primary: an arrow body runs to the end of the expression, so
 /// `(x: unknown) => x ?? y` puts the `??` INSIDE the arrow and the operand has
 /// to be wrapped before any operator may follow it.
+///
+/// [`BindingExpr::Not`] is NOT primary either, though its text could not
+/// absorb what follows it - `!a === b` reads as `(!a) === b`, which is what
+/// the tree said. It is left out because this predicate is the conservative
+/// stand-in described above, and a redundant pair of brackets round `(!a)`
+/// costs a round trip nothing; the real precedence model is what would earn
+/// the bare spelling.
 ///
 /// [`BindingExpr::Call`] IS primary and stays so with an arrow inside it:
 /// `xs.map((x: unknown) => x) ?? y` closes the argument list with `)` before

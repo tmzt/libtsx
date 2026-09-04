@@ -601,9 +601,17 @@ pub enum BindingExpr {
     /// not for behaviour, and a consumer that later wants JS coercion
     /// semantics has the fact it needs instead of having to guess.
     ///
-    /// `!=`/`!==` are NOT this variant and stay refused: a negation is a second
-    /// operator, nothing has asked for it, and inferring it from an equality
-    /// would be inventing syntax the author did not write.
+    /// `!=`/`!==` are NOT this variant, and they are no longer refused: they
+    /// are [`Ne`](BindingExpr::Ne), appended for the purpose. The refusal that
+    /// stood here read *"a negation is a second operator, nothing has asked
+    /// for it, and inferring it from an equality would be inventing syntax the
+    /// author did not write"* - and every clause of it still holds. The second
+    /// operator is a second VARIANT rather than a rewrite of this one, and
+    /// nothing is inferred in either direction: `a != b` is `Ne`, `!(a == b)`
+    /// is [`Not`](BindingExpr::Not) wrapping this, and neither is turned into
+    /// the other. Only "nothing has asked for it" stopped being true (Tim,
+    /// 2026-09-03: *"BindingExpr has to grow to support what we need,
+    /// specifically for negation"*).
     Eq {
         left: Box<BindingExpr>,
         right: Box<BindingExpr>,
@@ -725,6 +733,58 @@ pub enum BindingExpr {
     /// workspace already disagree, which is the evidence that it was never one
     /// meaning.
     Null,
+    /// **The prefix `!`** - the authored negation, `!x`.
+    ///
+    /// **Appended after [`Null`](BindingExpr::Null), with
+    /// [`Ne`](BindingExpr::Ne) beside it.** A pure append, so `HBDEF_VERSION`
+    /// does not move: *"a variant APPENDED to an enum is the one shape that
+    /// does not force a bump ... existing indices are untouched"*
+    /// (`libhbui::codec`). The cost arrives the day an author WRITES one, per
+    /// this enum's own rule above.
+    ///
+    /// Boxed because the operand is an ordinary expression, including another
+    /// `Not`. `!!x` is `Not(Not(x))`, which is what the author wrote; nothing
+    /// here collapses a double negation, because "these two cancel" is a
+    /// MEANING and meanings belong to the lowering.
+    ///
+    /// **Only the LOGICAL not.** `-x`, `+x`, `~x`, `typeof x`, `void x` and
+    /// `delete x` share oxc's unary node and stay refused by name: each is a
+    /// different operator answering a different question, and none has been
+    /// asked for. TypeScript's POSTFIX `!` (the non-null assertion) is a
+    /// different node entirely and is refused where it is written.
+    Not(Box<BindingExpr>),
+    /// `a !== b` and `a != b` - an inequality test, mirroring
+    /// [`Eq`](BindingExpr::Eq) field for field.
+    ///
+    /// **Appended after [`Not`](BindingExpr::Not) on purpose.**
+    ///
+    /// # Why this is a variant and not `Not(Eq { .. })`
+    ///
+    /// Because a serialization of an [`Element`] is *"the element as authored,
+    /// which is what makes graph -> TSX a real direction rather than an
+    /// aspiration"* - and `a != b` and `!(a == b)` are two things an author can
+    /// write. Lowering the first into the second makes them ONE shape, and the
+    /// emitter then has to guess which was written. That is the same loss
+    /// `Eq`'s `strict` field exists to refuse, one operator along: capture the
+    /// form, leave the meaning to the lowering.
+    ///
+    /// The meaning is expected to be one formula either way - a consumer
+    /// evaluates `Ne` as a negated `Eq` - and that is a judgment for the
+    /// consumer to make with a scope in hand, not a normalisation for this
+    /// layer to bake into the capture. Nothing is inferred in EITHER
+    /// direction: a `Not` wrapping an `Eq` stays that, and is not rewritten
+    /// into this.
+    ///
+    /// `strict` is `true` for `!==` and `false` for `!=`, recorded for the
+    /// reason `Eq` records it: the two operators differ exactly where coercion
+    /// would happen, and folding them together answers that question here
+    /// instead of leaving it to the consumer.
+    Ne {
+        left: Box<BindingExpr>,
+        right: Box<BindingExpr>,
+        /// `true` for `!==`, `false` for `!=`.
+        strict: bool,
+    },
 }
 
 impl BindingExpr {

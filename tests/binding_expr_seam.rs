@@ -61,6 +61,13 @@ fn one_expression_of_each_variant_crosses_the_seam_and_comes_back() {
         "c ? t : o",
         "a === b",
         "a == b",
+        "!a",
+        "a !== b",
+        "a != b",
+        // The two forms that must not collapse into one another, both spelled
+        // the way emit spells them: an inequality keeps its operator, and a
+        // negated equality keeps its brackets.
+        "!(a == b)",
         "(x: number) => x",
         "(x: number) => ({a: 1})",
         // F1's shape: the body's leading TOKEN is a brace, so the body is

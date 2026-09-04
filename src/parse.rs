@@ -38,6 +38,7 @@ use oxc_ast::ast::{
     ArrowFunctionExpression, ExportDefaultDeclarationKind, Expression, ImportDeclarationSpecifier,
     BinaryOperator, JSXAttributeItem, JSXAttributeName, JSXAttributeValue, JSXChild, JSXElement,
     JSXElementName, LogicalOperator, ModuleExportName, PropertyKey, Statement, TSSignature, TSType,
+    UnaryOperator,
 };
 use oxc_parser::Parser;
 use oxc_span::{SourceType, Span};
@@ -2072,10 +2073,8 @@ fn lower_binding_expr(expr: &Expression, _scope: &ImportScope) -> Result<Binding
             then: Box::new(lower_binding_expr(&cond.consequent, _scope)?),
             other: Box::new(lower_binding_expr(&cond.alternate, _scope)?),
         }),
-        // `===` and `==`, and ONLY those two of oxc's binary operators. The
-        // negations are a second operator and stay refused (see
-        // [`BindingExpr::Eq`]); every ordering comparison is refused for want
-        // of anything asking for one.
+        // `===` and `==`, and ONLY those two of oxc's binary operators. Every
+        // ordering comparison is refused for want of anything asking for one.
         Expression::BinaryExpression(binary)
             if matches!(
                 binary.operator,
@@ -2087,6 +2086,35 @@ fn lower_binding_expr(expr: &Expression, _scope: &ImportScope) -> Result<Binding
                 right: Box::new(lower_binding_expr(&binary.right, _scope)?),
                 strict: binary.operator == BinaryOperator::StrictEquality,
             })
+        }
+        // `!==` and `!=`, lowered to their OWN variant and never to a negated
+        // equality. `a != b` and `!(a == b)` are two things an author can
+        // write, and a capture that produced one shape for both would leave
+        // the emitter guessing which - see [`BindingExpr::Ne`]. Nothing is
+        // inferred in either direction here: this arm never builds a `Not`,
+        // and the unary arm below never builds a `Ne`.
+        Expression::BinaryExpression(binary)
+            if matches!(
+                binary.operator,
+                BinaryOperator::StrictInequality | BinaryOperator::Inequality
+            ) =>
+        {
+            Ok(B::Ne {
+                left: Box::new(lower_binding_expr(&binary.left, _scope)?),
+                right: Box::new(lower_binding_expr(&binary.right, _scope)?),
+                strict: binary.operator == BinaryOperator::StrictInequality,
+            })
+        }
+        // The prefix `!`, and ONLY it of oxc's unary operators - `-`, `+`,
+        // `~`, `typeof`, `void` and `delete` share this node kind and stay
+        // refused, each being a different operator nothing has asked for. The
+        // arm is written on the OPERATOR rather than the node for exactly the
+        // reason the `??` arm above is: matching the node would silently lower
+        // `typeof x` as a negation.
+        Expression::UnaryExpression(unary)
+            if unary.operator == UnaryOperator::LogicalNot =>
+        {
+            Ok(B::Not(Box::new(lower_binding_expr(&unary.argument, _scope)?)))
         }
         Expression::ComputedMemberExpression(_) => {
             Err("computed member paths are unsupported".into())
@@ -2326,21 +2354,36 @@ fn binding_expr_kind(expr: &Expression) -> &'static str {
             LogicalOperator::Coalesce => "`??`",
         },
         Expression::ConditionalExpression(_) => "conditional",
-        // Reached for every binary operator EXCEPT `===`/`==`, which have a
-        // positive arm. The negations are named individually because "we
-        // support equality" and "we refused your `!==`" are one keystroke
-        // apart, and an author who is told only "binary-operator" will read
-        // that as the equality support being absent.
+        // Reached for every binary operator EXCEPT the four equalities
+        // (`===`/`==`/`!==`/`!=`), which have positive arms. The inequalities
+        // used to be named individually HERE, because "we support equality"
+        // and "we refused your `!==`" are one keystroke apart; they lower now,
+        // so the naming moved from the refusal to the capture and the arms
+        // that spelled it are gone rather than left as dead reassurance.
         Expression::BinaryExpression(binary) => match binary.operator {
-            BinaryOperator::Inequality => "`!=`",
-            BinaryOperator::StrictInequality => "`!==`",
             BinaryOperator::LessThan
             | BinaryOperator::LessEqualThan
             | BinaryOperator::GreaterThan
             | BinaryOperator::GreaterEqualThan => "ordering-comparison",
             _ => "binary-operator",
         },
-        Expression::UnaryExpression(_) => "unary-operator",
+        // Reached for every unary operator EXCEPT `!`, which has a positive
+        // arm. Named individually for the reason the inequalities once were:
+        // an author who writes `typeof x` and is told only "unary-operator"
+        // has no way to tell whether `!x` went the same way.
+        Expression::UnaryExpression(unary) => match unary.operator {
+            UnaryOperator::UnaryNegation => "`-`",
+            UnaryOperator::UnaryPlus => "`+`",
+            UnaryOperator::BitwiseNot => "`~`",
+            UnaryOperator::Typeof => "`typeof`",
+            UnaryOperator::Void => "`void`",
+            UnaryOperator::Delete => "`delete`",
+            // `!` has a positive arm and cannot reach a refusal from here.
+            // The arm exists because the match is exhaustive; it names the
+            // operator anyway, so a future path that did reach it would say
+            // something true rather than something reassuring.
+            UnaryOperator::LogicalNot => "`!`",
+        },
         Expression::AwaitExpression(_) => "await",
         _ => "expression",
     }
@@ -3093,16 +3136,27 @@ mod tests {
     ///
     /// Before this change all three produced `"expression expressions are
     /// unsupported"`, which named nothing.
+    ///
+    /// **`!=`, `!==` and `!` LEFT this list**, and where they went is pinned
+    /// by [`both_inequality_operators_lower_and_keep_their_spelling`] and
+    /// [`the_prefix_negation_lowers_as_the_form_the_author_wrote`]. The unary
+    /// operators that stay refused replace `!a` here for the reason the
+    /// inequalities were once named individually: `!x` lowering and `typeof x`
+    /// not is one keystroke of difference, and an author told only
+    /// "unary-operator" cannot tell which side of that line they are on.
     #[test]
     fn the_other_logical_operators_are_refused_by_name() {
         for (source, expected) in [
             (r#"<Thing value={a || b}/>"#, "`||`"),
             (r#"<Thing value={a && b}/>"#, "`&&`"),
             (r#"<Thing value={a > b}/>"#, "ordering-comparison"),
-            (r#"<Thing value={a != b}/>"#, "`!=`"),
-            (r#"<Thing value={a !== b}/>"#, "`!==`"),
             (r#"<Thing value={a + b}/>"#, "binary-operator"),
-            (r#"<Thing value={!a}/>"#, "unary-operator"),
+            (r#"<Thing value={-a}/>"#, "`-`"),
+            (r#"<Thing value={+a}/>"#, "`+`"),
+            (r#"<Thing value={~a}/>"#, "`~`"),
+            (r#"<Thing value={typeof a}/>"#, "`typeof`"),
+            (r#"<Thing value={void a}/>"#, "`void`"),
+            (r#"<Thing value={delete a.b}/>"#, "`delete`"),
         ] {
             let Err(ParseError::Effect(EffectError::BindingSyntax { message, .. })) =
                 ParseCtx::default().parse_tsx(source)
@@ -3296,6 +3350,144 @@ mod tests {
         );
     }
 
+    /// **The prefix `!` lowers as the form the author wrote, and only that.**
+    ///
+    /// `!x` is a `Not`; so is `!(a == b)`, and the equality UNDER it stays an
+    /// equality. That second clause is the direction this test owns: rewriting
+    /// a negated equality into a [`BindingExpr::Ne`] on the way in would be as
+    /// much of an invention as the reverse, and the emitter would then put
+    /// back a `!=` nobody typed. The sibling test owns the other direction.
+    ///
+    /// The last case is the one a reader gets wrong: `!` binds tighter than
+    /// `===`, so `!a === b` is an equality whose LEFT is a negation, not a
+    /// negated equality. One bracket separates them and the capture keeps
+    /// them apart.
+    #[test]
+    fn the_prefix_negation_lowers_as_the_form_the_author_wrote() {
+        assert_eq!(
+            binding_of(r#"<Thing value={!props.ready}/>"#),
+            BindingExpr::Not(Box::new(path(&["props", "ready"])))
+        );
+        assert_eq!(
+            binding_of(r#"<Thing value={!(a == b)}/>"#),
+            BindingExpr::Not(Box::new(BindingExpr::Eq {
+                left: Box::new(path(&["a"])),
+                right: Box::new(path(&["b"])),
+                strict: false,
+            })),
+            "a negated LOOSE equality keeps both halves of what was written"
+        );
+        assert_eq!(
+            binding_of(r#"<Thing value={!(a === b)}/>"#),
+            BindingExpr::Not(Box::new(BindingExpr::Eq {
+                left: Box::new(path(&["a"])),
+                right: Box::new(path(&["b"])),
+                strict: true,
+            }))
+        );
+        assert_eq!(
+            binding_of(r#"<Thing value={!!a}/>"#),
+            BindingExpr::Not(Box::new(BindingExpr::Not(Box::new(path(&["a"]))))),
+            "a double negation is two nodes - cancelling them is a meaning"
+        );
+        assert_eq!(
+            binding_of(r#"<Thing value={!a === b}/>"#),
+            BindingExpr::Eq {
+                left: Box::new(BindingExpr::Not(Box::new(path(&["a"])))),
+                right: Box::new(path(&["b"])),
+                strict: true,
+            }
+        );
+    }
+
+    /// **`!==` and `!=` lower to [`BindingExpr::Ne`], and NEITHER is a
+    /// `Not(Eq)`.**
+    ///
+    /// The second clause is the load-bearing one, and it is ASSERTED rather
+    /// than described because the alternative lowering is the attractive one:
+    /// `Not(Eq { .. })` needs no new variant and every consumer would evaluate
+    /// it identically. What it costs is the round trip - `a != b` would become
+    /// indistinguishable from the `!(a == b)` an author could equally have
+    /// written, so the emitter has to pick one spelling for both and the
+    /// serialization stops being the element as authored.
+    ///
+    /// `strict` is carried for the reason [`BindingExpr::Eq`] carries it: the
+    /// two operators differ exactly where coercion would happen.
+    #[test]
+    fn both_inequality_operators_lower_and_keep_their_spelling() {
+        assert_eq!(
+            binding_of(r#"<Thing value={design().fidelity !== "lofi"}/>"#),
+            BindingExpr::Ne {
+                left: Box::new(BindingExpr::MemberOf(
+                    Box::new(BindingExpr::SymbolValue(ObjectSymbol::Design)),
+                    PropertyAccessor::Named("fidelity".into()),
+                )),
+                right: Box::new(BindingExpr::Literal(LiteralValue::String("lofi".into()))),
+                strict: true,
+            }
+        );
+        assert_eq!(
+            binding_of(r#"<Thing value={props.kind != "row"}/>"#),
+            BindingExpr::Ne {
+                left: Box::new(path(&["props", "kind"])),
+                right: Box::new(BindingExpr::Literal(LiteralValue::String("row".into()))),
+                strict: false,
+            },
+            "a loose inequality is recorded as a loose inequality"
+        );
+        for (inequality_source, negated_source) in [
+            (
+                r#"<Thing value={a != b}/>"#,
+                r#"<Thing value={!(a == b)}/>"#,
+            ),
+            (
+                r#"<Thing value={a !== b}/>"#,
+                r#"<Thing value={!(a === b)}/>"#,
+            ),
+        ] {
+            let inequality = binding_of(inequality_source);
+            let negated = binding_of(negated_source);
+            assert!(
+                matches!(inequality, BindingExpr::Ne { .. }),
+                "{inequality_source} lowered to {inequality:?}, not an inequality"
+            );
+            assert!(
+                matches!(negated, BindingExpr::Not(_)),
+                "{negated_source} lowered to {negated:?}, not a negation"
+            );
+            assert_ne!(
+                inequality, negated,
+                "{inequality_source} and {negated_source} are two authored \
+                 forms and must not share one capture"
+            );
+        }
+    }
+
+    /// **Each negated spelling comes back out as the operator it went in
+    /// with**, which is the whole reason there are two variants and not one.
+    ///
+    /// Asserted on the emitted TEXT, because that is where a fold would show:
+    /// a lowering that turned `a != b` into `Not(Eq)` would still round-trip
+    /// tree-to-tree (the sibling round-trip test would stay green) and would
+    /// emit `!(a == b)` for a source that said `a != b`.
+    #[test]
+    fn a_negation_re_emits_as_the_operator_it_was_written_with() {
+        for (source, expected) in [
+            (r#"<Thing value={a != b}/>"#, "a != b"),
+            (r#"<Thing value={a !== b}/>"#, "a !== b"),
+            (r#"<Thing value={!(a == b)}/>"#, "!(a == b)"),
+            (r#"<Thing value={!(a === b)}/>"#, "!(a === b)"),
+            (r#"<Thing value={!props.ready}/>"#, "!props.ready"),
+        ] {
+            let doc = parse_tsx(source).expect("parse");
+            let emitted = crate::emit::emit_tsx_document(&doc);
+            assert!(
+                emitted.contains(expected),
+                "{source} should re-emit {expected:?}, emitted {emitted:?}"
+            );
+        }
+    }
+
     /// Computed access stays refused wherever it sits in a chain.
     #[test]
     fn computed_access_is_still_refused_under_a_call() {
@@ -3329,6 +3521,22 @@ mod tests {
             r#"<Thing value={(a === b) === c}/>"#,
             r#"<Thing value={props.kind == "row"}/>"#,
             r#"<Thing value={(a ?? b) === c}/>"#,
+            // The two negations. `!` binds tighter than every operator here,
+            // so the cases that decide the emitter are the ones where its
+            // operand is an operator (brackets REQUIRED, or the re-parse is a
+            // negation of the left operand alone) and the ones where a
+            // negation is an operand (brackets redundant and harmless).
+            r#"<Thing value={!props.ready}/>"#,
+            r#"<Thing value={!(a === b)}/>"#,
+            r#"<Thing value={!(a ?? b)}/>"#,
+            r#"<Thing value={!(a ? b : c)}/>"#,
+            r#"<Thing value={!!a}/>"#,
+            r#"<Thing value={!a === b}/>"#,
+            r#"<Thing value={a !== b}/>"#,
+            r#"<Thing value={props.kind != "row"}/>"#,
+            r#"<Thing value={a != b ? c : d}/>"#,
+            r#"<Thing value={!(a != b)}/>"#,
+            r#"<Thing value={xs.map(x => !x.hidden)}/>"#,
             // The expression-bodied arrow, and the four shapes whose
             // parenthesisation the emitter has to get right: an operator
             // BESIDE an arrow (the arrow's body would swallow it), an operator
