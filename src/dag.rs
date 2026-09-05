@@ -19,11 +19,14 @@
 //!   restricted semantic AST that projects symmetrically across language
 //!   views and synthesizes directly to wasm. Complex Modules are *not*
 //!   represented here; they are opaque native-language units by design.
-//! * **Imported calls** ([`ImportedCall`], [`AttrValue::ImportedCall`]) -
-//!   `onGrommet={frobnicate("sprocket")}`: an [`is_event_binding`] attribute whose value
-//!   is ONE call resolving to a granted host import. Deliberately *not* a
-//!   handler and not a body - see [`ImportedCall`] and [`HOST_PREFIX`]
-//!   (LIBHBUI_PLAN Rules 46, 46a, 48).
+//! * **Event bindings** ([`AttrValue::BindingExpr`] carrying a
+//!   [`BindingExpr::Call`]) - `onGrommet={frobnicate("sprocket")}`: an
+//!   [`is_event_binding`] attribute whose value is ONE call resolving to a
+//!   granted host import. Deliberately *not* a handler and not a body - see
+//!   [`BindingExpr::Call`] and [`HOST_PREFIX`] (LIBHBUI_PLAN Rules 46, 46a,
+//!   48). There is no variant of its own: an imported call in expression
+//!   position is an ordinary call, and whether the thing on the other end is
+//!   an EFFECT is the embedding's reading (Rule 52).
 //! * **The embedding's provider** ([`ParserHost`], [`Resolution`]) - what a
 //!   module specifier resolves to. Not graph data: it is the question the
 //!   parse asks whoever embeds it, and the reason no name from any embedding's
@@ -208,38 +211,36 @@ pub enum AttrValue {
     Binding(String),
     /// An expression we don't lower (element/fragment/complex expr).
     Opaque,
-    /// `onGrommet={frobnicate("sprocket")}` - a **call to an imported symbol**
-    /// (LIBHBUI_PLAN Rules 46, 46a, 48).
+    /// An owned object/data binding expression - and, since the event lowering
+    /// re-pointed here, **the shape an `on..` attribute takes too**.
     ///
-    /// The names in that spelling are libtsx's own placeholders and belong to
-    /// no embedding: what an attribute or an imported name MEANS is the
-    /// embedding's model (Rule 52, [`ParserHost`]).
+    /// This is deliberately separate from [`Binding`](AttrValue::Binding),
+    /// which is the legacy path spelling.
     ///
-    /// The attribute name matched [`is_event_binding`], so the author declared
-    /// an event binding; the value was one call expression resolving to a
-    /// declared host import. See [`ImportedCall`].
+    /// # `ImportedCall` was here, and it is subsumed
     ///
-    /// # It was called `NamedEffect`, and that name claimed a meaning
+    /// An `ImportedCall { namespace, name, args }` variant sat between
+    /// [`Opaque`](AttrValue::Opaque) and this one and carried the narrow event
+    /// grammar. It is gone, subsumed the way `Member` was subsumed by
+    /// [`MemberOf`](BindingExpr::MemberOf): an imported call in expression
+    /// position is an ordinary [`BindingExpr::Call`], which already carries a
+    /// `namespace`, a `name` and `args` - **and a `type_args` the removed
+    /// variant had nowhere to put**. `frobnicate<Sprocket>("x")` and
+    /// `frobnicate("x")` captured as the same value under the old shape, which
+    /// is the identical erasure [`Element::type_args`] exists to prevent for
+    /// `<List<Message>>`.
     ///
-    /// An "effect" is something that HAPPENS - it is run, it mutates, it
-    /// navigates. None of that is knowable here. libtsx read a call, resolved
-    /// its callee through the import chain, and checked its arguments against
-    /// the signature the embedding handed over; whether the thing on the other
-    /// end is an effect, a pure query or a no-op is the embedding's model, and
-    /// naming this variant after one of those readings put the embedding's
-    /// vocabulary into the parser's (Rule 52, the same rule
-    /// [`ParserHost`] exists to keep).
+    /// What does NOT move down here is the CHECKING: an `on..` attribute's
+    /// value is still resolved through the module's import chain against the
+    /// signature the embedding declares ([`ParserHost`]), and still refused
+    /// with an [`EffectError`] when it is not one call to a granted host
+    /// import. Only the carrier changed. Whether the thing on the other end is
+    /// an EFFECT stays the embedding's reading (Rule 52) - the parser reads a
+    /// call.
     ///
-    /// **Kept after all preceding variants on purpose.** postcard encodes enum
-    /// variants positionally, so existing values above it must not move - and
-    /// the rename costs no bytes for the same reason: postcard writes indices,
-    /// never names.
-    ImportedCall(ImportedCall),
-    /// An owned object/data binding expression. This is deliberately separate
-    /// from [`Binding`] and [`ImportedCall`]: the former is the legacy path
-    /// spelling and the latter is the narrow, checked event grammar.
-    ///
-    /// **Appended last on purpose.** `AttrValue` is persisted positionally.
+    /// **A removal costs a version bump**, because postcard encodes enum
+    /// variants by index with no names in the bytes: this variant moved from
+    /// index 6 to index 5, so `libhbui`'s `HBDEF_VERSION` is 4 for it.
     BindingExpr(BindingExpr),
 }
 
@@ -274,65 +275,6 @@ pub fn is_event_binding(attr: &str) -> bool {
     attr.strip_prefix("on")
         .and_then(|rest| rest.chars().next())
         .is_some_and(|c| c.is_ascii_uppercase())
-}
-
-/// **A call to an imported symbol**: a declared host import, named, with its
-/// arguments (LIBHBUI_PLAN Rules 46a, 48).
-///
-/// This is all libtsx knows and all it is entitled to know. The parse resolved
-/// [`name`] through the module's import chain to an exported name in
-/// [`namespace`], and checked [`args`] against the [`FuncSig`] that namespace
-/// declares. What the call DOES on the other side is the embedding's model.
-///
-/// # It was called `NamedEffect`, and the name misled two ways
-///
-/// **"Effect" was a claim libtsx cannot make.** The word says the callee runs
-/// something - navigates, mutates, fires. libtsx never learns that: it sees an
-/// import, a callee, a signature and some literals. Naming the type after the
-/// embedding's reading of the callee is the same mistake [`ParserHost`] is
-/// named to avoid (Rule 52), and it has since become actively ambiguous -
-/// "effect" now also names a pipeline stage (`libeffects`) and a value
-/// accessor, neither of which is this.
-///
-/// **"Named" was defending the wrong thing.** It was there to say a call here
-/// is never anonymous, but that is a property of being a resolved IMPORT: a
-/// carrier holding an arbitrary [`Expr`] could not be an imported call at all,
-/// because there would be nothing to resolve. The new name carries that
-/// guarantee in the noun, so the adjective has no work left to do.
-///
-/// **The identity is the QUALIFIED name** (Rule 48): [`namespace`] and [`name`]
-/// together, never the bare name. A bare name is only unique inside one grant,
-/// and there is more than one grant - a provider answers for as many namespaces
-/// as the embedding declares. Dropping the namespace here would make two
-/// namespaces exporting a `frobnicate` with different meanings the same call
-/// to every reader downstream, and a decoded tree carrying one of them would
-/// pass a grant check written against the other.
-///
-/// [`name`]: ImportedCall::name
-/// [`namespace`]: ImportedCall::namespace
-/// [`args`]: ImportedCall::args
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ImportedCall {
-    /// The **specifier it was imported from** - the granted host namespace, as
-    /// the source spelled it and as the provider answered for it. Half the
-    /// identity, and the half a bare name cannot recover.
-    pub namespace: String,
-    /// The host import's **exported** name - the `imported` half of the import
-    /// chain, so `import { frobnicate as fb }` and a call to `fb(..)` both
-    /// arrive here as `frobnicate`. An alias is resolved once, at parse, rather
-    /// than at every reader.
-    pub name: String,
-    /// The call's arguments, in source order, lowered against the declared
-    /// parameter types.
-    ///
-    /// **Literals and binding paths**, and nothing else - this call grammar is
-    /// not an expression language (Rule 46a). A literal arrives as the
-    /// `Expr::Lit*` its declared parameter type chose; a binding path (`{id}`,
-    /// `{props.user.name}`) arrives as [`Expr::Get`], which is the existing
-    /// path-read variant and not a new one, so a decoder that never met a
-    /// binding argument still knows the shape it arrives in. Everything that
-    /// computes is [`EffectError::ArgNotALiteral`].
-    pub args: Vec<Expr>,
 }
 
 /// **A literal accepted by an owned object/data binding expression, at the
@@ -1163,8 +1105,8 @@ pub enum Resolution<'a> {
     /// A **granted host namespace** and the signatures it declares - an import
     /// with no source, whose qualified name *is* its identity (Rule 48).
     ///
-    /// The only answer that supplies anything an [`ImportedCall`] can resolve
-    /// against.
+    /// The only answer that supplies anything an `on..` attribute's call can
+    /// resolve against.
     Host(&'a [FuncSig]),
 }
 
@@ -1370,7 +1312,7 @@ pub enum EffectError {
     /// `handlers = { onGrommet: frobnicate("x") }` would reach an element as *no
     /// attribute at all*. The attribute loop never sees an `on..` name, so
     /// every refusal above is blind to it, and the effect is erased by exactly
-    /// the route the [`AttrValue::ImportedCall`] producer exists to close.
+    /// the route the event lowering exists to close.
     ///
     /// It could not be honoured even if it were resolvable: an attribute set
     /// spread from a value cannot be checked against declared props, so
@@ -1382,7 +1324,8 @@ pub enum EffectError {
     },
     /// An ordinary JSX object binding cannot be represented by the owned
     /// expression vocabulary. Unlike an event refusal, this names the
-    /// attribute syntax itself and never changes `ImportedCall` semantics.
+    /// attribute syntax itself and never changes the event grammar's
+    /// semantics.
     BindingSyntax {
         /// The ordinary attribute carrying the rejected expression.
         attr: String,
@@ -2254,10 +2197,13 @@ mod tests {
                     // fixture in libtsx that spelled an embedding's real effect
                     // would be the leak this crate's tests exist to catch.
                     "onGrommet".into(),
-                    AttrValue::ImportedCall(ImportedCall {
+                    AttrValue::BindingExpr(BindingExpr::Call {
                         namespace: "host:zork".into(),
                         name: "frobnicate".into(),
-                        args: vec![Expr::LitStr("sprocket".into())],
+                        type_args: vec![TypeShape::Named("Sprocket".into())],
+                        args: vec![BindingExpr::Literal(LiteralValue::String(
+                            "sprocket".into(),
+                        ))],
                     }),
                 ),
             ],

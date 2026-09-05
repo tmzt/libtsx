@@ -31,8 +31,8 @@
 #![cfg(feature = "parse")]
 
 use libtsx::dag::{
-    AttrValue, BindingExpr, EffectError, Expr, FieldDecl, FuncSig, ImportKind, LiteralValue,
-    ImportedCall, Node, ParserHost, Resolution, TsxDocument, TypeShape,
+    AttrValue, BindingExpr, EffectError, FieldDecl, FuncSig, ImportKind, LiteralValue, Node,
+    ParserHost, Resolution, TsxDocument, TypeShape,
 };
 use libtsx::{ParseCtx, ParseError, parse_tsx};
 
@@ -213,10 +213,11 @@ fn the_parse_splits_host_from_imported_from_unimported() {
             <Widget id="a" onGrommet={{frobnicate("sprocket")}} />
             "#
         )),
-        AttrValue::ImportedCall(ImportedCall {
+        AttrValue::BindingExpr(BindingExpr::Call {
             namespace: ZORK.into(),
             name: "frobnicate".into(),
-            args: vec![Expr::LitStr("sprocket".into())],
+            type_args: vec![],
+            args: vec![BindingExpr::Literal(LiteralValue::String("sprocket".into()))],
         })
     );
 
@@ -329,10 +330,11 @@ fn an_event_binding_carries_a_named_effect() {
             <Widget id="a" onGrommet={{frobnicate("sprocket")}} />
             "#
         )),
-        AttrValue::ImportedCall(ImportedCall {
+        AttrValue::BindingExpr(BindingExpr::Call {
             namespace: ZORK.into(),
             name: "frobnicate".into(),
-            args: vec![Expr::LitStr("sprocket".into())],
+            type_args: vec![],
+            args: vec![BindingExpr::Literal(LiteralValue::String("sprocket".into()))],
         })
     );
 
@@ -346,10 +348,11 @@ fn an_event_binding_carries_a_named_effect() {
             <Widget id="a" onGrommet={{fb("sprocket")}} />
             "#
         )),
-        AttrValue::ImportedCall(ImportedCall {
+        AttrValue::BindingExpr(BindingExpr::Call {
             namespace: ZORK.into(),
             name: "frobnicate".into(),
-            args: vec![Expr::LitStr("sprocket".into())],
+            type_args: vec![],
+            args: vec![BindingExpr::Literal(LiteralValue::String("sprocket".into()))],
         })
     );
 
@@ -364,10 +367,14 @@ fn an_event_binding_carries_a_named_effect() {
             <Lamp id="a" onXyzzy={{wibble(250, true)}} />
             "#
         )),
-        AttrValue::ImportedCall(ImportedCall {
+        AttrValue::BindingExpr(BindingExpr::Call {
             namespace: GRUE.into(),
             name: "wibble".into(),
-            args: vec![Expr::LitS32(250), Expr::LitBool(true)],
+            type_args: vec![],
+            args: vec![
+                BindingExpr::Literal(LiteralValue::Int32(250)),
+                BindingExpr::Literal(LiteralValue::Bool(true)),
+            ],
         })
     );
 
@@ -409,8 +416,8 @@ fn an_event_binding_carries_a_named_effect() {
 /// downstream, which is precisely how an effect from a second vocabulary passes
 /// a grant check written against the first.
 ///
-/// The `assert_ne!` is the gate: drop `namespace` from [`ImportedCall`] and it is
-/// the only assertion in the file that fails.
+/// The `assert_ne!` is the gate: drop the `namespace` a granted call carries and
+/// it is the only assertion in the file that fails.
 #[test]
 fn the_same_name_under_two_namespaces_is_two_effects() {
     let call = |namespace: &str| {
@@ -426,18 +433,20 @@ fn the_same_name_under_two_namespaces_is_two_effects() {
 
     assert_eq!(
         from_zork,
-        AttrValue::ImportedCall(ImportedCall {
+        AttrValue::BindingExpr(BindingExpr::Call {
             namespace: ZORK.into(),
             name: "frobnicate".into(),
-            args: vec![Expr::LitStr("sprocket".into())],
+            type_args: vec![],
+            args: vec![BindingExpr::Literal(LiteralValue::String("sprocket".into()))],
         })
     );
     assert_eq!(
         from_grue,
-        AttrValue::ImportedCall(ImportedCall {
+        AttrValue::BindingExpr(BindingExpr::Call {
             namespace: GRUE.into(),
             name: "frobnicate".into(),
-            args: vec![Expr::LitStr("sprocket".into())],
+            type_args: vec![],
+            args: vec![BindingExpr::Literal(LiteralValue::String("sprocket".into()))],
         })
     );
     assert_ne!(
@@ -617,17 +626,19 @@ fn arguments_are_checked_against_the_declared_signature() {
 }
 
 /// **A BINDING PATH is an argument.** An identifier or a static member chain
-/// lowers to [`Expr::Get`] - the same distinct first-class form
+/// lowers to [`BindingExpr::Path`] - the same distinct first-class form
 /// `AttrValue::Binding` is for an ordinary attribute - so an effect fired from
 /// inside a repeated template can be handed that instance's own field.
 ///
 /// Rule 46a is unmoved: the test above still refuses everything that computes.
 /// What this pins is that a *path* was never a computation, and that the value
-/// it lowers to is the pre-existing `Get` variant rather than a new one, so no
-/// encoded shape changed to admit it.
+/// it lowers to is the pre-existing path variant rather than a new one, so no
+/// encoded shape changed to admit it. (It read `Expr::Get` until the event
+/// lowering re-pointed at `BindingExpr`; the claim is unchanged, the vocabulary
+/// carrying it is the ordinary one.)
 #[test]
 fn a_binding_path_is_an_effect_argument_and_lowers_to_a_path_read() {
-    let effect = |call: &str| -> ImportedCall {
+    let effect = |call: &str| -> Vec<BindingExpr> {
         let doc = ctx()
             .parse_tsx(&format!(
                 r#"
@@ -640,21 +651,23 @@ fn a_binding_path_is_an_effect_argument_and_lowers_to_a_path_read() {
             panic!("one element");
         };
         match el.attr("onGrommet") {
-            Some(AttrValue::ImportedCall(e)) => e.clone(),
+            Some(AttrValue::BindingExpr(BindingExpr::Call { args, .. })) => args.clone(),
             other => panic!("{other:?}"),
         }
     };
 
     assert_eq!(
-        effect("frobnicate(id)").args,
-        vec![Expr::Get { path: "id".into() }],
+        effect("frobnicate(id)"),
+        vec![BindingExpr::Path(vec!["id".into()])],
         "a bare identifier is the row's own field",
     );
     assert_eq!(
-        effect("frobnicate(props.user.name)").args,
-        vec![Expr::Get {
-            path: "props.user.name".into()
-        }],
+        effect("frobnicate(props.user.name)"),
+        vec![BindingExpr::Path(vec![
+            "props".into(),
+            "user".into(),
+            "name".into()
+        ])],
         "a static member chain keeps its whole path",
     );
 
@@ -673,16 +686,14 @@ fn a_binding_path_is_an_effect_argument_and_lowers_to_a_path_read() {
     let Some(Node::Element(el)) = doc.root_nodes.first() else {
         panic!("one element");
     };
-    let Some(AttrValue::ImportedCall(effect)) = el.attr("onGrommet") else {
+    let Some(AttrValue::BindingExpr(BindingExpr::Call { args, .. })) = el.attr("onGrommet") else {
         panic!("an effect");
     };
     assert_eq!(
-        effect.args,
+        *args,
         vec![
-            Expr::Get {
-                path: "after".into()
-            },
-            Expr::LitBool(true)
+            BindingExpr::Path(vec!["after".into()]),
+            BindingExpr::Literal(LiteralValue::Bool(true)),
         ],
     );
 }
@@ -945,10 +956,11 @@ fn a_parsed_effect_survives_serde() {
     };
     assert_eq!(
         row.attr("onGrommet"),
-        Some(&AttrValue::ImportedCall(ImportedCall {
+        Some(&AttrValue::BindingExpr(BindingExpr::Call {
             namespace: ZORK.into(),
             name: "frobnicate".into(),
-            args: vec![Expr::LitStr("sprocket".into())],
+            type_args: vec![],
+            args: vec![BindingExpr::Literal(LiteralValue::String("sprocket".into()))],
         })),
         "the effect did not survive the round trip",
     );
@@ -987,10 +999,11 @@ fn one_context_serves_parse_app_as_well_as_parse_tsx() {
     };
     assert_eq!(
         widget.attr("onGrommet"),
-        Some(&AttrValue::ImportedCall(ImportedCall {
+        Some(&AttrValue::BindingExpr(BindingExpr::Call {
             namespace: ZORK.into(),
             name: "frobnicate".into(),
-            args: vec![Expr::LitStr("sprocket".into())],
+            type_args: vec![],
+            args: vec![BindingExpr::Literal(LiteralValue::String("sprocket".into()))],
         })),
         "the effect did not survive the splice",
     );
@@ -1011,9 +1024,9 @@ fn one_context_serves_parse_app_as_well_as_parse_tsx() {
 /// `<Widget {...handlers}/>` used to parse clean and yield a `<Widget>` with
 /// **no binding**: the attribute loop only ever saw
 /// `JSXAttributeItem::Attribute`, so a spread fell off the end and the
-/// event-binding recognition was never consulted. That is the erasure the
-/// `ImportedCall` producer exists to close, arriving by the one route none of
-/// its refusals watch.
+/// event-binding recognition was never consulted. That is the erasure the event
+/// lowering exists to close, arriving by the one route none of its refusals
+/// watch.
 #[test]
 fn a_spread_attribute_is_refused() {
     // The erasure itself: an effect that reaches the element as nothing.
@@ -1116,4 +1129,60 @@ fn every_effect_refusal_renders_ascii() {
         assert!(e.to_string().is_ascii(), "{e:?}");
         assert!(!e.to_string().is_empty());
     }
+}
+
+/// **An event call's TYPE ARGUMENTS survive the capture** - the property the
+/// shared call form exists for (FACT_WAVES W9a, FACT_SCOPING 6.7).
+///
+/// `AttrValue::ImportedCall` had nowhere to put a type argument, by
+/// construction: three fields, none of them a `TypeShape`. So
+/// `frobnicate<Sprocket>("sprocket")` parsed to the SAME value as
+/// `frobnicate("sprocket")` and the `<Sprocket>` existed in the source and
+/// nowhere else - the identical erasure `Element::type_args` exists to
+/// prevent for `<List<Message>>`.
+///
+/// Re-pointing the event lowering at `AttrValue::BindingExpr` closes it with
+/// no new variant: `BindingExpr::Call` already carries `type_args`, and an
+/// effect in expression position is an ordinary call there.
+///
+/// **The `assert_ne!` is the gate.** Drop the type arguments on the way in and
+/// the two spellings collapse into one value again, which is exactly the state
+/// this test was written red against.
+#[test]
+fn an_event_call_keeps_its_type_arguments_through_the_dag() {
+    let with_type_argument = only_effect(&format!(
+        r#"
+        import {{ frobnicate }} from "{ZORK}";
+        <Widget id="a" onGrommet={{frobnicate<Sprocket>("sprocket")}} />
+        "#
+    ));
+    assert_eq!(
+        with_type_argument,
+        AttrValue::BindingExpr(BindingExpr::Call {
+            namespace: ZORK.into(),
+            name: "frobnicate".into(),
+            type_args: vec![TypeShape::Named("Sprocket".into())],
+            args: vec![BindingExpr::Literal(LiteralValue::String("sprocket".into()))],
+        })
+    );
+
+    // The same call WITHOUT the type argument is a different value, which is
+    // what makes the assertion above about the type argument rather than about
+    // the call.
+    let without = only_effect(&format!(
+        r#"
+        import {{ frobnicate }} from "{ZORK}";
+        <Widget id="a" onGrommet={{frobnicate("sprocket")}} />
+        "#
+    ));
+    assert_ne!(with_type_argument, without);
+    assert_eq!(
+        without,
+        AttrValue::BindingExpr(BindingExpr::Call {
+            namespace: ZORK.into(),
+            name: "frobnicate".into(),
+            type_args: vec![],
+            args: vec![BindingExpr::Literal(LiteralValue::String("sprocket".into()))],
+        })
+    );
 }

@@ -17,18 +17,18 @@
 //!   not a `HashMap`) so downstream node-graph serialization is stable.
 //! * Expression children (`{binding}`) and string-literal children are
 //!   captured (the old proof-of-concept dropped them).
-//! * **Imported calls are produced here, not inferred later.** An
+//! * **Event bindings are produced here, not inferred later.** An
 //!   [`is_event_binding`] attribute's value is parsed as one call resolving to
-//!   a granted host import and emitted as [`AttrValue::ImportedCall`]; there is
-//!   no pass that later decides an [`AttrValue::Opaque`] was really a call
-//!   (LIBHBUI_PLAN Rules 46a, 48).
+//!   a granted host import and emitted as an [`AttrValue::BindingExpr`]
+//!   carrying a [`BindingExpr::Call`]; there is no pass that later decides an
+//!   [`AttrValue::Opaque`] was really a call (LIBHBUI_PLAN Rules 46a, 48).
 //! * **Configuration is a context, not a second entry point.** What a load
 //!   offers a source is [`ParseCtx`], built through [`ParseCtx::builder`] and
 //!   passed to whichever parse entry point the caller needs (Rule 49).
 
 use crate::dag::{
     AttrValue, BindingExpr, BindingParam, EffectError, BlockArrow, BlockStmt,
-    Element, FieldDecl, FuncSig, ImportDecl, ImportKind, ImportName, InterfaceDecl, ImportedCall,
+    Element, FieldDecl, FuncSig, ImportDecl, ImportKind, ImportName, InterfaceDecl,
     LiteralValue, Node, ObjectSymbol, ParserHost, PropertyAccessor, Resolution, TsxDocument,
     TypeShape, is_event_binding, is_host_namespace,
 };
@@ -295,7 +295,8 @@ impl ParseCtx {
     ///
     /// An `on..` attribute ([`is_event_binding`]) is parsed as one call
     /// resolving through the module's import chain to a signature this context
-    /// grants, and becomes [`AttrValue::ImportedCall`]. Nothing about that is
+    /// grants, and becomes an [`AttrValue::BindingExpr`] carrying a
+    /// [`BindingExpr::Call`]. Nothing about that is
     /// deferred: an attribute that announced an event binding and cannot carry
     /// one is refused **here**, with a typed [`EffectError`], rather than surviving as
     /// an [`AttrValue::Opaque`] that silently does nothing (Rule 46a).
@@ -724,12 +725,29 @@ impl<'a> ImportScope<'a> {
     }
 }
 
-/// Lower an `on..` attribute's value into [`AttrValue::ImportedCall`], or refuse
-/// it (Rules 46a, 48).
+/// Lower an `on..` attribute's value into a [`BindingExpr::Call`], or refuse it
+/// (Rules 46a, 48).
 ///
 /// The attribute already announced itself as an event binding, so every exit
-/// from here is either an [`AttrValue::ImportedCall`] or an error - there is
-/// deliberately no path that yields [`AttrValue::Opaque`].
+/// from here is either an [`AttrValue::BindingExpr`] carrying a call or an
+/// error - there is deliberately no path that yields [`AttrValue::Opaque`].
+///
+/// # The call is checked HERE and carried as an ordinary call
+///
+/// The value used to become an `AttrValue::ImportedCall` - three fields, no
+/// type arguments - and now becomes the same call the ordinary binding
+/// vocabulary already had a shape for. **What is checked did not move**: the
+/// callee still resolves through the module's import chain to a granted host
+/// import, the arguments are still filled positionally against the declared
+/// [`FuncSig`], and every refusal below is the one it always was. What changed
+/// is that the result has somewhere to put `frobnicate<Sprocket>("x")`'s type
+/// argument.
+///
+/// The two vocabularies for an argument met here too: an argument was lowered
+/// to a `crate::dag::Expr` (the handler-body vocabulary) and is now lowered to
+/// a [`BindingExpr`] like every other attribute value. The narrowing is
+/// unchanged and still [`LiteralValue::narrow`]'s - what goes away is the
+/// transcription onto a second literal ladder.
 fn imported_call_attr(
     attr: &str,
     value: Option<&JSXAttributeValue>,
@@ -781,6 +799,20 @@ fn imported_call_attr(
         }
     };
 
+    // The type arguments the callee was written with, read through the SAME
+    // mapping the ordinary call arm and `<List<Message>>` use - one type
+    // vocabulary, not a third one for this position.
+    let type_args: Vec<TypeShape> = call
+        .type_arguments
+        .as_ref()
+        .map(|args| {
+            args.params
+                .iter()
+                .map(|arg| type_shape(arg).unwrap_or(TypeShape::Named("unknown".into())))
+                .collect()
+        })
+        .unwrap_or_default();
+
     // **Arguments fill parameters positionally, and every parameter left
     // unfilled must be optional** ([`FieldDecl::optional`], which used to be
     // read by nobody here - see [`lower_arg`]'s doc for what that cost).
@@ -823,13 +855,23 @@ fn imported_call_attr(
         args.push(lowered);
     }
 
-    Ok(AttrValue::ImportedCall(ImportedCall {
+    Ok(AttrValue::BindingExpr(BindingExpr::Call {
         // The specifier the grant answered for - the other half of the
         // qualified name, so a reader downstream can tell two namespaces'
-        // same-named imports apart (Rule 48).
+        // same-named imports apart (Rule 48). A host specifier carries
+        // `host:`, which no member path can spell, so a granted call is
+        // distinguishable from `a.b()` by the namespace alone
+        // ([`is_host_namespace`]).
         namespace: namespace.to_string(),
         // The RESOLVED name: an alias is spent here and never travels.
         name: sig.name.clone(),
+        // **The whole reason this is a `Call`.** Read exactly as the ordinary
+        // call arm reads them, so one authored `<T>` has one capture wherever
+        // it is written. Nothing checks them against the signature: a
+        // `FuncSig` declares no type parameters, so there is nothing here to
+        // check against, and refusing what cannot be checked would refuse the
+        // spelling this change exists to admit.
+        type_args,
         args,
     }))
 }
@@ -860,7 +902,7 @@ enum ArgFail {
 ///
 /// * a **literal**, checked against the declared [`TypeShape`];
 /// * a **binding path** - `{id}`, `{props.user.name}` - lowered to
-///   [`crate::dag::Expr::Get`], the same distinct first-class form
+///   [`BindingExpr::Path`], the same distinct first-class form
 ///   [`AttrValue::Binding`] is for an ordinary attribute
 ///   ([`EffectError::ArgNotALiteral`] records why that is not a widening of
 ///   Rule 46a).
@@ -879,8 +921,7 @@ enum ArgFail {
 /// parameters positionally and refuses a call that leaves a non-optional one
 /// unfilled, so this is only ever asked about an argument that was actually
 /// written.
-fn lower_arg(expr: &Expression, declared: &TypeShape) -> Result<crate::dag::Expr, ArgFail> {
-    use crate::dag::Expr as E;
+fn lower_arg(expr: &Expression, declared: &TypeShape) -> Result<BindingExpr, ArgFail> {
     match expr {
         // CAPTURE, then NARROW - and the narrowing rules live on
         // [`LiteralValue::narrow`], not here. The widths of the two
@@ -898,7 +939,7 @@ fn lower_arg(expr: &Expression, declared: &TypeShape) -> Result<crate::dag::Expr
         // (`Id({id})`), a computed member (`row[i]`), an arithmetic expression
         // and a template literal all answer `None` here and stay refused.
         other => match expr_path(other) {
-            Some(path) => Ok(E::Get { path }),
+            Some(path) => Ok(BindingExpr::Path(path.split('.').map(str::to_owned).collect())),
             None => Err(ArgFail::NotALiteral),
         },
     }
@@ -968,14 +1009,23 @@ fn whole_f64(value: f64) -> Option<i64> {
     (value.fract() == 0.0 && value.abs() <= 9_007_199_254_740_992.0).then_some(value as i64)
 }
 
-/// One captured literal, narrowed to `declared` and spelled in the EVENT
-/// vocabulary - [`ArgFail::WrongType`] when it does not fit exactly.
+/// One captured literal, **narrowed to `declared`** - [`ArgFail::WrongType`]
+/// when it does not fit exactly.
 ///
-/// The two vocabularies are the same ladder written twice
-/// ([`LiteralValue`]'s widths against `Expr`'s `Lit*`), so this is the one
-/// place they are transcribed and it is TOTAL: every [`LiteralValue`] variant
-/// has exactly one `Lit*` spelling, so a width added to one side fails to
-/// compile here rather than falling through a catch-all.
+/// # It used to transcribe onto a second literal ladder, and no longer does
+///
+/// An event argument was a `crate::dag::Expr`, whose `LitBool`/`LitS32`/
+/// `LitS64`/`LitF32`/`LitF64`/`LitStr` are the same ladder [`LiteralValue`]
+/// writes as `Bool`/`Int32`/`Int64`/`Float32`/`Float64`/`String`. This function
+/// was the one place the two were transcribed. With the event lowering
+/// re-pointed at [`BindingExpr`] there is one ladder, so the narrowing is the
+/// whole of the work and the transcription is gone rather than moved.
+///
+/// The narrowing itself is untouched and still lives on
+/// [`LiteralValue::narrow`]: it is where the widths of the vocabularies meet,
+/// and a second copy of "does this fit?" written at a call site is how two
+/// sides come to disagree about 2^53 without either being wrong on its own
+/// terms.
 ///
 /// `U32`/`U64` cannot arrive: neither has an authored spelling (see
 /// [`TypeShape`]), so no TS parameter can declare one and
@@ -984,16 +1034,11 @@ fn whole_f64(value: f64) -> Option<i64> {
 fn lower_literal_arg(
     captured: LiteralValue,
     declared: &TypeShape,
-) -> Result<crate::dag::Expr, ArgFail> {
-    use crate::dag::Expr as E;
-    match captured.narrow(declared).ok_or(ArgFail::WrongType)? {
-        LiteralValue::Bool(value) => Ok(E::LitBool(value)),
-        LiteralValue::Int32(value) => Ok(E::LitS32(value)),
-        LiteralValue::Int64(value) => Ok(E::LitS64(value)),
-        LiteralValue::Float32(value) => Ok(E::LitF32(value)),
-        LiteralValue::Float64(value) => Ok(E::LitF64(value)),
-        LiteralValue::String(value) => Ok(E::LitStr(value)),
-    }
+) -> Result<BindingExpr, ArgFail> {
+    captured
+        .narrow(declared)
+        .map(BindingExpr::Literal)
+        .ok_or(ArgFail::WrongType)
 }
 
 /// Unwrap parentheses. `onTap={(navigate("Chat"))}` is the same call.

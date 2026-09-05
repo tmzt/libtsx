@@ -16,7 +16,7 @@
 
 use crate::dag::{
     AttrValue, BindingExpr, BindingParam, BlockArrow, BlockStmt, Element,
-    ImportDecl, InterfaceDecl, LiteralValue, Node, TsxDocument, TypeShape,
+    ImportDecl, InterfaceDecl, LiteralValue, Node, TsxDocument, TypeShape, is_host_namespace,
 };
 
 /// Emit a [`TsxDocument`] back to TSX source text.
@@ -234,22 +234,6 @@ fn emit_attr_value(out: &mut String, value: &AttrValue) {
             emit_binding_expr(out, expr);
             out.push('}');
         }
-        AttrValue::ImportedCall(call) => {
-            out.push_str("={");
-            // Emit just the imported name, not the namespace.
-            // The namespace is established by the import and should not appear
-            // in the JSX expression (e.g., emit "navigate(...)" not "host:effects.navigate(...)")
-            out.push_str(&call.name);
-            out.push('(');
-
-            for (i, arg) in call.args.iter().enumerate() {
-                if i > 0 {
-                    out.push_str(", ");
-                }
-                emit_expr(out, arg);
-            }
-            out.push_str(")}");
-        }
     }
 }
 
@@ -294,9 +278,9 @@ impl From<&BindingExpr> for String {
     }
 }
 
-/// Emit one owned object-binding expression. Unlike [`AttrValue::ImportedCall`],
-/// this vocabulary is not used by the legacy event parser; it is emitted only
-/// when a caller has already constructed the owned semantic IR.
+/// Emit one owned object-binding expression - **including an event binding**,
+/// since the `on..` lowering re-pointed at [`BindingExpr::Call`] and there is
+/// no second attribute vocabulary left to emit.
 ///
 /// The public spelling is `impl From<&BindingExpr> for String` above; this is
 /// the writer it and every internal splice share.
@@ -340,7 +324,20 @@ fn emit_binding_expr(out: &mut String, expr: &BindingExpr) {
             type_args,
             args,
         } => {
-            if !namespace.is_empty() {
+            // **A HOST namespace is established by the import and never
+            // appears in the expression** - `navigate("Chat")`, not
+            // `host:effects.navigate("Chat")`, which is not even a member path
+            // TypeScript could parse. This is the rule the removed
+            // `AttrValue::ImportedCall` arm carried, re-pointed here with the
+            // event lowering; the specifier survives in the graph and is
+            // recovered on re-parse through the module's import chain, which is
+            // what makes the round trip hold for an `on..` attribute.
+            //
+            // Keyed on the prefix rather than on a name, because `host:` is the
+            // one namespace spelling no ordinary call can produce:
+            // `static_call_parts` builds a namespace out of a member path, and
+            // a path cannot contain a colon.
+            if !namespace.is_empty() && !is_host_namespace(namespace) {
                 out.push_str(namespace);
                 out.push('.');
             }
@@ -781,64 +778,6 @@ fn emit_block_statements(out: &mut String, statements: &[BlockStmt], indent: usi
                 emit_binding_expr(out, value);
                 out.push_str(";\n");
             }
-        }
-    }
-}
-
-/// Emit an expression (for imported-call arguments).
-fn emit_expr(out: &mut String, expr: &crate::dag::Expr) {
-    use crate::dag::Expr;
-
-    match expr {
-        Expr::LitBool(b) => out.push_str(&b.to_string()),
-        Expr::LitS32(n) => out.push_str(&n.to_string()),
-        Expr::LitS64(n) => out.push_str(&n.to_string()),
-        Expr::LitF32(n) => out.push_str(&n.to_string()),
-        Expr::LitF64(n) => out.push_str(&n.to_string()),
-        // The same writer the binding vocabulary uses: a call argument is
-        // spliced into a JSX expression container, so it is JavaScript text and
-        // takes JavaScript's escapes. (An `AttrValue::Str` is NOT - it is a JSX
-        // attribute string, where a backslash is a backslash and `"` would need
-        // an entity - so it keeps its own verbatim spelling above.)
-        Expr::LitStr(s) => push_string_literal(out, s),
-        Expr::Param(_) => {
-            // Parameters only appear in handlers, which are not part of the element tree
-        }
-        Expr::Get { path } => {
-            out.push_str(path);
-        }
-        Expr::Bin { op, lhs, rhs } => {
-            out.push('(');
-            emit_expr(out, lhs);
-            out.push(' ');
-            match op {
-                crate::dag::BinOp::Add => out.push('+'),
-                crate::dag::BinOp::Sub => out.push('-'),
-                crate::dag::BinOp::Mul => out.push('*'),
-                crate::dag::BinOp::Div => out.push('/'),
-                crate::dag::BinOp::Eq => out.push_str("=="),
-                crate::dag::BinOp::Ne => out.push_str("!="),
-                crate::dag::BinOp::Lt => out.push('<'),
-                crate::dag::BinOp::Le => out.push_str("<="),
-                crate::dag::BinOp::Gt => out.push('>'),
-                crate::dag::BinOp::Ge => out.push_str(">="),
-                crate::dag::BinOp::And => out.push_str("&&"),
-                crate::dag::BinOp::Or => out.push_str("||"),
-            }
-            out.push(' ');
-            emit_expr(out, rhs);
-            out.push(')');
-        }
-        Expr::Call { callee, args } => {
-            out.push_str(callee);
-            out.push('(');
-            for (i, arg) in args.iter().enumerate() {
-                if i > 0 {
-                    out.push_str(", ");
-                }
-                emit_expr(out, arg);
-            }
-            out.push(')');
         }
     }
 }
