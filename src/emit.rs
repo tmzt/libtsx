@@ -782,7 +782,65 @@ fn emit_block_statements(out: &mut String, statements: &[BlockStmt], indent: usi
     }
 }
 
-/// Emit a type shape for type arguments.
+/// **The TypeScript spelling of a type** - the ONE renderer, whoever asks.
+///
+/// The second rung of the ladder the crate doc describes, spelled the way the
+/// first one is: a total conversion, so `From`; `&TypeShape` is fundamental and
+/// local here, so the impl is legal here and only here; and it names no `oxc_*`
+/// type, so it is open to a `default-features = false` consumer that holds a
+/// graph and wants source out of it.
+///
+/// # Why this door exists (FACT_SCOPING section 12c)
+///
+/// The renderer below has been here all along, reachable only through
+/// [`emit_tsx_document`] and [`emit_interface`]. A caller holding a bare
+/// [`TypeShape`] - the Forms pane writing a field into a screen's source, the
+/// scaffold declaring a generated List's row type - could not reach it, so each
+/// wrote its own, and the copies drifted until an OPTIONAL value lost its
+/// `| undefined` on one path and kept it on the other. That is not a formatting
+/// difference; it is a different type. One private renderer with no public door
+/// is how a language ends up with three of them.
+///
+/// So the door, not a fourth function: every decision about how a type is
+/// spelled in TypeScript is stated once, in the arms below, and the two
+/// disagreements the merge had to settle were already settled there -
+/// `S64` is `bigint` because that is the only spelling the parser lowers back
+/// to `S64`, and `U64` is `number` and NOT `bigint` because `bigint` parses back
+/// SIGNED. Both reasons are written out at their own arms.
+///
+/// # The other direction
+///
+/// `parse::type_shape` is the inverse, behind the `parse` feature, and the two
+/// are the codec's two halves for this rung. It has no `&str` door of its own
+/// yet (it takes an `oxc_ast::TSType`, which the quarantine forbids naming in a
+/// public signature). Giving it one is the same shape as
+/// `impl TryFrom<&str> for BindingExpr`: wrap the text as a type alias, parse,
+/// lower the single declaration. It costs a [`crate::ParseError`] variant,
+/// because `ParseError::Binding`'s own doc says that only `BindingExpr`'s
+/// `TryFrom` produces it - which is why it is not done here rather than done
+/// badly.
+///
+/// # What is NOT round-trippable, and is not pretending to be
+///
+/// TypeScript has one numeric keyword, so `S32`, `F32`, `U32` and `U64` all
+/// widen to `number` and come back as `F64`. That loss belongs to the target
+/// language, it is stated at each arm, and the authoritative shape is the one
+/// in the graph - never the text this writes.
+impl From<&TypeShape> for String {
+    fn from(shape: &TypeShape) -> Self {
+        let mut out = String::new();
+        emit_type_shape(&mut out, shape);
+        out
+    }
+}
+
+/// Emit a type shape - a type argument, an interface member, or anything else
+/// that reaches [`String::from`] above.
+///
+/// The `&mut String` writer stays private for the same reason
+/// [`emit_binding_expr`]'s does: it is the recursion, and the shared buffer is
+/// why (a type is spliced into an interface, a type-argument list, a record
+/// member).
 fn emit_type_shape(out: &mut String, shape: &TypeShape) {
     match shape {
         TypeShape::Bool => out.push_str("boolean"),
@@ -821,6 +879,14 @@ fn emit_type_shape(out: &mut String, shape: &TypeShape) {
         TypeShape::U32 => out.push_str("number"),
         TypeShape::U64 => out.push_str("number"),
         TypeShape::String => out.push_str("string"),
+        // **`Array<T>`, not `T[]`** - the two are the same TypeScript type and
+        // both parse back to `List`, so this is the one spelling difference the
+        // merge had to settle that is not about MEANING. It goes to `Array<T>`
+        // because `deps/libtsx/tests/binding_expr_seam.rs` and libhbui's
+        // `codec_round_trip.rs` pin authored `Array<...>` text emitting back
+        // byte-identical - emit can be the identity on one spelling of the two,
+        // and that is the one with the tests. `highbay_data::scaffold` used to
+        // write `T[]` into generated screens and now writes this.
         TypeShape::List(inner) => {
             out.push_str("Array<");
             emit_type_shape(out, inner);

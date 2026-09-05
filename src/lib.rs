@@ -46,6 +46,15 @@
 //! `libhbui`'s `codec_round_trip.rs` measures over every authored `.tsx` in the
 //! repository and over an exhaustive operand/position matrix.
 //!
+//! **[`dag::TypeShape`] is the same seam one rung up**, and the render half is
+//! now open the same way: `impl From<&TypeShape> for String` ([`emit`]) is the
+//! ONE TypeScript spelling of a type, for every caller that holds a type and
+//! wants source. It was private for a long time, reachable only by emitting a
+//! whole document or a whole interface, and two crates above wrote their own
+//! copies in the meantime and drifted (FACT_SCOPING section 12c). The parse half
+//! is `parse::type_shape`, which still has no `&str` door - see the render
+//! half's doc for what giving it one costs.
+//!
 //! **The ladder continues upward in the crate that owns the next rung**, and
 //! the orphan rule works out at each one without anything moving crates: a
 //! crate may write the impl whose NEW type is its own, because `&T` is
