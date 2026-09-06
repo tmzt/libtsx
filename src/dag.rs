@@ -1750,7 +1750,25 @@ pub struct FieldDecl {
     pub optional: bool,
 }
 
-/// The shape of a type as it crosses the edge. Maps 1:1 onto WIT types.
+/// The shape of a type as it crosses the edge.
+///
+/// **NOT 1:1 with WIT, and that is settled rather than aspirational.** This doc
+/// said *"Maps 1:1 onto WIT types"* until 2026-09-06. It was already false —
+/// `Pick`, `Omit`, `Extends` and `Apply` are type-level OPERATORS with no WIT
+/// counterpart, and `IndexedAccess` is a fifth — and it cannot be made true:
+/// WIT has records, variants, enums, flags, lists, options, results, tuples and
+/// resources, and NO lookup or mapped types at all. Tim, on being shown that:
+/// *"that's a limitation of WIT we can't overcome, so the 1:1 goes, but we have
+/// a deterministic one-way spelling."*
+///
+/// **So the relation is a DETERMINISTIC ONE-WAY REDUCTION, not a bijection.**
+/// Every `TypeShape` reduces to exactly one WIT type, always the same one; no
+/// WIT type reduces back. The operators exist to be EVALUATED
+/// (`libhbdata::typeexpr`) before anything is emitted, so what reaches
+/// `nocap-witgen` is already a WIT type. An operator arriving at the edge
+/// unreduced is a defect, not a spelling to invent a WIT form for — inventing
+/// one would put a name-encoded relationship across the ABI boundary, which is
+/// the worst place for it.
 ///
 /// **`S` is SIGNED - WIT's spelling, not Rust's.** WIT writes the pair as
 /// `s32`/`u32` where Rust writes it `i32`/`u32`, so [`TypeShape::S32`] and Rust
@@ -1899,6 +1917,72 @@ pub enum TypeShape {
     Extends {
         base: Box<TypeShape>,
     },
+    // THE INDEXED ACCESS. Appended last, same rule as everything above: this
+    // enum is persisted positionally, so it goes at the END and not beside
+    // `Omit` and `Pick` where it reads better. Placing it there would renumber
+    // `Pick` and `Extends` and change what every already-committed byte decodes
+    // to; appending keeps old bytes readable, which is the whole of the
+    // placement rule.
+    //
+    // WHY ITS OWN VARIANT AND NOT `Apply`, which is `Omit`/`Pick`'s reason
+    // exactly: `Apply` holds `args: Vec<TypeShape>` and DEMANDS A TYPE in every
+    // slot. `Person["handle"]` takes a TYPE and a KEY LITERAL, so the type slot
+    // would have to hold a name - and a slot that can hold a type is a slot
+    // that can hold `Named("unknown")`.
+    //
+    // WHY NOT A `Named` HOLDING THE BRACKETS, which is what it WAS. MEASURED,
+    // before this variant existed:
+    //
+    //     Person["handle"]  ->  Named("Person[\"handle\"]")
+    //
+    // and it did not stop there: `libhbdata::typeexpr::eval` carried that
+    // string into the FINAL vocabulary as `ShapeType::Named("Person[\"handle\"]")`,
+    // a name no declaration answers, where the field's own type belonged. The
+    // relationship was TEXT INSIDE A NAME - the shape RULING 4 forbids ("the
+    // convention is for the TS spelling, the nodegraph is explicit in the
+    // relationship") - it survived the strict lowering, and no gate said a
+    // word. Every author of an indexed access got that by default.
+    //
+    // WHAT IT IS FOR. A form is a PROJECTION over a raw type, and this is the
+    // spelling that keeps the link to the raw type WITHOUT CHANGING THE FORM'S
+    // SHAPE. `Pick<Person, "handle">` also names Person, but it evaluates to
+    // `{ handle: string }` - a record - so a form spelled that way gains a
+    // level of nesting per projected field. `Person["handle"]` evaluates to
+    // `string`: the provenance lives in the spelling and the shape does not
+    // move. That contrast is the whole reason this exists and is asserted as
+    // one test in `crates/libhbdata/tests/indexed_access.rs`.
+    /// `Base["key"]` - TypeScript's indexed access. **The field's own type,
+    /// named through the type that declares it.**
+    ///
+    /// `base` is boxed so the operators compose in both directions -
+    /// `Pick<Person["address"], "city">` is the spelling the corpus already
+    /// writes, and `Person["address"]["city"]` is this node nested. A bare name
+    /// here would refuse the second one.
+    ///
+    /// `key` is a `String` and not a `TypeShape` for [`TypeShape::Omit`]'s
+    /// stated reason: a field name is not a type, and the narrower field makes
+    /// `Named("unknown")` in that slot unrepresentable.
+    ///
+    /// **A key naming no field of the base is NOT rejected here.** Like
+    /// `Omit`/`Pick`, this is the AUTHORED form and survives unreduced, because
+    /// checking the key needs the base's field list and that may live in a
+    /// layer this pack never loaded. It is rejected at evaluation, with the
+    /// whole document in hand - `libhbdata::typeexpr`, one place.
+    IndexedAccess {
+        base: Box<TypeShape>,
+        key: String,
+    },
+}
+
+/// **The TypeScript spelling of an indexed access**, given an ALREADY-RENDERED
+/// base - `Person["handle"]`.
+///
+/// Beside [`key_operator_spelling`] and for its reason: a dozen surfaces render
+/// a `TypeShape` as text and each renders the BASE its own way, but none has a
+/// reason to spell the BRACKETS differently, so the quoting cannot come out one
+/// way here and another way there.
+pub fn indexed_access_spelling(base: &str, key: &str) -> String {
+    format!("{base}[\"{key}\"]")
 }
 
 /// **The TypeScript spelling of a key operator**, given an ALREADY-RENDERED

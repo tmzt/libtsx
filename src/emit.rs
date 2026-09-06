@@ -949,6 +949,14 @@ fn emit_type_shape(out: &mut String, shape: &TypeShape) {
         // emits as its base, which is the text that was inside the clause.
         // `emit_interface` writes the `extends` itself.
         TypeShape::Extends { base } => emit_type_shape(out, base),
+        // Same round trip as the key operators, through the same kind of shared
+        // spelling: `Person["handle"]` is read to a node and written back to the
+        // characters it was read from, so the parse and this are inverse on it.
+        TypeShape::IndexedAccess { base, key } => {
+            let mut rendered = String::new();
+            emit_type_shape(&mut rendered, base);
+            out.push_str(&crate::dag::indexed_access_spelling(&rendered, key));
+        }
     }
 }
 

@@ -1299,31 +1299,39 @@ fn type_shape(ty: &TSType) -> Result<TypeShape, String> {
     })
 }
 
-/// `Outer["field"]` - TypeScript's indexed access, as the SPELLING it is.
+/// `Outer["field"]` - TypeScript's indexed access, as the NODE it is.
 ///
-/// # Why a `Named` holding brackets, and not a variant
+/// # It used to be a `Named` holding the brackets, and that was the defect
 ///
-/// It is how an ANONYMOUS member type is written. A nested object literal
-/// (`interface Home { user: { name: string } }`) declares a shape with no name
-/// of its own, and `Home["user"]` is the only way TypeScript has to say it - so
-/// a consumer projecting that step needs the spelling, not a resolution.
+/// MEASURED, before [`TypeShape::IndexedAccess`] existed:
 ///
-/// `TypeShape::Named` is documented as "a reference to another interface by
-/// name", and this widens what a name may be to include a member path. The
-/// alternative - a `TypeShape::Index { base, key }` variant - is the more
-/// faithful node and is DEFERRED rather than rejected: this enum is persisted
-/// positionally into `.hbtypes`, and every resolver in the tree
-/// (`libhbdata::typeexpr::eval`, witgen, `emit`) would owe it an arm on the same
-/// commit. That is a vocabulary change to make deliberately.
+/// ```text
+/// Person["handle"]  ->  Named("Person[\"handle\"]")
+/// ```
 ///
-/// **The reason it is admitted at all is that the spelling was ALREADY the
-/// carrier.** `highbay_ui::zui::forms` assembles a form step's rows in Rust and
-/// writes exactly `Named("HomeProps[\"user\"]")`; `libhbui::app`'s `fields_of`
-/// takes those brackets apart. So an authored document and a Rust-built tree now
-/// produce the same node for the same type, which is what let the last string
-/// splitter go. Before this arm, the authored spelling fell to `_ =>` and became
-/// `Named("unknown")` - the base GONE, exactly the defect `Omit`/`Pick` were
-/// added to repair, and it drew an EMPTY form step rather than an error.
+/// and `libhbdata::typeexpr::eval` carried that string on into the FINAL
+/// vocabulary as `ShapeType::Named("Person[\"handle\"]")` - a name no
+/// declaration answers, standing where the field's own type belonged. The
+/// relationship was TEXT INSIDE A NAME, which is what RULING 4 forbids, and it
+/// survived the strict lowering with no gate to say so. The arm was admitted
+/// because the spelling was already the carrier one layer up
+/// (`highbay_ui::zui::forms` builds `"HomeProps[\"user\"]"` in Rust and
+/// `libhbui::app`'s `fields_of` takes the brackets apart), so an authored
+/// document and a Rust-built tree agreed - on the wrong node.
+///
+/// **What the variant changes is where the link LIVES**, not whether the
+/// spelling is accepted: the base is the same `Named("Person")` every other
+/// reference to Person is, the key is a key, and evaluation reduces it to the
+/// FIELD'S OWN TYPE rather than to a dangling name. See
+/// [`TypeShape::IndexedAccess`] for why it is not an `Apply` and why it is
+/// appended last.
+///
+/// # The base takes the ordinary lowering
+///
+/// Any type expression, not just a name - which is what makes
+/// `Person["address"]["city"]` this node nested rather than a refusal. The
+/// previous arm required a `Named` base and only accepted that nesting by
+/// accident, because the inner access had already collapsed INTO a name.
 ///
 /// The key must be a string literal, for the reason [`key_names`] refuses a
 /// non-literal: `Home[keyof X]` names something this cannot spell, and inventing
@@ -1335,16 +1343,10 @@ fn indexed_shape(idx: &oxc_ast::ast::TSIndexedAccessType) -> Result<TypeShape, S
     let oxc_ast::ast::TSLiteral::StringLiteral(key) = &lit.literal else {
         return Err("an indexed access `T[K]` takes a string literal key".to_string());
     };
-    let base = match type_shape(&idx.object_type)? {
-        TypeShape::Named(name) => name,
-        other => {
-            return Err(format!(
-                "an indexed access `T[\"{}\"]` needs a named base, this one is {other:?}",
-                key.value
-            ));
-        }
-    };
-    Ok(TypeShape::Named(format!("{base}[\"{}\"]", key.value)))
+    Ok(TypeShape::IndexedAccess {
+        base: Box::new(type_shape(&idx.object_type)?),
+        key: key.value.to_string(),
+    })
 }
 
 /// `T | undefined` / `T | null` -> `Option<T>`; **any other union is refused.**
@@ -2699,13 +2701,24 @@ mod tests {
         );
     }
 
-    /// **An indexed access keeps its SPELLING**, which is what an anonymous
-    /// member type has instead of a name.
+    /// **An indexed access keeps its BASE AND ITS KEY APART**, which is what a
+    /// name holding brackets never did.
     ///
-    /// Before `indexed_shape` existed this fell to `type_shape`'s `_ =>` arm
-    /// and measured as `Named("unknown")` - the base gone - so a `Pick` over a
-    /// nested shape resolved against nothing and drew an EMPTY form step. The
-    /// `assert_ne` at the end is that exact state.
+    /// Two earlier states, both measured, and the second is why the variant
+    /// exists:
+    ///
+    /// 1. Before `indexed_shape` existed at all this fell to `type_shape`'s
+    ///    `_ =>` arm and became `Named("unknown")` - the base GONE - so a `Pick`
+    ///    over a nested shape resolved against nothing and drew an EMPTY form
+    ///    step. The first `assert_ne` is that state.
+    /// 2. Then it was `Named("Home[\"user\"]")`: the base was back, but as TEXT
+    ///    INSIDE A NAME, which is the shape RULING 4 forbids and which
+    ///    `libhbdata::typeexpr` carried on into the final vocabulary as a name
+    ///    nothing answers. The second `assert_ne` is that one.
+    ///
+    /// The `Pick` beside it is not decoration: the base is boxed so the
+    /// operators compose, and this is the composition the corpus already writes
+    /// (`crates/highbay_elements/data/examples/forms_screen.tsx`).
     #[test]
     fn an_indexed_access_keeps_the_member_path_it_names() {
         let interfaces = extract_interfaces(
@@ -2717,15 +2730,53 @@ mod tests {
             "#,
         )
         .expect("an indexed access parses");
-        assert_eq!(interfaces[0].fields[0].ty, TypeShape::Named("Home[\"user\"]".into()));
+        let user = TypeShape::IndexedAccess {
+            base: Box::new(TypeShape::Named("Home".into())),
+            key: "user".into(),
+        };
+        assert_eq!(interfaces[0].fields[0].ty, user);
         assert_eq!(
             interfaces[0].fields[1].ty,
             TypeShape::Pick {
-                base: Box::new(TypeShape::Named("Home[\"user\"]".into())),
+                base: Box::new(user.clone()),
                 picked: vec!["name".into(), "email".into()],
             }
         );
         assert_ne!(interfaces[0].fields[0].ty, TypeShape::Named("unknown".into()));
+        assert_ne!(interfaces[0].fields[0].ty, TypeShape::Named("Home[\"user\"]".into()));
+    }
+
+    /// **The spelling survives the round trip**, which is the other half of a
+    /// vocabulary: a type that parses and cannot be written back is not in the
+    /// language, it is only tolerated by the parser.
+    ///
+    /// Nested both ways, because that is where a shared spelling helper earns
+    /// its keep - the brackets and the key operator's quotes are each written in
+    /// exactly one place (`dag::indexed_access_spelling`,
+    /// `dag::key_operator_spelling`), so they cannot come out one way here and
+    /// another way in a drawn label.
+    #[test]
+    fn an_indexed_access_is_written_back_as_the_typescript_it_was_read_from() {
+        let interfaces = extract_interfaces(
+            r#"
+                interface Props {
+                    user: Home["user"];
+                    deep: Home["user"]["name"];
+                    picked: Pick<Home["user"], "name" | "email">;
+                }
+            "#,
+        )
+        .expect("parses");
+        let spelled: Vec<String> =
+            interfaces[0].fields.iter().map(|f| String::from(&f.ty)).collect();
+        assert_eq!(
+            spelled,
+            vec![
+                "Home[\"user\"]".to_string(),
+                "Home[\"user\"][\"name\"]".to_string(),
+                "Pick<Home[\"user\"], \"name\" | \"email\">".to_string(),
+            ],
+        );
     }
 
     /// A key that is not a string literal is REFUSED rather than spelled
