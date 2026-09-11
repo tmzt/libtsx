@@ -2194,7 +2194,7 @@ pub enum TypeShape {
 /// registered type functions (FACT_IMPLEMENTATION A3).
 ///
 /// They exist here, on the type, rather than being spelled as `Apply` literals
-/// at every producer, for the reason [`key_operator_spelling`] exists on the
+/// at every producer, for the reason [`application_spelling`] exists on the
 /// rendering side: there are a dozen places that BUILD one of these, and none
 /// of them has a reason to shape the key argument differently. One constructor,
 /// so a key list cannot arrive as a union in one producer and as a
@@ -2210,7 +2210,7 @@ impl TypeShape {
     ///
     /// The key argument is THE UNION THE TS SPELLING ALWAYS HAD, under
     /// [`TypeShape::Union`]'s producer-normalization rule: no keys is the empty
-    /// union (which [`key_operator_spelling`] and the emit both spell `never`),
+    /// union (which [`union_spelling`] and the emit both spell `never`),
     /// one key is that key's literal and NOT a one-member union, and two or
     /// more is the union. So `Pick<P, "a">` and `Pick<P, "a" | "a">` are the
     /// same node exactly when they are the same TypeScript.
@@ -2282,8 +2282,8 @@ impl TypeShape {
 /// Before this, five surfaces each matched `Omit`/`Pick`/`IndexedAccess` as
 /// dedicated variants and each rendered them its own way; they now pass their
 /// OWN base rendering in and share the decision about which form to write. The
-/// same argument [`key_operator_spelling`] and [`indexed_access_spelling`]
-/// already made about quoting, one level up.
+/// same argument [`indexed_access_spelling`] and [`literal_spelling`] already
+/// made about quoting, one level up.
 ///
 /// `rendered` is the caller's rendering of each argument, in order and the same
 /// length as `args` - a WIT name, a drawn label, a canonical identity string.
@@ -2325,38 +2325,21 @@ pub fn application_spelling(constructor: &str, args: &[TypeShape], rendered: &[S
 /// **The TypeScript spelling of an indexed access**, given an ALREADY-RENDERED
 /// base - `Person["handle"]`.
 ///
-/// Beside [`key_operator_spelling`] and for its reason: a dozen surfaces render
-/// a `TypeShape` as text and each renders the BASE its own way, but none has a
-/// reason to spell the BRACKETS differently, so the quoting cannot come out one
-/// way here and another way there.
+/// Beside [`application_spelling`], which calls it, and for its reason: a dozen
+/// surfaces render a `TypeShape` as text and each renders the BASE its own way,
+/// but none has a reason to spell the BRACKETS differently, so the quoting
+/// cannot come out one way here and another way there.
 pub fn indexed_access_spelling(base: &str, key: &str) -> String {
     format!("{base}[\"{key}\"]")
 }
 
-/// **The TypeScript spelling of a key operator**, given an ALREADY-RENDERED
-/// base - `Omit<Props, "a" | "b">`.
-///
-/// One function because there are a dozen places that render a `TypeShape` as
-/// text (a WIT name, a drawn label, a change-detection token, a canonical
-/// identity string) and each renders the BASE its own way, but none of them has
-/// a reason to spell the KEYS differently. Every such site calls this with its
-/// own base rendering, so a key list cannot come out quoted in one surface and
-/// bare in another.
-///
-/// An empty key list spells `never`, TypeScript's own name for it, because
-/// `Omit<Props, >` reparses as nothing.
-pub fn key_operator_spelling(operator: &str, base: &str, keys: &[String]) -> String {
-    let keys: Vec<String> = keys.iter().map(|key| format!("\"{key}\"")).collect();
-    let keys = if keys.is_empty() { "never".to_string() } else { keys.join(" | ") };
-    format!("{operator}<{base}, {keys}>")
-}
 
 /// **One literal, spelled as TypeScript source** - shared by VALUE position
 /// (`emit_binding_expr`), TYPE position (`emit_type_shape`, for
 /// [`TypeShape::Literal`]) and by every surface downstream that renders a
 /// literal type as text.
 ///
-/// Beside [`indexed_access_spelling`] and [`key_operator_spelling`] and for
+/// Beside [`indexed_access_spelling`] and [`application_spelling`] and for
 /// their reason, which the literal type made load-bearing: `TypeShape::Literal`
 /// put a [`LiteralValue`] in type position, so a dozen surfaces that already
 /// render a `TypeShape` - a WIT name, a drawn label, a change-detection token,
@@ -2441,7 +2424,8 @@ pub fn string_literal_spelling(value: &str) -> String {
 /// surface and `|` in another is two identities for one type.
 ///
 /// An empty member list spells `never`, TypeScript's own name for the empty
-/// union, exactly as [`key_operator_spelling`] spells an empty key list. See
+/// union, which is also how an empty key list reaches the page now that a key
+/// list IS a union. See
 /// [`TypeShape::Union`] on why the degenerate lengths are spelled rather than
 /// asserted against.
 pub fn union_spelling(members: &[String]) -> String {

@@ -2912,10 +2912,11 @@ mod tests {
     /// language, it is only tolerated by the parser.
     ///
     /// Nested both ways, because that is where a shared spelling helper earns
-    /// its keep - the brackets and the key operator's quotes are each written in
-    /// exactly one place (`dag::indexed_access_spelling`,
-    /// `dag::key_operator_spelling`), so they cannot come out one way here and
-    /// another way in a drawn label.
+    /// its keep - the brackets are written in exactly one place
+    /// (`dag::indexed_access_spelling`, reached through
+    /// `dag::application_spelling`) and the key quotes in another
+    /// (`dag::literal_spelling`, reached through the union), so neither can come
+    /// out one way here and another way in a drawn label.
     #[test]
     fn an_indexed_access_is_written_back_as_the_typescript_it_was_read_from() {
         let interfaces = extract_interfaces(
