@@ -422,83 +422,22 @@ fn emit_binding_expr(out: &mut String, expr: &BindingExpr) {
 /// emit has to write a decimal token for a decimal value, whether or not the
 /// value happens to be whole.
 ///
-/// The `.0` is appended only when the rendered text is a bare integer -
-/// anything with a point, an exponent or a non-finite spelling already
-/// re-parses as what it is (or, for a non-finite, is not a TypeScript numeric
-/// literal at all and could not have come from a parse).
-/// **One literal, spelled as TypeScript source** - shared by VALUE position
-/// ([`emit_binding_expr`]) and TYPE position ([`emit_type_shape`]).
+/// **One literal, spelled as TypeScript source** - through
+/// [`crate::dag::literal_spelling`], which is where the spelling lives now.
 ///
-/// Beside [`crate::dag::indexed_access_spelling`] and for its reason: two
-/// positions render the same [`LiteralValue`] and neither has a reason to spell
-/// it differently, so the quoting, the escaping and the `1.0`-vs-`1` decision
-/// cannot come out one way here and another way there. `TypeShape::Literal`
-/// carries a `LiteralValue` precisely so this stays one function.
-///
-/// **The one place the two positions differ is a `Float64` that happens to be
-/// whole.** [`push_float_literal`] writes `1.0`, because in value position a
-/// bare `1` re-parses as `Int64` and the round trip is a law there. In type
-/// position `1.0` is legal TypeScript and re-parses as `Literal(Int64(1))`, so
-/// that one shape does not round trip - and it is not producible by a parse
-/// either, because `numeric_literal` reads `1` as `Int64`. A hand-built
-/// `Literal(Float64(1.0))` is the only way to reach it.
+/// It moved there when `TypeShape::Literal` made a literal renderable by
+/// surfaces outside this crate: a WIT name, a drawn label, a canonical identity
+/// token. That function's doc carries the whole argument, including the one
+/// place value and type position differ (a whole `Float64`).
 fn push_literal_value(out: &mut String, literal: &LiteralValue) {
-    match literal {
-        LiteralValue::Bool(value) => out.push_str(if *value { "true" } else { "false" }),
-        LiteralValue::Int32(value) => out.push_str(&value.to_string()),
-        LiteralValue::Int64(value) => out.push_str(&value.to_string()),
-        LiteralValue::Float32(value) => push_float_literal(out, f64::from(*value)),
-        LiteralValue::Float64(value) => push_float_literal(out, *value),
-        LiteralValue::String(value) => push_string_literal(out, value),
-    }
+    out.push_str(&crate::dag::literal_spelling(literal));
 }
 
-fn push_float_literal(out: &mut String, value: f64) {
-    let text = value.to_string();
-    let integral = text
-        .strip_prefix('-')
-        .unwrap_or(&text)
-        .bytes()
-        .all(|b| b.is_ascii_digit());
-    out.push_str(&text);
-    if integral {
-        out.push_str(".0");
-    }
-}
-
-/// **A double-quoted TypeScript string literal for `value`, escaped.**
-///
-/// The unescaped spelling this replaces pushed `"`, the value, `"`, and failed
-/// three ways (libhbui's `codec_round_trip.rs`, F3): a quote ended the literal
-/// early, a newline left it unterminated, and a BACKSLASH was silently eaten -
-/// `back\slash` emitted as `"back\slash"`, which re-parses as `backslash`. The
-/// last is the one that matters, because both of the others are syntax errors a
-/// re-parse reports and that one is a different string nothing complains about.
-///
-/// **Minimal, deliberately.** Only what changes meaning is escaped, so an
-/// ordinary string is written the way an author would write it and the round
-/// trip is not "escape everything" wearing a fix's clothes - the single quote,
-/// the `$`, the backtick and every printable non-ASCII character go through
-/// untouched. `U+2028`/`U+2029` are in the list because they are line
-/// terminators to a JavaScript lexer even though they look like nothing.
+/// A double-quoted, escaped TypeScript string literal - see
+/// [`crate::dag::string_literal_spelling`], which this and
+/// [`push_property_key`] share.
 fn push_string_literal(out: &mut String, value: &str) {
-    out.push('"');
-    for ch in value.chars() {
-        match ch {
-            '\\' => out.push_str("\\\\"),
-            '"' => out.push_str("\\\""),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            '\u{2028}' => out.push_str("\\u2028"),
-            '\u{2029}' => out.push_str("\\u2029"),
-            other if (other as u32) < 0x20 => {
-                out.push_str(&format!("\\u{:04x}", other as u32));
-            }
-            other => out.push(other),
-        }
-    }
-    out.push('"');
+    out.push_str(&crate::dag::string_literal_spelling(value));
 }
 
 /// **A property key: bare when it is an identifier, quoted when it is not.**
@@ -1003,15 +942,15 @@ fn emit_type_shape(out: &mut String, shape: &TypeShape) {
         // hold one, and `never` is what TypeScript calls the empty union. See
         // `TypeShape::Union`.
         TypeShape::Union(members) => {
-            if members.is_empty() {
-                out.push_str("never");
-            }
-            for (index, member) in members.iter().enumerate() {
-                if index > 0 {
-                    out.push_str(" | ");
-                }
-                emit_type_shape(out, member);
-            }
+            let rendered: Vec<String> = members
+                .iter()
+                .map(|member| {
+                    let mut text = String::new();
+                    emit_type_shape(&mut text, member);
+                    text
+                })
+                .collect();
+            out.push_str(&crate::dag::union_spelling(&rendered));
         }
     }
 }

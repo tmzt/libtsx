@@ -2109,6 +2109,136 @@ pub fn key_operator_spelling(operator: &str, base: &str, keys: &[String]) -> Str
     format!("{operator}<{base}, {keys}>")
 }
 
+/// **One literal, spelled as TypeScript source** - shared by VALUE position
+/// (`emit_binding_expr`), TYPE position (`emit_type_shape`, for
+/// [`TypeShape::Literal`]) and by every surface downstream that renders a
+/// literal type as text.
+///
+/// Beside [`indexed_access_spelling`] and [`key_operator_spelling`] and for
+/// their reason, which the literal type made load-bearing: `TypeShape::Literal`
+/// put a [`LiteralValue`] in type position, so a dozen surfaces that already
+/// render a `TypeShape` - a WIT name, a drawn label, a change-detection token,
+/// a canonical identity string, a mock value - each acquired a literal to spell,
+/// and none of them has a reason to quote, escape or round it differently. One
+/// function, so `"back\slash"` cannot come out escaped in the emit and bare in
+/// a token that is supposed to be an identity.
+///
+/// **The one place the two positions differ is a `Float64` that happens to be
+/// whole.** [`float_literal_spelling`] writes `1.0`, because in value position a
+/// bare `1` re-parses as `Int64` and the round trip is a law there. In type
+/// position `1.0` is legal TypeScript and re-parses as `Literal(Int64(1))`, so
+/// that one shape does not round trip - and it is not producible by a parse
+/// either, because `numeric_literal` reads `1` as `Int64`. A hand-built
+/// `Literal(Float64(1.0))` is the only way to reach it.
+pub fn literal_spelling(literal: &LiteralValue) -> String {
+    match literal {
+        LiteralValue::Bool(value) => if *value { "true" } else { "false" }.to_string(),
+        LiteralValue::Int32(value) => value.to_string(),
+        LiteralValue::Int64(value) => value.to_string(),
+        LiteralValue::Float32(value) => float_literal_spelling(f64::from(*value)),
+        LiteralValue::Float64(value) => float_literal_spelling(*value),
+        LiteralValue::String(value) => string_literal_spelling(value),
+    }
+}
+
+/// A float, with `.0` appended only when the rendered text is a bare integer -
+/// anything with a point, an exponent or a non-finite spelling already
+/// re-parses as what it is (or, for a non-finite, is not a TypeScript numeric
+/// literal at all and could not have come from a parse).
+fn float_literal_spelling(value: f64) -> String {
+    let text = value.to_string();
+    let integral =
+        text.strip_prefix('-').unwrap_or(&text).bytes().all(|b| b.is_ascii_digit());
+    if integral { format!("{text}.0") } else { text }
+}
+
+/// **A double-quoted TypeScript string literal for `value`, escaped.**
+///
+/// The unescaped spelling this replaces pushed `"`, the value, `"`, and failed
+/// three ways (libhbui's `codec_round_trip.rs`, F3): a quote ended the literal
+/// early, a newline left it unterminated, and a BACKSLASH was silently eaten -
+/// `back\slash` emitted as `"back\slash"`, which re-parses as `backslash`. The
+/// last is the one that matters, because both of the others are syntax errors a
+/// re-parse reports and that one is a different string nothing complains about.
+///
+/// **Minimal, deliberately.** Only what changes meaning is escaped, so an
+/// ordinary string is written the way an author would write it and the round
+/// trip is not "escape everything" wearing a fix's clothes - the single quote,
+/// the `$`, the backtick and every printable non-ASCII character go through
+/// untouched. `U+2028`/`U+2029` are in the list because they are line
+/// terminators to a JavaScript lexer even though they look like nothing.
+pub fn string_literal_spelling(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for ch in value.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{2028}' => out.push_str("\\u2028"),
+            '\u{2029}' => out.push_str("\\u2029"),
+            other if (other as u32) < 0x20 => {
+                out.push_str(&format!("\\u{:04x}", other as u32));
+            }
+            other => out.push(other),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// **The TypeScript spelling of a union**, given ALREADY-RENDERED members -
+/// `"primary" | "danger"`.
+///
+/// The third of this trio and for the same reason: the surfaces that render a
+/// `TypeShape` as text each render a MEMBER their own way - one spells a WIT
+/// name, one a drawn label, one a canonical identity - but none has a reason to
+/// spell the SEPARATOR differently, and a union whose bar came out ` | ` in one
+/// surface and `|` in another is two identities for one type.
+///
+/// An empty member list spells `never`, TypeScript's own name for the empty
+/// union, exactly as [`key_operator_spelling`] spells an empty key list. See
+/// [`TypeShape::Union`] on why the degenerate lengths are spelled rather than
+/// asserted against.
+pub fn union_spelling(members: &[String]) -> String {
+    if members.is_empty() { "never".to_string() } else { members.join(" | ") }
+}
+
+/// **The member a union READS AS to a consumer whose vocabulary has no sum
+/// type**, or `None` when its members do not agree.
+///
+/// Nearly every consumer downstream projects a `TypeShape` into a vocabulary
+/// that is SMALLER than TypeScript's - five Genius column types, GraphQL's
+/// scalars, postgres's, a keyboard mode - and none of them has a sum type to
+/// project a union into. Each one then faces the same question, which is NOT
+/// "what is a union" but "does this union still have ONE answer in my
+/// vocabulary": `"draft" | "published"` is one `text` column, and
+/// `1 | "auto"` is not one of anything.
+///
+/// One function because the answer has to be the same in two places that are
+/// not allowed to disagree - `highbay_data_service` decides a column's pg TYPE
+/// and, separately, how to render a VALUE bound into it, and a union read as
+/// `text` by one and as `jsonb` by the other writes a quoted JSON string into a
+/// text column. A fold written per site is a seam waiting to drift, and this is
+/// the kind of drift nothing reports.
+///
+/// The MEMBER comes back rather than the reading, because a caller that needs
+/// to recurse (the value renderer) needs a shape and a caller that needs the
+/// reading already has `read`. Which member: the first, and its identity
+/// matters only when `read` is coarser than equality on the members - all of
+/// them read the same by construction, so any would do, and the first is the
+/// author's own (see [`TypeShape::Union`] on member order).
+pub fn union_reading<'a, T: PartialEq>(
+    members: &'a [TypeShape],
+    read: impl Fn(&TypeShape) -> T,
+) -> Option<&'a TypeShape> {
+    let first = members.first()?;
+    let reading = read(first);
+    members[1..].iter().all(|member| read(member) == reading).then_some(first)
+}
+
 /// A function signature (handler export or host import).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FuncSig {
