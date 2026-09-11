@@ -1972,6 +1972,112 @@ pub enum TypeShape {
         base: Box<TypeShape>,
         key: String,
     },
+    // THE LITERAL TYPE AND THE UNION. Appended last, same rule as everything
+    // above and for the same reason: this enum is persisted positionally, so a
+    // variant that reads better beside `String` or beside `Option` still goes
+    // at the END. `deps/libtsx/tests/committed_hbdef_decodes.rs` is that rule
+    // made checkable from inside this crate - it decodes frozen `.hbdef` bytes
+    // and re-encodes them byte for byte, so an INSERTED variant fails there
+    // rather than in a silently different declaration six crates away.
+    //
+    // WHAT WAS BROKEN WITHOUT THEM. `TypeShape` was documented as having
+    // TypeScript semantics and could not spell TypeScript's two most ordinary
+    // type forms. MEASURED, before these variants existed:
+    //
+    //     interface ButtonProps { tone?: "primary" | "danger" }
+    //       -> Err("`tone`: a union of 2 types is not modelled - the semantic
+    //               AST has no sum type ...")
+    //     interface Row { kind: "handle" }
+    //       -> Named("unknown")
+    //
+    // The first is an outright refusal of ordinary source; the second is the
+    // worse half, because it PARSES - `"handle"` reached `type_shape`'s `_ =>`
+    // arm and became the same `Named("unknown")` every other unmodelled form
+    // becomes, so a discriminant a record actually keys on arrived downstream
+    // indistinguishable from a typo.
+    //
+    // THE REFUSAL WAS RIGHT WHILE IT STOOD, and that is why it is replaced
+    // rather than relaxed. `union_shape`'s doc argues at length that collapsing
+    // `Id | Blank` to `Id` is worse than refusing it, and it is: the author
+    // declared a sum type and every reader saw one arm of it. The fix for "the
+    // vocabulary has no sum type" is a sum type, not a looser collapse.
+    /// **A TypeScript LITERAL TYPE** - `"primary"`, `42`, `true`: the type
+    /// whose only inhabitant is that one value.
+    ///
+    /// # Why the payload is [`LiteralValue`] and not a literal enum of its own
+    ///
+    /// Because a second one would be a second width vocabulary, and
+    /// [`LiteralValue`]'s own doc records that having two was the defect: it
+    /// spells widths Rust's way, [`TypeShape`] spells them WIT's way, and the
+    /// translation between them is written ONCE as
+    /// [`type_shape`](LiteralValue::type_shape) and
+    /// [`narrow`](LiteralValue::narrow) *"so no consumer maps a width by
+    /// hand."* A literal type is a literal standing in type position - it is
+    /// the same value, read in the other position - so it takes the same
+    /// carrier, and `type_shape` is already exactly the widening a consumer
+    /// wants from it (`Literal(String("primary"))` widens to `String`).
+    ///
+    /// The cost, stated: [`LiteralValue`] now reaches disk through two
+    /// variants instead of one. It was already append-last for that reason and
+    /// its doc already says so; this adds a second reader of the same rule, not
+    /// a new rule.
+    ///
+    /// # Number and boolean are the same feature, not extra scope
+    ///
+    /// TypeScript's literal types are exactly string, number, boolean and
+    /// bigint. Accepting `"a"` and refusing `1` would need its own refusal arm
+    /// - MORE code than accepting, to ship a half of a form authors write whole
+    /// (`type Step = -1 | 0 | 1`). Bigint is the one left out, and deliberately:
+    /// [`LiteralValue`] has no bigint carrier, and minting one at the type level
+    /// alone would create a literal the VALUE level cannot hold. `parse::literal_shape`
+    /// refuses it by name instead.
+    ///
+    /// # Reduction
+    ///
+    /// WIT has no literal type, so the deterministic one-way reduction this
+    /// enum's header describes is to the literal's own width - what
+    /// [`LiteralValue::type_shape`] returns. The literal survives in the
+    /// AUTHORED form, which is where a property sheet reads it from.
+    Literal(LiteralValue),
+    /// **A union** - `"primary" | "danger"`, `Id | Blank`.
+    ///
+    /// # This does NOT subsume [`TypeShape::Option`], and that is a decision
+    ///
+    /// `Option` is documented as `T | undefined` and is the one union this
+    /// vocabulary had; `undefined` has no [`TypeShape`] spelling of its own, so
+    /// `Option(T)` cannot be re-expressed as `Union([T, Undefined])` without a
+    /// third variant for the absence - and absence-as-modelling is exactly what
+    /// `Option` is for ([`LiteralValue`]'s doc settles the same question for
+    /// the value level: there is no `Null` there because absence belongs to the
+    /// type vocabulary). So the parser keeps partitioning the nullish members
+    /// out and the two compose: `A | B | undefined` lowers to
+    /// `Option(Union([A, B]))`, with `Option` outermost.
+    ///
+    /// # Normalized by the producer, not by the type
+    ///
+    /// `parse::union_shape` never builds a union of fewer than two members: one
+    /// member is that member, and zero members with a nullish is
+    /// `Named("unknown")`. A shorter `Vec` is still REPRESENTABLE here, because
+    /// a `Vec` cannot say otherwise and a hand-built node may hold one; the
+    /// emit spells an empty union `never` and a one-member union as that
+    /// member, so nothing downstream has to guess. Neither shape round-trips
+    /// through a re-parse, and neither is produced by one.
+    ///
+    /// # Reduction
+    ///
+    /// A union of string literals reduces to a WIT `enum`; the general case to
+    /// a WIT `variant`. Both are reductions performed at evaluation, like every
+    /// other operator here - see the enum header on why an unreduced node must
+    /// never reach the edge.
+    ///
+    /// # Member order is the AUTHOR'S
+    ///
+    /// `"a" | "b"` and `"b" | "a"` are the same TypeScript type and two values
+    /// here, deliberately: this crate's product describes authored SOURCE, and
+    /// the emit is the identity on what was read. A consumer that needs a
+    /// canonical order sorts at the point it needs one - which is the same
+    /// place that decides whether the order is part of the shape's identity.
+    Union(Vec<TypeShape>),
 }
 
 /// **The TypeScript spelling of an indexed access**, given an ALREADY-RENDERED

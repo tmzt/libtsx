@@ -1263,13 +1263,18 @@ fn signatures_to_fields(sigs: &[TSSignature]) -> Result<Vec<FieldDecl>, String> 
 /// Map a `TSType` onto the owned [`TypeShape`] vocabulary, or say why it has no
 /// place in it.
 ///
-/// **Fallible because one case cannot be answered**, not because the mapping is
-/// risky: [`TypeShape`] has no sum type, so a union of two real types is a
-/// declaration this vocabulary cannot hold. Everything else it does not model
-/// becomes [`TypeShape::Named`] and stays a *reference* - which is honest,
-/// because a named reference is exactly what an unmodelled type is - while a
-/// discarded union member would be a declaration silently replaced by a
-/// different one.
+/// **Fallible because some forms cannot be answered**, not because the mapping
+/// is risky. It used to be fallible for exactly one reason - the vocabulary had
+/// no sum type, so a union of two real types could not be held - and
+/// [`TypeShape::Union`] has since answered that one. What remains fallible is
+/// the literal forms with no carrier ([`literal_shape`]): a bigint literal type
+/// and a template literal type.
+///
+/// Everything else it does not model becomes [`TypeShape::Named`] and stays a
+/// *reference* - which is honest, because a named reference is exactly what an
+/// unmodelled type is - while a discarded union member, or a literal flattened
+/// into `Named("unknown")`, is a declaration silently replaced by a different
+/// one.
 fn type_shape(ty: &TSType) -> Result<TypeShape, String> {
     Ok(match ty {
         TSType::TSBooleanKeyword(_) => TypeShape::Bool,
@@ -1294,6 +1299,9 @@ fn type_shape(ty: &TSType) -> Result<TypeShape, String> {
         TSType::TSUnionType(u) => union_shape(u)?,
         TSType::TSTypeReference(r) => reference_shape(r)?,
         TSType::TSIndexedAccessType(idx) => indexed_shape(idx)?,
+        // A LITERAL IN TYPE POSITION, which used to fall to the `_` arm below
+        // and become `Named("unknown")` - see [`literal_shape`].
+        TSType::TSLiteralType(lit) => literal_shape(lit)?,
         // Anything else we don't model becomes an opaque named reference.
         _ => TypeShape::Named("unknown".to_string()),
     })
@@ -1349,21 +1357,37 @@ fn indexed_shape(idx: &oxc_ast::ast::TSIndexedAccessType) -> Result<TypeShape, S
     })
 }
 
-/// `T | undefined` / `T | null` -> `Option<T>`; **any other union is refused.**
+/// **A union.** The nullish members are partitioned out into
+/// [`TypeShape::Option`]; what is left is the union proper.
 ///
-/// # It used to collapse, and that is the defect this replaces
+/// # It used to collapse, then it REFUSED, and this is the third answer
 ///
-/// The rule was "other unions collapse to the first non-nullish member
+/// The first rule was "other unions collapse to the first non-nullish member
 /// (best-effort)", so `Id | Blank` parsed as `Id` and `Blank` disappeared with
 /// no diagnostic anywhere. That is worse than unsupported: the author declared
 /// a sum type, the parse answered with one arm of it, and every reader
 /// downstream - the property sheet, the daemon's column planner, the seed
 /// generator - saw a complete declaration that was not the one written.
 ///
-/// [`TypeShape`] models products (`Record`) and options and has no sum, so
-/// there is no arm to lower this to. Refusing says so at the one place that
-/// knows; admitting it needs a `TypeShape` variant, and that is a serialized IR
-/// change (see DRAFT_APP_PLAN.md's finding on it), not a parser change.
+/// So it became a refusal, correctly: [`TypeShape`] modelled products
+/// (`Record`) and options and had no sum, and refusing says so at the one place
+/// that knows. But the refusal was never the destination - its own doc named
+/// the fix (*"admitting it needs a `TypeShape` variant"*), and the price of
+/// standing still was `tone?: "primary" | "danger"`, ordinary TSX, failing to
+/// parse at all.
+///
+/// [`TypeShape::Union`] is that variant, so the whole of this function's
+/// refusal is now a construction. **The anti-collapse property is unchanged and
+/// is what the test still measures**: every member reaches the shape. Nothing
+/// is dropped, which was the only thing the refusal was protecting.
+///
+/// # The nullish members still come out, and `Option` is still outermost
+///
+/// `A | B | undefined` lowers to `Option(Union([A, B]))`, not to
+/// `Union([A, B, Undefined])`: there is no `undefined` [`TypeShape`], and
+/// minting one so that `Option` could be expressed as a union would replace a
+/// modelled absence with a member every consumer has to recognise by name. See
+/// [`TypeShape::Union`] for the full argument.
 fn union_shape(u: &oxc_ast::ast::TSUnionType) -> Result<TypeShape, String> {
     let mut nullish = false;
     let mut members: Vec<&TSType> = Vec::new();
@@ -1373,15 +1397,125 @@ fn union_shape(u: &oxc_ast::ast::TSUnionType) -> Result<TypeShape, String> {
             other => members.push(other),
         }
     }
-    match (members.len(), nullish) {
-        (1, true) => Ok(TypeShape::Option(Box::new(type_shape(members[0])?))),
-        (1, false) => type_shape(members[0]),
+    // A union of ONE is that one type - a `Union` wrapper around a single
+    // member would make `A` and `(A)` two different shapes, and the author
+    // wrote one type either way. `TypeShape::Union` documents this
+    // normalization as the producer's job rather than the type's.
+    let shape = match members.as_slice() {
         // `undefined | null` alone: nullish and nothing to be optional ABOUT.
-        (0, _) => Ok(TypeShape::Named("unknown".to_string())),
-        (n, _) => Err(format!(
-            "a union of {n} types is not modelled - the semantic AST has no sum type, only `T | undefined` / `T | null` (which is an Option)"
-        )),
-    }
+        [] => return Ok(TypeShape::Named("unknown".to_string())),
+        [only] => type_shape(only)?,
+        many => TypeShape::Union(
+            many.iter().map(|m| type_shape(m)).collect::<Result<Vec<_>, _>>()?,
+        ),
+    };
+    Ok(if nullish { TypeShape::Option(Box::new(shape)) } else { shape })
+}
+
+/// **A literal in TYPE position** - `"handle"`, `42`, `-1`, `true`.
+///
+/// # It was `Named("unknown")`, and that is the defect this replaces
+///
+/// A `TSLiteralType` had no arm at all, so it fell through [`type_shape`]'s
+/// `_ =>` catch-all. MEASURED, before this existed:
+///
+/// ```text
+/// interface Row { kind: "handle" }  ->  kind: Named("unknown")
+/// ```
+///
+/// which is the same shape an unmodelled `symbol`, `never` or mapped type
+/// produces. A discriminant a record keys on and a form this vocabulary has
+/// never heard of decoded IDENTICALLY, and the catch-all is why: it answers
+/// "this is a reference to something I cannot see", which is true of an
+/// unmodelled type and false of a literal, whose whole content is right there
+/// in the source.
+///
+/// # The numeric capture is [`numeric_literal`]'s, not a second reading
+///
+/// Reusing it is the point: it reads the INTEGER FROM THE SOURCE TEXT rather
+/// than from oxc's already-rounded `f64`, which is the only reading under which
+/// an `Int64` capture is worth having. A literal type written past 2^53 has
+/// exactly the same fidelity as the same token written in value position,
+/// because it is the same function.
+///
+/// # Two refusals, both named
+///
+/// * a **bigint** literal type (`1n`) - [`LiteralValue`] has no bigint carrier,
+///   and minting one at the type level alone would create a literal the value
+///   level cannot hold;
+/// * a **template literal** type with no substitution (`` `abc` ``) - which is
+///   a literal string wearing the other quotes, and would be admissible; it is
+///   refused because admitting it would make `` `abc` `` and `"abc"` the same
+///   shape and the emit would have to pick one spelling to write back.
+///
+/// Both are refused rather than degraded, because degrading is what this
+/// function exists to stop. The refusal names the form so an author can find
+/// it.
+///
+/// **A template literal type WITH a substitution (`` `id-${string}` ``) does
+/// not arrive here at all** - oxc gives it a `TSTemplateLiteralType`, a
+/// different node, which still falls to [`type_shape`]'s `_ =>` arm and becomes
+/// `Named("unknown")`. MEASURED. That is the pre-existing catch-all rather than
+/// anything this function decides, and it is a real gap of the same class: a
+/// type-level function over strings is §13's registry territory, not a literal.
+fn literal_shape(lit: &oxc_ast::ast::TSLiteralType) -> Result<TypeShape, String> {
+    use oxc_ast::ast::TSLiteral;
+    let value = match &lit.literal {
+        TSLiteral::StringLiteral(s) => LiteralValue::String(s.value.to_string()),
+        TSLiteral::BooleanLiteral(b) => LiteralValue::Bool(b.value),
+        TSLiteral::NumericLiteral(n) => numeric_literal(n),
+        // A NEGATIVE numeric literal type, which TypeScript spells as a unary
+        // expression rather than as a token: `type Step = -1 | 0 | 1`. Accepting
+        // `1` and refusing `-1` would be a half of a form authors write whole.
+        TSLiteral::UnaryExpression(u) => return unary_literal_shape(u),
+        TSLiteral::BigIntLiteral(_) => {
+            return Err("a bigint literal type has no place in this vocabulary - \
+                        there is no bigint literal to hold it"
+                .to_string());
+        }
+        TSLiteral::TemplateLiteral(_) => {
+            return Err("a template literal type is not modelled - it is a type-level \
+                        function over strings, not a literal"
+                .to_string());
+        }
+    };
+    Ok(TypeShape::Literal(value))
+}
+
+/// `-1` / `+1` in type position: the negation applied to the literal it wraps.
+///
+/// Split out of [`literal_shape`] so the two refusals it adds - a non-numeric
+/// operand and an operator that is not a sign - read as refusals rather than as
+/// nesting. Both are unreachable from TypeScript that type-checks; they are
+/// here because the AST can hold them and answering "unknown" is what this pair
+/// of functions exists to stop doing.
+fn unary_literal_shape(u: &oxc_ast::ast::UnaryExpression) -> Result<TypeShape, String> {
+    let Expression::NumericLiteral(n) = &u.argument else {
+        return Err("a literal type's operand is a number".to_string());
+    };
+    let value = numeric_literal(n);
+    let value = match u.operator {
+        UnaryOperator::UnaryPlus => value,
+        UnaryOperator::UnaryNegation => match value {
+            // `numeric_literal` produces only these two, and the one integer
+            // that cannot be negated (`i64::MIN`) is not one of them: its
+            // magnitude does not parse as an `i64`, so the token arrives as a
+            // float already.
+            LiteralValue::Int64(v) => match v.checked_neg() {
+                Some(v) => LiteralValue::Int64(v),
+                None => return Err("a negated literal type is out of range".to_string()),
+            },
+            LiteralValue::Float64(v) => LiteralValue::Float64(-v),
+            other => return Err(format!("`-` does not apply to the literal {other:?}")),
+        },
+        other => {
+            return Err(format!(
+                "`{}` is not a sign, and a literal type takes only a sign",
+                other.as_str()
+            ));
+        }
+    };
+    Ok(TypeShape::Literal(value))
 }
 
 /// `Array<T>` → `List<T>`; `Omit`/`Pick` → the key operators; every other
@@ -2878,25 +3012,32 @@ mod tests {
         assert_eq!(ifaces[0].fields[0].ty, TypeShape::Bool);
     }
 
-    /// **A union of two real types is REFUSED, not collapsed** - the defect
-    /// [`union_shape`] documents. `Id | Blank` used to parse as `Id`, so a
-    /// declared sum type reached every reader as one arm of itself with no
-    /// diagnostic anywhere.
+    /// **A union of two real types is CARRIED, not collapsed** - the defect
+    /// [`union_shape`] documents, now fixed rather than refused. `Id | Blank`
+    /// once parsed as `Id`, so a declared sum type reached every reader as one
+    /// arm of itself with no diagnostic anywhere; then it was refused outright,
+    /// because the vocabulary had no sum to lower it to.
     ///
-    /// The refusal names the interface and the field, because the whole point is
-    /// that an author can find it.
+    /// **The property under test did not change when the answer did.** What was
+    /// always being ruled out is a member DISAPPEARING, and that is asserted
+    /// here the direct way: both members are in the shape. The refusal was one
+    /// way to guarantee it and [`TypeShape::Union`] is a better one, because it
+    /// also parses.
     #[test]
-    fn a_union_of_two_real_types_is_refused_rather_than_collapsed() {
-        let errors = extract_interfaces("interface Route { record: Id | Blank; }")
-            .expect_err("a sum type has no place in this vocabulary");
-        assert_eq!(errors.len(), 1, "{errors:?}");
-        assert!(errors[0].contains("Route"), "{errors:?}");
-        assert!(errors[0].contains("record"), "{errors:?}");
-        assert!(errors[0].contains("sum type"), "{errors:?}");
-        assert!(errors[0].is_ascii(), "{errors:?}");
+    fn a_union_of_two_real_types_is_carried_rather_than_collapsed() {
+        let ifaces = extract_interfaces("interface Route { record: Id | Blank; }")
+            .expect("a sum type is spellable now");
+        assert_eq!(
+            ifaces[0].fields[0].ty,
+            TypeShape::Union(vec![
+                TypeShape::Named("Id".into()),
+                TypeShape::Named("Blank".into()),
+            ]),
+            "neither member is dropped, and they keep the author\'s order",
+        );
 
         // ...and the nullish forms are untouched: they are an Option, which this
-        // vocabulary does model.
+        // vocabulary has always modelled and which the union does NOT subsume.
         for src in [
             "interface P { a: string | undefined; }",
             "interface P { a: string | null; }",
@@ -2910,21 +3051,47 @@ mod tests {
             );
         }
 
-        // A nested union is refused through the containers too - a record field
-        // and a list element are the two ways one hides.
-        for src in [
-            "interface P { a: { b: Id | Blank }; }",
-            "interface P { a: (Id | Blank)[]; }",
-        ] {
-            assert!(extract_interfaces(src).is_err(), "{src}");
-        }
+        // The two compose, with `Option` OUTERMOST - `A | B | undefined` is an
+        // optional union and not a union with an `undefined` member.
+        let ifaces =
+            extract_interfaces("interface P { a: Id | Blank | undefined; }").expect("optional union");
+        assert_eq!(
+            ifaces[0].fields[0].ty,
+            TypeShape::Option(Box::new(TypeShape::Union(vec![
+                TypeShape::Named("Id".into()),
+                TypeShape::Named("Blank".into()),
+            ]))),
+        );
 
-        // Every refused declaration is reported, not just the first.
+        // A nested union reaches the shape through the containers too - a record
+        // field and a list element are the two ways one used to hide.
+        let union = TypeShape::Union(vec![
+            TypeShape::Named("Id".into()),
+            TypeShape::Named("Blank".into()),
+        ]);
+        let ifaces = extract_interfaces("interface P { a: { b: Id | Blank }; }").expect("record");
+        let TypeShape::Record(fields) = &ifaces[0].fields[0].ty else { panic!("a record") };
+        assert_eq!(fields[0].ty, union);
+        let ifaces = extract_interfaces("interface P { a: (Id | Blank)[]; }").expect("list");
+        assert_eq!(ifaces[0].fields[0].ty, TypeShape::List(Box::new(union)));
+    }
+
+    /// **Every refused declaration is reported, not just the first.** This was
+    /// asserted with two unions until unions parsed; the property belongs to
+    /// [`extract_interfaces`]\'s error collection and not to unions, so it moves
+    /// onto a form that is still refused rather than leaving with them.
+    #[test]
+    fn every_refused_field_is_reported_not_just_the_first() {
         let errors = extract_interfaces(
-            "interface A { x: Id | Blank; }\ninterface B { y: Id | Blank; }",
+            "interface A { x: 1n; }\ninterface B { y: `abc`; }",
         )
         .expect_err("two refusals");
         assert_eq!(errors.len(), 2, "{errors:?}");
+        // The refusal names the interface and the field, because the whole
+        // point is that an author can find it.
+        assert!(errors[0].contains("A") && errors[0].contains("x"), "{errors:?}");
+        assert!(errors[1].contains("B") && errors[1].contains("y"), "{errors:?}");
+        assert!(errors.iter().all(|e| e.is_ascii()), "{errors:?}");
     }
 
     #[test]

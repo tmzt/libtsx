@@ -286,14 +286,7 @@ impl From<&BindingExpr> for String {
 /// the writer it and every internal splice share.
 fn emit_binding_expr(out: &mut String, expr: &BindingExpr) {
     match expr {
-        BindingExpr::Literal(literal) => match literal {
-            LiteralValue::Bool(value) => out.push_str(if *value { "true" } else { "false" }),
-            LiteralValue::Int32(value) => out.push_str(&value.to_string()),
-            LiteralValue::Int64(value) => out.push_str(&value.to_string()),
-            LiteralValue::Float32(value) => push_float_literal(out, f64::from(*value)),
-            LiteralValue::Float64(value) => push_float_literal(out, *value),
-            LiteralValue::String(value) => push_string_literal(out, value),
-        },
+        BindingExpr::Literal(literal) => push_literal_value(out, literal),
         BindingExpr::Null => out.push_str("null"),
         BindingExpr::Path(path) => out.push_str(&path.join(".")),
         BindingExpr::Array(items) => {
@@ -433,6 +426,33 @@ fn emit_binding_expr(out: &mut String, expr: &BindingExpr) {
 /// anything with a point, an exponent or a non-finite spelling already
 /// re-parses as what it is (or, for a non-finite, is not a TypeScript numeric
 /// literal at all and could not have come from a parse).
+/// **One literal, spelled as TypeScript source** - shared by VALUE position
+/// ([`emit_binding_expr`]) and TYPE position ([`emit_type_shape`]).
+///
+/// Beside [`crate::dag::indexed_access_spelling`] and for its reason: two
+/// positions render the same [`LiteralValue`] and neither has a reason to spell
+/// it differently, so the quoting, the escaping and the `1.0`-vs-`1` decision
+/// cannot come out one way here and another way there. `TypeShape::Literal`
+/// carries a `LiteralValue` precisely so this stays one function.
+///
+/// **The one place the two positions differ is a `Float64` that happens to be
+/// whole.** [`push_float_literal`] writes `1.0`, because in value position a
+/// bare `1` re-parses as `Int64` and the round trip is a law there. In type
+/// position `1.0` is legal TypeScript and re-parses as `Literal(Int64(1))`, so
+/// that one shape does not round trip - and it is not producible by a parse
+/// either, because `numeric_literal` reads `1` as `Int64`. A hand-built
+/// `Literal(Float64(1.0))` is the only way to reach it.
+fn push_literal_value(out: &mut String, literal: &LiteralValue) {
+    match literal {
+        LiteralValue::Bool(value) => out.push_str(if *value { "true" } else { "false" }),
+        LiteralValue::Int32(value) => out.push_str(&value.to_string()),
+        LiteralValue::Int64(value) => out.push_str(&value.to_string()),
+        LiteralValue::Float32(value) => push_float_literal(out, f64::from(*value)),
+        LiteralValue::Float64(value) => push_float_literal(out, *value),
+        LiteralValue::String(value) => push_string_literal(out, value),
+    }
+}
+
 fn push_float_literal(out: &mut String, value: f64) {
     let text = value.to_string();
     let integral = text
@@ -955,7 +975,43 @@ fn emit_type_shape(out: &mut String, shape: &TypeShape) {
         TypeShape::IndexedAccess { base, key } => {
             let mut rendered = String::new();
             emit_type_shape(&mut rendered, base);
+            // **PARENTHESISED WHEN THE BASE IS A UNION**, and this is the one
+            // place in this function precedence bites. `(A | B)["k"]` is a
+            // producible shape - `indexed_shape` lowers through
+            // `TSParenthesizedType`, which `type_shape` strips - and written
+            // bare it is `A | B["k"]`, which TypeScript reads as
+            // `A | (B["k"])`: a DIFFERENT type that parses cleanly, so the
+            // round trip would come back wrong with nothing to say so.
+            if matches!(**base, TypeShape::Union(_)) {
+                rendered = format!("({rendered})");
+            }
             out.push_str(&crate::dag::indexed_access_spelling(&rendered, key));
+        }
+        // A literal type is its literal, in the ONE spelling both positions
+        // share - see [`push_literal_value`].
+        TypeShape::Literal(value) => push_literal_value(out, value),
+        // `A | B | C`. No parentheses of its own: `|` binds looser than every
+        // spelling above it, and each of the three containers a union can sit
+        // inside already brackets its contents - `Array<...>`, `{a: ...}`,
+        // `Foo<...>`. The exception is the base of an indexed access, which is
+        // parenthesised at that arm rather than here, because that is where the
+        // ambiguity is.
+        //
+        // The degenerate lengths are spelled rather than asserted against: the
+        // parser never builds them (`union_shape` normalises one member to that
+        // member and zero to `Named("unknown")`), but a hand-built node can
+        // hold one, and `never` is what TypeScript calls the empty union. See
+        // `TypeShape::Union`.
+        TypeShape::Union(members) => {
+            if members.is_empty() {
+                out.push_str("never");
+            }
+            for (index, member) in members.iter().enumerate() {
+                if index > 0 {
+                    out.push_str(" | ");
+                }
+                emit_type_shape(out, member);
+            }
         }
     }
 }
