@@ -1524,15 +1524,26 @@ fn unary_literal_shape(u: &oxc_ast::ast::UnaryExpression) -> Result<TypeShape, S
 ///
 /// # The key operators are read BEFORE the arguments are lowered
 ///
-/// `Omit<X, "a" | "b">`'s second argument is not a type, and lowering it as one
-/// destroys it two different ways: a single `"a"` reaches `type_shape`'s `_ =>`
-/// arm and becomes `Named("unknown")`, and `"a" | "b"` reaches [`union_shape`],
-/// which REFUSES a two-member union outright (correctly - the vocabulary has no
-/// sum type). So the general path can only mangle this argument or reject the
-/// whole declaration.
+/// `Omit<X, "a" | "b">`'s second argument is a list of FIELD NAMES, not a type,
+/// and [`TypeShape::Omit`] holds it as `Vec<String>` for that reason - a slot
+/// that can hold a type is a slot that can hold `Named("unknown")`.
 ///
-/// Hence the branch above the `map(type_shape)`: the keys are read
-/// syntactically, as the names they are.
+/// **The reason this branch exists changed when literal and union types landed,
+/// and the branch did not.** It used to be that the general path could only
+/// MANGLE this argument: `"a"` fell to `type_shape`'s `_ =>` arm and became
+/// `Named("unknown")`, and `"a" | "b"` reached [`union_shape`], which refused a
+/// two-member union outright. Both of those are now faithful - the first is a
+/// `Literal`, the second a `Union` of two - so nothing is destroyed by lowering
+/// them any more.
+///
+/// What remains is a TYPE MISMATCH rather than a loss: `Union([Literal("a"),
+/// Literal("b")])` is a perfectly good type and is not a `Vec<String>`, and
+/// unwrapping one into the other here would be the key-slot reduction that
+/// belongs to the operators' own evaluation. FACT_CURRENT_v2 section 12 says
+/// the key slot *should* hold a union, and prices that under section 13: `Pick`
+/// and `Omit` become registered type functions, at which point their variants
+/// are read and never written and the payload can change for free. Until then
+/// the keys are read syntactically, as the names they are.
 fn reference_shape(r: &oxc_ast::ast::TSTypeReference) -> Result<TypeShape, String> {
     let name = match &r.type_name {
         oxc_ast::ast::TSTypeName::IdentifierReference(id) => id.name.to_string(),
