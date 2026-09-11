@@ -157,44 +157,64 @@ fn the_emit_re_parses_to_the_same_shape() {
     }
 }
 
-/// **The two variants are APPENDED**, pinned at the byte.
+/// **THE TAIL OF THE ENUM, PINNED AT THE BYTE - AND RE-PINNED, ONCE, WHEN THE
+/// THREE KEY OPERATORS LEFT IT.**
 ///
-/// This is the test the whole placement rule rests on. `TypeShape` is
-/// persisted positionally - postcard writes a bare varint variant index with no
-/// name beside it - so a variant INSERTED where it reads better renumbers every
-/// variant after it, and every already-committed `.hbdef` decodes as a
-/// different declaration with no error anywhere.
+/// `TypeShape` is persisted positionally - postcard writes a bare varint
+/// variant index with no name beside it - so a variant INSERTED where it reads
+/// better renumbers every variant after it, and every already-committed
+/// `.hbdef` decodes as a different declaration with no error anywhere. That
+/// rule is why `Literal` and `Union` were appended rather than filed beside
+/// `String` and `Option`, and this test is what makes the placement checkable.
 ///
-/// Asserting the new indices alone would not catch that: it is the index of the
-/// variant BEFORE them that says the addition went to the end rather than into
-/// the middle. `IndexedAccess` at 16 is the load-bearing line here.
-/// `committed_hbdef_decodes.rs` is the same claim from the other direction, on
-/// real bytes.
+/// # Why these numbers MOVED, and why that is a bump rather than a defect
+///
+/// It read `the_new_variants_are_appended_at_17_and_18` and pinned
+/// `Omit` 13, `Pick` 14, `Extends` 15, `IndexedAccess` 16, `Literal` 17,
+/// `Union` 18. `Omit`, `Pick` and `IndexedAccess` are REGISTERED TYPE FUNCTIONS
+/// now (`libhbdata::typeexpr::REGISTRY`, FACT_IMPLEMENTATION A3): the operators
+/// are `TypeShape::Apply` applications carrying a name, exactly as `Partial`
+/// always was, so their variants were removed and everything after them shifted
+/// down by three.
+///
+/// **A removal cannot be append-managed**, which is the same sentence
+/// `libhbui::codec::HBDEF_VERSION` records for each of its own bumps: there are
+/// no names in the bytes, so an old record's `15` is read as `Extends` by the
+/// writer and as `Union` by this build. That is exactly what the version header
+/// refuses, and it is refused rather than migrated - `HBDEF_VERSION` and
+/// `NODEGRAPH_VERSION` both moved in the commit that removed these variants,
+/// and every committed artifact was regenerated.
+///
+/// So the number to read here is `Extends`: it is the FIRST variant after the
+/// three that left, and 13 is 15 minus 3 exactly. If it were anything else, the
+/// removal took something else with it.
 #[test]
-fn the_new_variants_are_appended_at_17_and_18() {
+fn the_tail_of_the_enum_is_pinned_where_the_registry_left_it() {
     /// postcard writes the discriminant as a leading varint; every index here
     /// is under 128, so it is the first byte.
     fn index(shape: &TypeShape) -> u8 {
         postcard::to_allocvec(shape).expect("encode")[0]
     }
 
-    // The tail of the enum as it stood before this step, unchanged.
+    // Everything up to and including the unsigned pair is where it always was:
+    // the removal was of three CONSECUTIVE variants after them, so nothing here
+    // may move.
     assert_eq!(index(&TypeShape::Bool), 0);
     assert_eq!(index(&TypeShape::Apply { constructor: "F".into(), args: vec![] }), 10);
     assert_eq!(index(&TypeShape::U32), 11);
     assert_eq!(index(&TypeShape::U64), 12);
-    assert_eq!(index(&TypeShape::Omit { base: Box::new(TypeShape::Bool), omitted: vec![] }), 13);
-    assert_eq!(index(&TypeShape::Pick { base: Box::new(TypeShape::Bool), picked: vec![] }), 14);
-    assert_eq!(index(&TypeShape::Extends { base: Box::new(TypeShape::Bool) }), 15);
-    assert_eq!(
-        index(&TypeShape::IndexedAccess { base: Box::new(TypeShape::Bool), key: "k".into() }),
-        16,
-        "the last variant before this step - if this moved, the addition was an INSERT",
-    );
 
-    // ...and the two new ones, after it.
-    assert_eq!(index(&TypeShape::Literal(LiteralValue::String("x".into()))), 17);
-    assert_eq!(index(&TypeShape::Union(vec![])), 18);
+    // `Omit` (13), `Pick` (14) and `IndexedAccess` (16) were here. Each is an
+    // `Apply` now and therefore index 10, which the line above already pins -
+    // there is no fourth index to assert, and that IS the saving the registry
+    // makes: a registered function costs no variant.
+    assert_eq!(
+        index(&TypeShape::Extends { base: Box::new(TypeShape::Bool) }),
+        13,
+        "the first variant after the three that left - 15 minus 3, exactly",
+    );
+    assert_eq!(index(&TypeShape::Literal(LiteralValue::String("x".into()))), 14);
+    assert_eq!(index(&TypeShape::Union(vec![])), 15);
 
     // Round trip, nested, with every literal width in one value - so a payload
     // that encodes but does not decode cannot pass on the index check alone.

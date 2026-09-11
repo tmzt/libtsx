@@ -45,6 +45,32 @@ const HB_MODAL: &[u8] = include_bytes!("fixtures/hb_modal.hbdef");
 /// artifact's accident.
 const WIDGET_PALETTE: &[u8] = include_bytes!("fixtures/widget_palette.hbdef");
 
+/// `crates/highbay_elements/src/data/components/binding_select/binding_select.hbdef`,
+/// frozen at `HBDEF_VERSION` 5 — **the first fixture here that declares an
+/// `interface` at all**.
+///
+/// # It is here because the other two measured nothing about the typelib entry
+///
+/// MEASURED while landing FACT_IMPLEMENTATION B1, which added two fields to
+/// `InterfaceDecl`: `HB_MODAL` and `WIDGET_PALETTE` both carry
+/// `interfaces.len() == 0`. So a change that reshapes the typelib entry — the
+/// single most consequential shape in this file's remit, being what `.hbdef`
+/// exists to seal — passes this gate untouched, and did. The module doc's claim
+/// that this is *"the append gate"* held for `TypeShape` and `BindingExpr` and
+/// was blind to `InterfaceDecl` for as long as it has existed.
+///
+/// That is a finding about the FIXTURES, not about the check: two artifacts
+/// were chosen for size and for being real, and neither happened to declare a
+/// props shape. This one does, which is why a third exists rather than the
+/// first two being swapped.
+///
+/// **Its freeze point is version 5 and not earlier**, deliberately: the two
+/// above are pre-A3 bytes and stay that way, while this one starts the record
+/// for the entry's current shape. A fixture frozen at the version that broke is
+/// worth nothing; a fixture frozen at the version after it is what the NEXT
+/// change is measured against.
+const BINDING_SELECT: &[u8] = include_bytes!("fixtures/binding_select.hbdef");
+
 fn body(bytes: &[u8], what: &str) -> Definition {
     assert_eq!(&bytes[..4], b"HBDF", "{what} is not an .hbdef record");
     postcard::from_bytes(&bytes[HEADER_LEN + ID_LEN..])
@@ -59,11 +85,28 @@ fn body(bytes: &[u8], what: &str) -> Definition {
 fn committed_hbdef_artifacts_still_decode() {
     let modal = body(HB_MODAL, "hb_modal.hbdef");
     let palette = body(WIDGET_PALETTE, "widget_palette.hbdef");
+    let select = body(BINDING_SELECT, "binding_select.hbdef");
 
     // Decoding is necessary and not sufficient: postcard will happily read
     // misaligned bytes as SOMETHING. So the contents are pinned too.
     assert_eq!(modal.symbol, "HbModal");
     assert_eq!(palette.symbol, "WidgetPalette");
+    assert_eq!(select.symbol, "BindingSelect");
+
+    // **THE TYPELIB ENTRY IS REACHED**, which is what `BINDING_SELECT` is for
+    // and what the two above cannot say: an `InterfaceDecl` is in these bytes,
+    // so a field added to it anywhere but as an `Option` at the end shows here.
+    assert!(
+        !select.interfaces.is_empty(),
+        "binding_select.hbdef declares a props shape - if this is ever empty, the fixture \
+         was replaced with one that measures what the other two already measure",
+    );
+    assert_eq!(
+        (modal.interfaces.len(), palette.interfaces.len()),
+        (0, 0),
+        "MEASURED, and recorded so the gap cannot be forgotten twice: neither of the \
+         original fixtures declares an interface, so neither can see a change to one",
+    );
 
     // Re-encoding the decoded value reproduces the original body byte for
     // byte. This is the strongest statement available from inside this crate:
@@ -71,6 +114,7 @@ fn committed_hbdef_artifacts_still_decode() {
     for (bytes, def, what) in [
         (HB_MODAL, &modal, "hb_modal.hbdef"),
         (WIDGET_PALETTE, &palette, "widget_palette.hbdef"),
+        (BINDING_SELECT, &select, "binding_select.hbdef"),
     ] {
         let re = postcard::to_allocvec(def).expect("re-encode");
         assert_eq!(
@@ -80,3 +124,4 @@ fn committed_hbdef_artifacts_still_decode() {
         );
     }
 }
+

@@ -1204,6 +1204,8 @@ fn convert_interface(
         })
         .collect::<Result<Vec<_>, String>>()?;
     Ok(InterfaceDecl {
+        id: None,
+        version: None,
         name,
         fields: signatures_to_fields(&decl.body.body)?,
         extends,
@@ -1311,7 +1313,7 @@ fn type_shape(ty: &TSType) -> Result<TypeShape, String> {
 ///
 /// # It used to be a `Named` holding the brackets, and that was the defect
 ///
-/// MEASURED, before [`TypeShape::IndexedAccess`] existed:
+/// MEASURED, before the indexed access had a node of its own:
 ///
 /// ```text
 /// Person["handle"]  ->  Named("Person[\"handle\"]")
@@ -1327,12 +1329,13 @@ fn type_shape(ty: &TSType) -> Result<TypeShape, String> {
 /// `libhbui::app`'s `fields_of` takes the brackets apart), so an authored
 /// document and a Rust-built tree agreed - on the wrong node.
 ///
-/// **What the variant changes is where the link LIVES**, not whether the
-/// spelling is accepted: the base is the same `Named("Person")` every other
-/// reference to Person is, the key is a key, and evaluation reduces it to the
-/// FIELD'S OWN TYPE rather than to a dangling name. See
-/// [`TypeShape::IndexedAccess`] for why it is not an `Apply` and why it is
-/// appended last.
+/// **What the node changes is where the link LIVES**, not whether the spelling
+/// is accepted: the base is the same `Named("Person")` every other reference to
+/// Person is, the key is a key, and evaluation reduces it to the FIELD'S OWN
+/// TYPE rather than to a dangling name. It is a registered type function now
+/// rather than a variant - [`TypeShape::indexed_access`] builds it and
+/// [`TypeShape::INDEXED_ACCESS`] names it - which changes the CARRIER and none
+/// of the above.
 ///
 /// # The base takes the ordinary lowering
 ///
@@ -1341,9 +1344,18 @@ fn type_shape(ty: &TSType) -> Result<TypeShape, String> {
 /// previous arm required a `Named` base and only accepted that nesting by
 /// accident, because the inner access had already collapsed INTO a name.
 ///
-/// The key must be a string literal, for the reason [`key_names`] refuses a
-/// non-literal: `Home[keyof X]` names something this cannot spell, and inventing
-/// a spelling for it would put `unknown` back through a different door.
+/// # The key must be a string literal HERE, and `Pick`'s no longer is
+///
+/// The two look like one rule and are not. `Pick<T, K>` lowers `K` through
+/// `type_shape` and reaches the registry faithfully as `Named("K")`, so the
+/// refusal belongs at evaluation. `Home[keyof X]` has no such luck: `keyof X`
+/// falls to [`type_shape`]'s `_ =>` arm and becomes `Named("unknown")`, which
+/// is the degradation this whole area exists to stop - so the refusal stays
+/// here, where the source is still in hand to name.
+///
+/// It is a DIFFERENT refusal from the one that left `Pick`: that one was
+/// `key_names` refusing a faithful lowering; this one is refusing to write down
+/// a mangled one.
 fn indexed_shape(idx: &oxc_ast::ast::TSIndexedAccessType) -> Result<TypeShape, String> {
     let TSType::TSLiteralType(lit) = &idx.index_type else {
         return Err("an indexed access `T[K]` takes a string literal key".to_string());
@@ -1351,10 +1363,7 @@ fn indexed_shape(idx: &oxc_ast::ast::TSIndexedAccessType) -> Result<TypeShape, S
     let oxc_ast::ast::TSLiteral::StringLiteral(key) = &lit.literal else {
         return Err("an indexed access `T[K]` takes a string literal key".to_string());
     };
-    Ok(TypeShape::IndexedAccess {
-        base: Box::new(type_shape(&idx.object_type)?),
-        key: key.value.to_string(),
-    })
+    Ok(TypeShape::indexed_access(type_shape(&idx.object_type)?, key.value.to_string()))
 }
 
 /// **A union.** The nullish members are partitioned out into
@@ -1518,32 +1527,29 @@ fn unary_literal_shape(u: &oxc_ast::ast::UnaryExpression) -> Result<TypeShape, S
     Ok(TypeShape::Literal(value))
 }
 
-/// `Array<T>` → `List<T>`; `Omit`/`Pick` → the key operators; every other
-/// generic reference preserves its constructor and all arguments as
-/// [`TypeShape::Apply`].
+/// `Array<T>` → `List<T>`; every other generic reference preserves its
+/// constructor and all arguments as [`TypeShape::Apply`].
 ///
-/// # The key operators are read BEFORE the arguments are lowered
+/// # `Omit`/`Pick` had a branch here, and it is GONE
 ///
-/// `Omit<X, "a" | "b">`'s second argument is a list of FIELD NAMES, not a type,
-/// and [`TypeShape::Omit`] holds it as `Vec<String>` for that reason - a slot
-/// that can hold a type is a slot that can hold `Named("unknown")`.
+/// It read the key argument SYNTACTICALLY - `key_names`, string literals only -
+/// because `TypeShape::Omit` held its keys as a `Vec<String>` and `Apply`
+/// demanded a type in that slot. The branch existed because the general path
+/// could only MANGLE the argument: `"a"` fell to `type_shape`'s `_ =>` arm and
+/// became `Named("unknown")`, and `"a" | "b"` reached [`union_shape`], which
+/// refused a two-member union outright.
 ///
-/// **The reason this branch exists changed when literal and union types landed,
-/// and the branch did not.** It used to be that the general path could only
-/// MANGLE this argument: `"a"` fell to `type_shape`'s `_ =>` arm and became
-/// `Named("unknown")`, and `"a" | "b"` reached [`union_shape`], which refused a
-/// two-member union outright. Both of those are now faithful - the first is a
-/// `Literal`, the second a `Union` of two - so nothing is destroyed by lowering
-/// them any more.
+/// Both of those are faithful now - the first is a `Literal`, the second a
+/// `Union` - so the general path destroys nothing, and the operators are
+/// registered type functions rather than variants (FACT_IMPLEMENTATION A3).
+/// **The key slot therefore holds THE UNION THE TS SPELLING ALWAYS HAD**, which
+/// is what FACT_CURRENT_v2 section 12 asked for.
 ///
-/// What remains is a TYPE MISMATCH rather than a loss: `Union([Literal("a"),
-/// Literal("b")])` is a perfectly good type and is not a `Vec<String>`, and
-/// unwrapping one into the other here would be the key-slot reduction that
-/// belongs to the operators' own evaluation. FACT_CURRENT_v2 section 12 says
-/// the key slot *should* hold a union, and prices that under section 13: `Pick`
-/// and `Omit` become registered type functions, at which point their variants
-/// are read and never written and the payload can change for free. Until then
-/// the keys are read syntactically, as the names they are.
+/// **What this newly ADMITS is `Pick<T, K>` with `K` a type parameter**, which
+/// `key_names` refused outright. It parses as `Apply { "Pick", [Named("T"),
+/// Named("K")] }` - faithful to the source - and is refused at EVALUATION, with
+/// the base in hand, which is where every other key question is already
+/// answered.
 fn reference_shape(r: &oxc_ast::ast::TSTypeReference) -> Result<TypeShape, String> {
     let name = match &r.type_name {
         oxc_ast::ast::TSTypeName::IdentifierReference(id) => id.name.to_string(),
@@ -1559,25 +1565,15 @@ fn reference_shape(r: &oxc_ast::ast::TSTypeReference) -> Result<TypeShape, Strin
 /// ([`reference_shape`]) and the `extends` clause ([`heritage_shape`]), because
 /// `Omit<B, "a">` must mean the same thing in both and oxc hands them over as
 /// two different node types.
+///
+/// `Array` is the ONE name still special-cased here, and it is not an operator:
+/// `Array<T>` and `T[]` are two spellings of one TypeScript type, so they lower
+/// to the one node. Every other constructor - including `Omit`, `Pick` and
+/// `Partial` - is carried by name to the registry.
 fn key_operator_or_apply(
     name: &str,
     params: &oxc_allocator::Vec<'_, TSType<'_>>,
 ) -> Result<TypeShape, String> {
-    if matches!(name, "Omit" | "Pick") {
-        let [base, keys] = params.as_slice() else {
-            return Err(format!(
-                "`{name}` takes exactly 2 type arguments, this one has {}",
-                params.len()
-            ));
-        };
-        let base = Box::new(type_shape(base)?);
-        let keys = key_names(keys, name)?;
-        return Ok(if name == "Omit" {
-            TypeShape::Omit { base, omitted: keys }
-        } else {
-            TypeShape::Pick { base, picked: keys }
-        });
-    }
     let args = params.iter().map(type_shape).collect::<Result<Vec<_>, _>>()?;
     if name == "Array" {
         if let Some(first) = args.first() {
@@ -1585,41 +1581,6 @@ fn key_operator_or_apply(
         }
     }
     Ok(TypeShape::Apply { constructor: name.to_string(), args })
-}
-
-/// The key argument of `Omit`/`Pick`: one string literal, or a union of them.
-///
-/// **Refuses anything else, rather than falling back.** A key position holding
-/// something this cannot name is the defect the operators were added to fix; a
-/// best-effort reading here would put `unknown` back by a different door. The
-/// two forms admitted are the two TypeScript itself uses, and a key that names
-/// no field of the base is not this function's to catch - that needs the base
-/// RESOLVED, and resolution is where it is rejected.
-fn key_names(ty: &TSType, operator: &str) -> Result<Vec<String>, String> {
-    fn one(ty: &TSType) -> Option<String> {
-        let TSType::TSLiteralType(lit) = ty else {
-            return None;
-        };
-        match &lit.literal {
-            oxc_ast::ast::TSLiteral::StringLiteral(s) => Some(s.value.to_string()),
-            _ => None,
-        }
-    }
-    let members: Vec<&TSType> = match ty {
-        TSType::TSUnionType(u) => u.types.iter().collect(),
-        single => vec![single],
-    };
-    members
-        .into_iter()
-        .map(|member| {
-            one(member).ok_or_else(|| {
-                format!(
-                    "`{operator}`'s key argument is a string literal or a union of them, \
-                     not every type is a field name"
-                )
-            })
-        })
-        .collect()
 }
 
 fn convert_element(jsx: &JSXElement, low: &Lowering) -> Result<Element, EffectError> {
@@ -2703,14 +2664,18 @@ mod tests {
         );
     }
 
-    /// **The key operators keep the KEYS**, which is the whole reason they are
-    /// variants rather than `Apply`.
+    /// **The key operators keep the KEYS** - the property that earned them
+    /// dedicated variants, held at a different address now that they are
+    /// registered type functions (FACT_IMPLEMENTATION A3).
     ///
-    /// Before this existed, `Omit<ContainerProps, "direction">` measured as
-    /// `Apply { "Omit", [Named("ContainerProps"), Named("unknown")] }` - the
-    /// field name replaced by the parser's word for "not modelled", so two
-    /// Omits hiding DIFFERENT fields of one base were byte-identical. The
-    /// `assert_ne` below is the specific thing that used to be an `assert_eq`.
+    /// Before the variants existed, `Omit<ContainerProps, "direction">`
+    /// measured as `Apply { "Omit", [Named("ContainerProps"),
+    /// Named("unknown")] }` - the field name replaced by the parser's word for
+    /// "not modelled", so two Omits hiding DIFFERENT fields of one base were
+    /// byte-identical. The `assert_ne` below is the specific thing that used to
+    /// be an `assert_eq`, and it is asserted over the APPLICATION now: the key
+    /// slot holds the union it always had in the TS spelling, so the general
+    /// node carries the names the variant used to.
     #[test]
     fn the_key_operators_keep_their_field_names() {
         let interfaces = extract_interfaces(
@@ -2724,23 +2689,20 @@ mod tests {
             "#,
         )
         .expect("the key operators parse");
-        let base = || Box::new(TypeShape::Named("ContainerProps".into()));
+        let base = || TypeShape::Named("ContainerProps".into());
 
         assert_eq!(
             interfaces[0].fields[0].ty,
-            TypeShape::Omit { base: base(), omitted: vec!["direction".into()] },
+            TypeShape::key_operator("Omit", base(), vec!["direction".into()]),
         );
         assert_eq!(
             interfaces[0].fields[1].ty,
-            TypeShape::Omit {
-                base: base(),
-                omitted: vec!["direction".into(), "gap".into()],
-            },
+            TypeShape::key_operator("Omit", base(), vec!["direction".into(), "gap".into()]),
             "a union of literals is several keys, not a refused union",
         );
         assert_eq!(
             interfaces[0].fields[2].ty,
-            TypeShape::Pick { base: base(), picked: vec!["gap".into()] },
+            TypeShape::key_operator("Pick", base(), vec!["gap".into()]),
         );
         assert_ne!(
             interfaces[0].fields[0].ty, interfaces[0].fields[3].ty,
@@ -2752,7 +2714,64 @@ mod tests {
         );
     }
 
-    /// They NEST, which is why `base` is boxed rather than a bare name.
+    /// **THE KEY SLOT IS THE UNION IT ALWAYS WAS**, spelled out rather than
+    /// gone through the constructor - because the constructor and the parser
+    /// agreeing proves only that they agree.
+    ///
+    /// `Pick<P, "a" | "b">`'s second type argument is `"a" | "b"`, which is a
+    /// union of two string literals in TypeScript and is that exactly here. The
+    /// single-key case is the literal itself and NOT a one-member union, under
+    /// `TypeShape::Union`'s producer-normalization rule.
+    #[test]
+    fn a_key_argument_is_a_literal_or_a_union_of_them() {
+        let interfaces = extract_interfaces(
+            r#"
+                interface Props {
+                    one: Pick<P, "a">;
+                    two: Pick<P, "a" | "b">;
+                }
+            "#,
+        )
+        .expect("the key operators parse");
+        let TypeShape::Apply { constructor, args } = &interfaces[0].fields[0].ty else {
+            panic!("an application, not a variant: {:?}", interfaces[0].fields[0].ty)
+        };
+        assert_eq!(constructor, "Pick");
+        assert_eq!(args[1], TypeShape::Literal(LiteralValue::String("a".into())));
+
+        let TypeShape::Apply { args, .. } = &interfaces[0].fields[1].ty else {
+            panic!("an application")
+        };
+        assert_eq!(
+            args[1],
+            TypeShape::Union(vec![
+                TypeShape::Literal(LiteralValue::String("a".into())),
+                TypeShape::Literal(LiteralValue::String("b".into())),
+            ]),
+        );
+    }
+
+    /// **`Pick<T, K>` WITH A TYPE PARAMETER PARSES**, which `key_names`
+    /// refused outright - FACT_IMPLEMENTATION A3's named red.
+    ///
+    /// It is not resolvable here and is not meant to be: `K` lowers to the name
+    /// it is, faithfully, and the refusal moves to evaluation where the base is
+    /// in hand. The old refusal happened with only a fragment of the document
+    /// and could therefore only ever say "not every type is a field name".
+    #[test]
+    fn a_key_argument_may_be_a_type_parameter() {
+        let interfaces = extract_interfaces(r#"interface Props { sub: Pick<T, K>; }"#)
+            .expect("a generic key argument parses");
+        assert_eq!(
+            interfaces[0].fields[0].ty,
+            TypeShape::Apply {
+                constructor: "Pick".into(),
+                args: vec![TypeShape::Named("T".into()), TypeShape::Named("K".into())],
+            },
+        );
+    }
+
+    /// They NEST, which is why the base is an ordinary type argument.
     #[test]
     fn the_key_operators_compose() {
         let interfaces = extract_interfaces(
@@ -2761,13 +2780,11 @@ mod tests {
         .expect("nested operators parse");
         assert_eq!(
             interfaces[0].fields[0].ty,
-            TypeShape::Pick {
-                base: Box::new(TypeShape::Omit {
-                    base: Box::new(TypeShape::Named("Full".into())),
-                    omitted: vec!["a".into()],
-                }),
-                picked: vec!["b".into()],
-            },
+            TypeShape::key_operator(
+                "Pick",
+                TypeShape::key_operator("Omit", TypeShape::Named("Full".into()), vec!["a".into()]),
+                vec!["b".into()],
+            ),
         );
     }
 
@@ -2795,10 +2812,11 @@ mod tests {
         assert_eq!(
             interfaces[0].extends,
             vec![TypeShape::Extends {
-                base: Box::new(TypeShape::Omit {
-                    base: Box::new(TypeShape::Named("ContainerProps".into())),
-                    omitted: vec!["direction".into()],
-                }),
+                base: Box::new(TypeShape::key_operator(
+                    "Omit",
+                    TypeShape::Named("ContainerProps".into()),
+                    vec!["direction".into()],
+                )),
             }],
             "an operator in the clause is the SAME tree it is in field position",
         );
@@ -2875,17 +2893,15 @@ mod tests {
             "#,
         )
         .expect("an indexed access parses");
-        let user = TypeShape::IndexedAccess {
-            base: Box::new(TypeShape::Named("Home".into())),
-            key: "user".into(),
-        };
+        let user = TypeShape::indexed_access(TypeShape::Named("Home".into()), "user");
         assert_eq!(interfaces[0].fields[0].ty, user);
         assert_eq!(
             interfaces[0].fields[1].ty,
-            TypeShape::Pick {
-                base: Box::new(user.clone()),
-                picked: vec!["name".into(), "email".into()],
-            }
+            TypeShape::key_operator(
+                "Pick",
+                user.clone(),
+                vec!["name".into(), "email".into()],
+            ),
         );
         assert_ne!(interfaces[0].fields[0].ty, TypeShape::Named("unknown".into()));
         assert_ne!(interfaces[0].fields[0].ty, TypeShape::Named("Home[\"user\"]".into()));
@@ -2936,25 +2952,51 @@ mod tests {
         assert!(err.contains("string literal key"), "got: {err}");
     }
 
-    /// A key position that is not a field name is REFUSED, not read
-    /// best-effort. Falling back would reintroduce `Named("unknown")` in the
-    /// slot these variants exist to protect.
+    /// **THE TWO KEY REFUSALS MOVED TO EVALUATION, AND THIS IS WHAT REPLACED
+    /// THEM HERE: the parse is FAITHFUL.**
+    ///
+    /// `Omit<Base, number>` and `Omit<Base>` were refused at parse, by
+    /// `key_names` and by an arity check this function no longer performs.
+    /// Both now lower to the application they are, because `Omit` is a
+    /// registered type function and this crate holds no registry - it has no
+    /// evaluator and nowhere to host a reduction, which is FACT_CURRENT_v2
+    /// section 13 rule 2 read correctly (what `libtsx` owned was the PARSE-side
+    /// hardcoding, and that is the thing that left).
+    ///
+    /// **What this test must therefore still prove is that nothing DEGRADES**,
+    /// which was always the real content of the refusal: a key slot holding
+    /// `Named("unknown")` is the defect, and a key slot holding the type the
+    /// author wrote is not. `number` is `F64` here, faithfully, and the
+    /// refusal is `libhbdata::typeexpr`'s - `a_key_argument_that_is_not_a_field_name_is_refused`
+    /// and `an_arity_mismatch_is_its_own_refusal`, where the base is in hand
+    /// and the diagnostic can name what the keys should have been.
     #[test]
-    fn a_key_that_is_not_a_name_is_refused() {
-        let err = extract_interfaces(r#"interface Props { bad: Omit<Base, number>; }"#)
-            .expect_err("a non-literal key is refused")
-            .join("; ");
-        assert!(
-            err.contains("key argument"),
-            "the diagnostic should name the key argument, got: {err}"
+    fn a_key_that_is_not_a_name_lowers_faithfully_and_is_refused_at_evaluation() {
+        let interfaces = extract_interfaces(r#"interface Props { bad: Omit<Base, number>; }"#)
+            .expect("a non-literal key parses as the type it is");
+        assert_eq!(
+            interfaces[0].fields[0].ty,
+            TypeShape::Apply {
+                constructor: "Omit".into(),
+                args: vec![TypeShape::Named("Base".into()), TypeShape::F64],
+            },
+            "the key slot holds what was written, never `unknown`",
+        );
+        assert_eq!(
+            interfaces[0].fields[0].ty.key_literals(),
+            None,
+            "and it does not READ as a key list, which is what the evaluator refuses on",
         );
 
-        let err = extract_interfaces(r#"interface Props { bad: Omit<Base>; }"#)
-            .expect_err("a one-argument Omit is refused")
-            .join("; ");
-        assert!(
-            err.contains("exactly 2"),
-            "the diagnostic should name the arity, got: {err}"
+        let interfaces = extract_interfaces(r#"interface Props { bad: Omit<Base>; }"#)
+            .expect("a one-argument Omit parses");
+        assert_eq!(
+            interfaces[0].fields[0].ty,
+            TypeShape::Apply {
+                constructor: "Omit".into(),
+                args: vec![TypeShape::Named("Base".into())],
+            },
+            "the arity is preserved for the registry to refuse, not corrected here",
         );
     }
 

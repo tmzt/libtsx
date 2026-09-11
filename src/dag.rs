@@ -89,6 +89,15 @@ pub struct DagModule {
 }
 
 /// A TS `interface` declaration: `interface Name extends … { fields… }`.
+///
+/// **It is also the TYPELIB ENTRY** - `libhbdata` re-exports it as `Shape` and
+/// `highbay_data` aliases it as `DataSchema`, so a widget's props, a table's
+/// schema and a typelib entry are ONE record with three names
+/// (`designs/FACT_CURRENT_v2.md` §5.1). That is why [`InterfaceDecl::id`] and
+/// [`InterfaceDecl::version`] live on a type in a TypeScript-boundary crate:
+/// the entry they belong to is this struct, and a second struct carrying them
+/// beside it would be the two-records-for-one-shape defect §5.1 exists to rule
+/// out.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct InterfaceDecl {
     pub name: String,
@@ -106,6 +115,146 @@ pub struct InterfaceDecl {
     /// such clause, still decodes.
     #[serde(default)]
     pub extends: Vec<TypeShape>,
+    /// **WHICH shape this is** - assigned once and carried, never derived from
+    /// the name (`designs/FACT_CURRENT_v2.md` §2.1). The only thing a lookup
+    /// uses.
+    ///
+    /// # `None` is the honest state of a parsed declaration, not a hole
+    ///
+    /// A `.tsx` names a shape by SYMBOL and never by id - §5.1 is explicit that
+    /// *"a UUID spelled in a `.tsx` would be exactly that handle"* this crate's
+    /// surface must not carry - so the PARSER cannot produce one and does not
+    /// invent one. Identity is assigned where a shape is PROPOSED, on the
+    /// graph, and travels with the entry from there. The alternative, a
+    /// non-optional field, would force every producer to mint, and *"nothing
+    /// acquires identity as a side effect of being resolved"* is the rule the
+    /// whole section is for.
+    ///
+    /// **So a round trip through `.tsx` LOSES it, by construction**, while a
+    /// round trip through `.hbdef` or the node-graph keeps it. That is the
+    /// asymmetry §5.1 describes and not a defect in the emit: the graph is the
+    /// IR, and a serialization that cannot spell an id is a serialization the
+    /// id does not travel in.
+    ///
+    /// # Why it is not folded from the name
+    ///
+    /// Because a rename is a metadata edit and a name fold makes it a new type.
+    /// The migration planner has to tell a renamed shape from a new one, and by
+    /// name alone it cannot; §2.1 runs that argument in full.
+    ///
+    /// `#[serde(default)]` for the same reason [`InterfaceDecl::extends`] has
+    /// it - but note that postcard is NOT self-describing, so the default does
+    /// not rescue bytes written before this field existed. Those are refused by
+    /// the version header (`libhbui::codec::HBDEF_VERSION`,
+    /// `highbay_data::graph::NODEGRAPH_VERSION`), which is what a version
+    /// header is for.
+    #[serde(default)]
+    pub id: Option<TypeUuid>,
+    /// **Whether rows written under an earlier shape are STALE** - the version,
+    /// riding beside the id and never part of the key
+    /// (`designs/FACT_CURRENT_v2.md` §2.2).
+    ///
+    /// Two fields, two jobs, and neither substitutes for the other: separating
+    /// them is what lets a cache tell *same type, newer shape* from *a
+    /// different type entirely*. With the version folded into the id - which is
+    /// what `FactTypeId::from_qualified_name` does today - a comparison of ids
+    /// cannot distinguish the two cases at all.
+    ///
+    /// **THE ACTION STORE DETERMINES IT.** Nothing increments this by hand and
+    /// no surface chooses when a shape becomes a new version: the value follows
+    /// from the shape's position in the ledger. `None` therefore means *no
+    /// ledger has spoken for this declaration yet*, which is the state of every
+    /// interface parsed straight out of source text.
+    #[serde(default)]
+    pub version: Option<TypeVersion>,
+}
+
+/// **The ASSIGNED identity of a declared type** - a 128-bit UUID, carried
+/// verbatim (`designs/FACT_CURRENT_v2.md` §2.1, §2.3).
+///
+/// # Why a `u128` and not a `uuid::Uuid`
+///
+/// Because this crate has one dependency (`serde`) and a UUID is 128 bits with
+/// a spelling convention. The spelling is [`TypeUuid::Display`], written once
+/// here so no consumer assembles the hyphens itself; the VALUE is the number,
+/// which is what §2.3's fold rule cares about: *"anything that is already an id
+/// of the right width is carried verbatim"*, so this never folds and never
+/// truncates.
+///
+/// # Nothing here MINTS one
+///
+/// There is deliberately no `TypeUuid::new()`. A mint needs entropy and a
+/// record of what it has issued (`libhbui::id::HbWidgetMint` is the pattern),
+/// and both belong to the authoring layer that proposes a shape - not to a
+/// parser. [`TypeUuid::from_u128`] takes a value that has already been decided.
+///
+/// [`TypeUuid::Display`]: std::fmt::Display
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct TypeUuid(u128);
+
+impl TypeUuid {
+    /// An id that has already been decided somewhere else.
+    pub const fn from_u128(value: u128) -> Self {
+        Self(value)
+    }
+
+    /// The raw bits, for a consumer that has to put them on a wire.
+    pub const fn get(self) -> u128 {
+        self.0
+    }
+}
+
+impl std::fmt::Display for TypeUuid {
+    /// The canonical 8-4-4-4-12 hyphenated form, lowercase - ASCII only, so it
+    /// is safe in a log, a DDL literal and a drawn label alike.
+    ///
+    /// ONE spelling, here, because it is the string a consumer stores
+    /// (`highbay_data_service::schema::ShapeId::assigned`) and a second
+    /// assembly of the same hyphens is a second chance to put one in the wrong
+    /// place.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let b = self.0.to_be_bytes();
+        for (at, byte) in b.iter().enumerate() {
+            if matches!(at, 4 | 6 | 8 | 10) {
+                write!(f, "-")?;
+            }
+            write!(f, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+/// **The version of a declared type**, as the Action Store determined it
+/// (`designs/FACT_CURRENT_v2.md` §2.2).
+///
+/// A newtype over `u32` rather than a bare one so it cannot be handed to a slot
+/// expecting an id, and vice versa - the two fields sit beside each other on
+/// [`InterfaceDecl`] and the whole point of §2.2 is that they are not
+/// interchangeable. `u32` is the width `libhbobjects::ObjectDescriptor::version`
+/// already uses for the same fact on the typed side.
+///
+/// **No arithmetic is offered on purpose.** There is no `next()`, no `+ 1`: the
+/// version follows from the ledger, and a type that could increment itself
+/// would be a second place a version could come from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct TypeVersion(u32);
+
+impl TypeVersion {
+    /// A version the Action Store has determined.
+    pub const fn from_u32(value: u32) -> Self {
+        Self(value)
+    }
+
+    /// The number, for a consumer comparing two of them.
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+}
+
+impl std::fmt::Display for TypeVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
 }
 
 /// An ES `import { a, b as c } from "src"` declaration — the **typed reference**
@@ -1754,8 +1903,9 @@ pub struct FieldDecl {
 ///
 /// **NOT 1:1 with WIT, and that is settled rather than aspirational.** This doc
 /// said *"Maps 1:1 onto WIT types"* until 2026-09-06. It was already false —
-/// `Pick`, `Omit`, `Extends` and `Apply` are type-level OPERATORS with no WIT
-/// counterpart, and `IndexedAccess` is a fifth — and it cannot be made true:
+/// `Extends` and `Apply` are type-level OPERATORS with no WIT counterpart, and
+/// `Apply` now carries `Pick`, `Omit` and `IndexedAccess` as well (the registry,
+/// FACT_IMPLEMENTATION A3) — and it cannot be made true:
 /// WIT has records, variants, enums, flags, lists, options, results, tuples and
 /// resources, and NO lookup or mapped types at all. Tim, on being shown that:
 /// *"that's a limitation of WIT we can't overcome, so the 1:1 goes, but we have
@@ -1840,57 +1990,33 @@ pub enum TypeShape {
     /// nocap handle crosses as two of these. No authored spelling yet - see
     /// the note above.
     U64,
-    // THE KEY OPERATORS. Appended last, same rule as everything above.
+    // THE KEY OPERATORS WERE VARIANTS HERE, AND ARE REGISTERED TYPE FUNCTIONS
+    // NOW - `libhbdata::typeexpr::REGISTRY` (FACT_IMPLEMENTATION A3,
+    // FACT_CURRENT_v2 section 13 rule 4). `Omit<B, "a" | "b">` is an ordinary
+    // `Apply { constructor: "Omit", args: [B, Union([Literal("a"),
+    // Literal("b")])] }`, built by [`TypeShape::key_operator`] and read back by
+    // [`TypeShape::key_literals`].
     //
-    // WHY THESE TWO AND NOT `Partial`. The line is not "which utility types
-    // matter" - it is WHAT KIND OF ARGUMENT THE OPERATOR TAKES. `Apply` holds
-    // `args: Vec<TypeShape>`, so it can carry any operator whose arguments are
-    // TYPES: `Result<A, B>` is faithful there, and so is `Partial<X>`, which is
-    // why `Partial` gets no variant. It is an application of Optional to each
-    // of X's fields, and `Option` already spells that; the reduction belongs to
-    // resolution, not to a node here.
-    //
-    // `Omit` and `Pick` take FIELD NAMES. `Apply` demands a type in that slot,
-    // so the parser has to invent one, and it does: `type_shape` falls to its
-    // `_ =>` arm and produces `Named("unknown")`. MEASURED, before this
-    // existed:
+    // WHY THEY EARNED VARIANTS AND NO LONGER DO. The argument was that `Apply`
+    // demands a TYPE in every slot while `Omit`/`Pick` take FIELD NAMES, so the
+    // parser had to invent one and did: `type_shape` fell to its `_ =>` arm and
+    // produced `Named("unknown")`. MEASURED, before the variants existed:
     //
     //     Omit<ContainerProps, "direction">
     //       -> Apply { "Omit", [Named("ContainerProps"), Named("unknown")] }
     //
-    // The name is not merely unresolved, it is GONE - two Omits over one base
-    // that hide different fields decode to identical bytes. These variants are
-    // not extra expressiveness; they are the repair of a node that cannot hold
-    // a name where it requires a type.
+    // That is fixed at the source now: `"direction"` is a `Literal` and
+    // `"a" | "b"` is a `Union`, so the key slot holds THE UNION IT ALWAYS WAS
+    // in the TS spelling, faithfully, in the general node. The variants were
+    // the repair of a node that could not hold a name where it required a
+    // type; section 12 removed that limitation, so the repair went with it.
     //
-    // UNRESOLVED IS THE POINT. Both are the AUTHORED form and both survive into
-    // `.hbtypes` unreduced, because reducing them needs the base's field list
-    // and that may live in a layer this pack never loaded. A type expression
-    // tree resolves the way any expression tree does (Tim, 2026-08-27), and a
-    // key naming no field of the resolved base is rejected THERE - one place,
-    // with the whole document in hand, rather than here with a fragment of it.
-    /// `Omit<Base, "a" | "b">` - Base without the named fields.
-    ///
-    /// `base` is boxed rather than a bare name so the operators compose:
-    /// `Omit<Omit<X, "a">, "b">` and `Pick<Omit<X, "a">, "b">` are both this
-    /// tree, nested.
-    ///
-    /// `omitted` is `Vec<String>` and not `Vec<TypeShape>` on purpose. A field
-    /// name is not a type, and a slot that can hold a type is a slot that can
-    /// hold `Named("unknown")` - which is the exact defect this variant exists
-    /// to fix. The narrower field makes that state unrepresentable.
-    Omit {
-        base: Box<TypeShape>,
-        omitted: Vec<String>,
-    },
-    /// `Pick<Base, "a" | "b">` - Base with ONLY the named fields.
-    ///
-    /// The dual of [`TypeShape::Omit`]: same shape, opposite fold. See its
-    /// documentation for why the key list is `Vec<String>`.
-    Pick {
-        base: Box<TypeShape>,
-        picked: Vec<String>,
-    },
+    // UNRESOLVED IS STILL THE POINT. The application is the AUTHORED form and
+    // survives into `.hbtypes` unreduced, because reducing it needs the base's
+    // field list and that may live in a layer this pack never loaded. A key
+    // naming no field of the resolved base is rejected at EVALUATION - one
+    // place, with the whole document in hand - and so is an unregistered
+    // constructor.
     /// **One entry of an `extends` clause** - `interface P extends Base {}`.
     ///
     /// # It was DROPPED SILENTLY, and that was the blocker
@@ -1917,21 +2043,25 @@ pub enum TypeShape {
     Extends {
         base: Box<TypeShape>,
     },
-    // THE INDEXED ACCESS. Appended last, same rule as everything above: this
-    // enum is persisted positionally, so it goes at the END and not beside
-    // `Omit` and `Pick` where it reads better. Placing it there would renumber
-    // `Pick` and `Extends` and change what every already-committed byte decodes
-    // to; appending keeps old bytes readable, which is the whole of the
-    // placement rule.
+    // THE INDEXED ACCESS WAS A VARIANT HERE, AND IS A REGISTERED TYPE FUNCTION
+    // NOW, beside the key operators above: `Person["handle"]` is
+    // `Apply { constructor: "IndexedAccess", args: [Person, Literal("handle")] }`,
+    // built by [`TypeShape::indexed_access`] and spelled back with brackets by
+    // [`indexed_access_spelling`], which every renderer already called.
     //
-    // WHY ITS OWN VARIANT AND NOT `Apply`, which is `Omit`/`Pick`'s reason
-    // exactly: `Apply` holds `args: Vec<TypeShape>` and DEMANDS A TYPE in every
-    // slot. `Person["handle"]` takes a TYPE and a KEY LITERAL, so the type slot
-    // would have to hold a name - and a slot that can hold a type is a slot
-    // that can hold `Named("unknown")`.
+    // "IndexedAccess" IS A CONSTRUCTOR NAME WITH NO TYPESCRIPT SPELLING, and
+    // that is deliberate rather than overlooked. TypeScript writes this
+    // operator with brackets and gives it no callable name, so the registry
+    // needs one that cannot collide with a declaration: it is the INTERNAL
+    // name of a reduction whose SURFACE is `Base["key"]`, and the emit writes
+    // the brackets. An author who writes `IndexedAccess<Person, "handle">`
+    // reaches the same reduction and gets `Person["handle"]` back from the
+    // emit - idempotent after one pass, and the same type either way.
     //
-    // WHY NOT A `Named` HOLDING THE BRACKETS, which is what it WAS. MEASURED,
-    // before this variant existed:
+    // WHY IT USED TO NEED A VARIANT, and why that reason is gone. `Apply`
+    // DEMANDS A TYPE in every slot, and before section 12 a key literal was
+    // not one: `"handle"` fell to `type_shape`'s `_ =>` arm. MEASURED, before
+    // the variant existed:
     //
     //     Person["handle"]  ->  Named("Person[\"handle\"]")
     //
@@ -1940,38 +2070,17 @@ pub enum TypeShape {
     // a name no declaration answers, where the field's own type belonged. The
     // relationship was TEXT INSIDE A NAME - the shape RULING 4 forbids ("the
     // convention is for the TS spelling, the nodegraph is explicit in the
-    // relationship") - it survived the strict lowering, and no gate said a
-    // word. Every author of an indexed access got that by default.
+    // relationship"). `TypeShape::Literal` is now a type, so the key slot holds
+    // the key AS THE TYPE IT IS and the relationship is still explicit.
     //
-    // WHAT IT IS FOR. A form is a PROJECTION over a raw type, and this is the
-    // spelling that keeps the link to the raw type WITHOUT CHANGING THE FORM'S
-    // SHAPE. `Pick<Person, "handle">` also names Person, but it evaluates to
-    // `{ handle: string }` - a record - so a form spelled that way gains a
-    // level of nesting per projected field. `Person["handle"]` evaluates to
-    // `string`: the provenance lives in the spelling and the shape does not
-    // move. That contrast is the whole reason this exists and is asserted as
-    // one test in `crates/libhbdata/tests/indexed_access.rs`.
-    /// `Base["key"]` - TypeScript's indexed access. **The field's own type,
-    /// named through the type that declares it.**
-    ///
-    /// `base` is boxed so the operators compose in both directions -
-    /// `Pick<Person["address"], "city">` is the spelling the corpus already
-    /// writes, and `Person["address"]["city"]` is this node nested. A bare name
-    /// here would refuse the second one.
-    ///
-    /// `key` is a `String` and not a `TypeShape` for [`TypeShape::Omit`]'s
-    /// stated reason: a field name is not a type, and the narrower field makes
-    /// `Named("unknown")` in that slot unrepresentable.
-    ///
-    /// **A key naming no field of the base is NOT rejected here.** Like
-    /// `Omit`/`Pick`, this is the AUTHORED form and survives unreduced, because
-    /// checking the key needs the base's field list and that may live in a
-    /// layer this pack never loaded. It is rejected at evaluation, with the
-    /// whole document in hand - `libhbdata::typeexpr`, one place.
-    IndexedAccess {
-        base: Box<TypeShape>,
-        key: String,
-    },
+    // WHAT IT IS FOR, unchanged by where it lives. A form is a PROJECTION over
+    // a raw type, and this is the spelling that keeps the link to the raw type
+    // WITHOUT CHANGING THE FORM'S SHAPE. `Pick<Person, "handle">` also names
+    // Person, but it evaluates to `{ handle: string }` - a record - so a form
+    // spelled that way gains a level of nesting per projected field.
+    // `Person["handle"]` evaluates to `string`: the provenance lives in the
+    // spelling and the shape does not move. That contrast is asserted as one
+    // test in `crates/libhbdata/tests/indexed_access.rs`.
     // THE LITERAL TYPE AND THE UNION. Appended last, same rule as everything
     // above and for the same reason: this enum is persisted positionally, so a
     // variant that reads better beside `String` or beside `Option` still goes
@@ -2078,6 +2187,139 @@ pub enum TypeShape {
     /// canonical order sorts at the point it needs one - which is the same
     /// place that decides whether the order is part of the shape's identity.
     Union(Vec<TypeShape>),
+}
+
+/// **The constructors for the three REGISTERED key operators** - the door that
+/// replaced `TypeShape::Pick`, `Omit` and `IndexedAccess` when they became
+/// registered type functions (FACT_IMPLEMENTATION A3).
+///
+/// They exist here, on the type, rather than being spelled as `Apply` literals
+/// at every producer, for the reason [`key_operator_spelling`] exists on the
+/// rendering side: there are a dozen places that BUILD one of these, and none
+/// of them has a reason to shape the key argument differently. One constructor,
+/// so a key list cannot arrive as a union in one producer and as a
+/// single-member union in another.
+impl TypeShape {
+    /// The registered constructor name of TypeScript's indexed access. It has
+    /// no authored spelling - the surface is `Base["key"]` - so the name is
+    /// written ONCE, here, and read from here by the emit and by the registry.
+    pub const INDEXED_ACCESS: &'static str = "IndexedAccess";
+
+    /// **`Omit<Base, "a" | "b">` / `Pick<Base, "a" | "b">`**, as the
+    /// application it is.
+    ///
+    /// The key argument is THE UNION THE TS SPELLING ALWAYS HAD, under
+    /// [`TypeShape::Union`]'s producer-normalization rule: no keys is the empty
+    /// union (which [`key_operator_spelling`] and the emit both spell `never`),
+    /// one key is that key's literal and NOT a one-member union, and two or
+    /// more is the union. So `Pick<P, "a">` and `Pick<P, "a" | "a">` are the
+    /// same node exactly when they are the same TypeScript.
+    pub fn key_operator(operator: &str, base: TypeShape, keys: Vec<String>) -> TypeShape {
+        TypeShape::Apply {
+            constructor: operator.to_string(),
+            args: vec![base, TypeShape::key_union(keys)],
+        }
+    }
+
+    /// **`Base["key"]`**, as the application it is. See [`TypeShape::INDEXED_ACCESS`]
+    /// for why the constructor is named rather than spelled with brackets here.
+    pub fn indexed_access(base: TypeShape, key: impl Into<String>) -> TypeShape {
+        TypeShape::Apply {
+            constructor: Self::INDEXED_ACCESS.to_string(),
+            args: vec![base, TypeShape::Literal(LiteralValue::String(key.into()))],
+        }
+    }
+
+    /// A key list as the type it is - see [`TypeShape::key_operator`] for the
+    /// normalization.
+    pub fn key_union(keys: Vec<String>) -> TypeShape {
+        match keys.len() {
+            1 => TypeShape::Literal(LiteralValue::String(keys.into_iter().next().expect("one"))),
+            _ => TypeShape::Union(
+                keys.into_iter().map(|k| TypeShape::Literal(LiteralValue::String(k))).collect(),
+            ),
+        }
+    }
+
+    /// **The field names a key argument names, or `None` if it names something
+    /// that is not a list of field names.**
+    ///
+    /// The inverse of [`TypeShape::key_union`], and the ONE reader of that
+    /// shape: a renderer asking "what keys does this operator carry" and an
+    /// evaluator asking "which fields does it keep" are the same question, and
+    /// two readings of it would be two chances to disagree about whether a
+    /// one-member union is a union.
+    ///
+    /// `None` rather than an error because the callers differ in what they do
+    /// about it: the evaluator refuses by name with the base in hand, and a
+    /// renderer falls back to the general `Constructor<args…>` spelling. A key
+    /// slot holding `K` (a type parameter) or `keyof X` reaches both, which is
+    /// the case `key_names` used to refuse AT PARSE and no longer does.
+    pub fn key_literals(&self) -> Option<Vec<String>> {
+        fn one(ty: &TypeShape) -> Option<String> {
+            match ty {
+                TypeShape::Literal(LiteralValue::String(key)) => Some(key.clone()),
+                _ => None,
+            }
+        }
+        match self {
+            TypeShape::Union(members) => members.iter().map(one).collect(),
+            single => one(single).map(|key| vec![key]),
+        }
+    }
+}
+
+/// **THE TYPESCRIPT SPELLING OF AN APPLICATION** - one function for every
+/// surface that renders a `TypeShape::Apply` as text.
+///
+/// It exists because the registry made one node carry three spellings.
+/// `Omit<P, "a" | "b">` and `Partial<P>` are written as the application they
+/// are, while `Person["handle"]` is written with BRACKETS - TypeScript gives
+/// the indexed access no callable name, so the constructor
+/// ([`TypeShape::INDEXED_ACCESS`]) is internal and the general spelling would
+/// emit a type no author has written and `tsc` does not accept.
+///
+/// Before this, five surfaces each matched `Omit`/`Pick`/`IndexedAccess` as
+/// dedicated variants and each rendered them its own way; they now pass their
+/// OWN base rendering in and share the decision about which form to write. The
+/// same argument [`key_operator_spelling`] and [`indexed_access_spelling`]
+/// already made about quoting, one level up.
+///
+/// `rendered` is the caller's rendering of each argument, in order and the same
+/// length as `args` - a WIT name, a drawn label, a canonical identity string.
+/// The arguments are rendered by the CALLER rather than through a closure
+/// because several of these surfaces render with a `&mut self` (WIT generation
+/// hoists inline records as it goes), and a borrow that outlives one argument
+/// is exactly what a callback here would need.
+///
+/// # Panics
+///
+/// If `rendered` is shorter than `args`. The two are one list said twice and a
+/// caller that lets them disagree has a bug this function cannot paper over -
+/// the alternative, a silent empty string, is a type printed with an argument
+/// missing.
+pub fn application_spelling(constructor: &str, args: &[TypeShape], rendered: &[String]) -> String {
+    assert_eq!(
+        args.len(),
+        rendered.len(),
+        "an application's arguments and their renderings are one list",
+    );
+    if constructor == TypeShape::INDEXED_ACCESS
+        && let [base, key] = args
+        && let Some(keys) = key.key_literals()
+        && let [key] = keys.as_slice()
+    {
+        let mut base_text = rendered[0].clone();
+        // **PARENTHESISED WHEN THE BASE IS A UNION.** `(A | B)["k"]` written
+        // bare is `A | B["k"]`, which TypeScript reads as `A | (B["k"])` - a
+        // DIFFERENT type that parses cleanly, so a round trip would come back
+        // wrong with nothing to say so.
+        if matches!(base, TypeShape::Union(_)) {
+            base_text = format!("({base_text})");
+        }
+        return indexed_access_spelling(&base_text, key);
+    }
+    format!("{constructor}<{}>", rendered.join(", "))
 }
 
 /// **The TypeScript spelling of an indexed access**, given an ALREADY-RENDERED
@@ -2327,6 +2569,8 @@ mod tests {
         DagModule {
             name: "counter".into(),
             interfaces: vec![InterfaceDecl {
+            id: None,
+            version: None,
             extends: Vec::new(),
                 name: "CounterProps".into(),
                 fields: vec![
@@ -2587,6 +2831,8 @@ mod tests {
 
     fn user_card_props() -> Vec<InterfaceDecl> {
         vec![InterfaceDecl {
+            id: None,
+            version: None,
             extends: Vec::new(),
             name: "UserCardProps".into(),
             fields: vec![FieldDecl {

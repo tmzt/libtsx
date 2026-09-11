@@ -886,6 +886,47 @@ fn emit_type_shape(out: &mut String, shape: &TypeShape) {
             out.push('}');
         }
         TypeShape::Named(name) => out.push_str(name),
+        // **THE INDEXED ACCESS IS SPELLED WITH BRACKETS, and it is an `Apply`
+        // like every other registered function.** TypeScript gives this
+        // operator no callable name, so the constructor
+        // ([`TypeShape::INDEXED_ACCESS`]) is internal and the SURFACE is
+        // `Base["key"]` - the same round trip as before it was registered:
+        // `Person["handle"]` is read to a node and written back to the
+        // characters it was read from, through the shared
+        // `indexed_access_spelling` that every rendering surface calls.
+        //
+        // The general arm below would write `IndexedAccess<Person, "handle">`,
+        // which is legal input to this parser but is not TypeScript, so it
+        // would leave an emitted `.tsx` that `tsc` rejects.
+        TypeShape::Apply { constructor, args }
+            if constructor == TypeShape::INDEXED_ACCESS
+                && matches!(args.as_slice(), [_, TypeShape::Literal(LiteralValue::String(_))]) =>
+        {
+            let [base, TypeShape::Literal(LiteralValue::String(key))] = args.as_slice() else {
+                unreachable!("the guard above admitted exactly this shape")
+            };
+            let mut rendered = String::new();
+            emit_type_shape(&mut rendered, base);
+            // **PARENTHESISED WHEN THE BASE IS A UNION**, and this is the one
+            // place in this function precedence bites. `(A | B)["k"]` is a
+            // producible shape - `indexed_shape` lowers through
+            // `TSParenthesizedType`, which `type_shape` strips - and written
+            // bare it is `A | B["k"]`, which TypeScript reads as
+            // `A | (B["k"])`: a DIFFERENT type that parses cleanly, so the
+            // round trip would come back wrong with nothing to say so.
+            if matches!(base, TypeShape::Union(_)) {
+                rendered = format!("({rendered})");
+            }
+            out.push_str(&crate::dag::indexed_access_spelling(&rendered, key));
+        }
+        // **`Omit<Base, "a" | "b">` NEEDS NO ARM**, and that is the point of the
+        // key slot holding a union: the general application spelling below
+        // renders the base and then the key argument, and a key argument that is
+        // `Union([Literal("a"), Literal("b")])` renders as `"a" | "b"` through
+        // the union and literal arms. The characters are the ones
+        // `key_operator_spelling` produced when the keys were a `Vec<String>`,
+        // including `never` for the empty list, so no emitted text moved when
+        // the operators became registered functions.
         TypeShape::Apply { constructor, args } => {
             out.push_str(constructor);
             out.push('<');
@@ -897,35 +938,11 @@ fn emit_type_shape(out: &mut String, shape: &TypeShape) {
             }
             out.push('>');
         }
-        // The key operators re-emit as the TypeScript they were read from, so a
-        // parse/emit round trip is the identity on them - through the shared
-        // `key_operator_spelling`, which every other rendering surface also
-        // calls, so the keys cannot come out spelled two ways.
-        TypeShape::Omit { base, omitted } => emit_key_operator(out, "Omit", base, omitted),
-        TypeShape::Pick { base, picked } => emit_key_operator(out, "Pick", base, picked),
         // An `extends` entry in TYPE position has no TypeScript spelling of its
         // own - the keyword belongs to the interface, not to the type. So it
         // emits as its base, which is the text that was inside the clause.
         // `emit_interface` writes the `extends` itself.
         TypeShape::Extends { base } => emit_type_shape(out, base),
-        // Same round trip as the key operators, through the same kind of shared
-        // spelling: `Person["handle"]` is read to a node and written back to the
-        // characters it was read from, so the parse and this are inverse on it.
-        TypeShape::IndexedAccess { base, key } => {
-            let mut rendered = String::new();
-            emit_type_shape(&mut rendered, base);
-            // **PARENTHESISED WHEN THE BASE IS A UNION**, and this is the one
-            // place in this function precedence bites. `(A | B)["k"]` is a
-            // producible shape - `indexed_shape` lowers through
-            // `TSParenthesizedType`, which `type_shape` strips - and written
-            // bare it is `A | B["k"]`, which TypeScript reads as
-            // `A | (B["k"])`: a DIFFERENT type that parses cleanly, so the
-            // round trip would come back wrong with nothing to say so.
-            if matches!(**base, TypeShape::Union(_)) {
-                rendered = format!("({rendered})");
-            }
-            out.push_str(&crate::dag::indexed_access_spelling(&rendered, key));
-        }
         // A literal type is its literal, in the ONE spelling both positions
         // share - see [`push_literal_value`].
         TypeShape::Literal(value) => push_literal_value(out, value),
@@ -955,13 +972,6 @@ fn emit_type_shape(out: &mut String, shape: &TypeShape) {
     }
 }
 
-/// `Omit<Base, "a" | "b">` - this module's base rendering, the shared key
-/// rendering.
-fn emit_key_operator(out: &mut String, operator: &str, base: &TypeShape, keys: &[String]) {
-    let mut rendered = String::new();
-    emit_type_shape(&mut rendered, base);
-    out.push_str(&crate::dag::key_operator_spelling(operator, &rendered, keys));
-}
 
 /// Emit indentation (spaces).
 fn emit_indent(out: &mut String, level: usize) {
