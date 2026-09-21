@@ -838,7 +838,7 @@ fn imported_call_attr(
         let lowered = arg
             .as_expression()
             .ok_or(ArgFail::NotALiteral)
-            .and_then(|expr| lower_arg(unparen(expr), &param.ty))
+            .and_then(|expr| lower_arg(unparen(expr), &param.ty, scope))
             .map_err(|fail| match fail {
                 ArgFail::NotALiteral => EffectError::ArgNotALiteral {
                     attr: attr.to_string(),
@@ -878,10 +878,11 @@ fn imported_call_attr(
 
 /// Why an argument could not be lowered.
 enum ArgFail {
-    /// Neither a literal nor a binding path - a call, an arithmetic
-    /// expression, a template literal, an arrow function, an object or array
-    /// literal. An imported call is not an expression language (Rule 46a); a
-    /// computation belongs in a Module.
+    /// Not one of the three admissible forms - see [`admissible_arg`], which
+    /// is where the line is drawn and argued. An arithmetic expression, a
+    /// template literal, an arrow function, an object or array literal, a
+    /// spread and an optional call all land here. An imported call is not an
+    /// expression language (Rule 46a); a computation belongs in a Module.
     NotALiteral,
     /// A literal the declared parameter type cannot hold.
     WrongType,
@@ -898,14 +899,33 @@ enum ArgFail {
 /// somewhere with no view of the source text that caused it. Refusing costs an
 /// error at parse time, which is the cheap end of that trade.
 ///
-/// Two forms are admitted, and they are two forms rather than one:
+/// Three forms are admitted, and they are three forms rather than one:
 ///
 /// * a **literal**, checked against the declared [`TypeShape`];
 /// * a **binding path** - `{id}`, `{props.user.name}` - lowered to
 ///   [`BindingExpr::Path`], the same distinct first-class form
 ///   [`AttrValue::Binding`] is for an ordinary attribute
 ///   ([`EffectError::ArgNotALiteral`] records why that is not a widening of
-///   Rule 46a).
+///   Rule 46a);
+/// * a **symbol projection or a value in call form** - `listItem()`,
+///   `uiComponent().props.pane`, `pane("name")` - admitted by SHAPE, through
+///   [`admissible_arg`], which holds the whole of that decision.
+///
+/// # Everything but a literal is lowered by the ORDINARY lowering
+///
+/// The non-literal arm hands the expression to [`lower_binding_expr`] - the
+/// one an ordinary attribute binding takes - and then asks whether the shape
+/// that came back is admissible. It does NOT lower these forms itself, and
+/// that is the point: a second lowering written beside the first is how one
+/// authored text comes to have two captures, and the whole value of the
+/// widening is that `onTap={f(uiComponent().props.pane)}` and
+/// `value={uiComponent().props.pane}` produce the SAME expression, so
+/// everything downstream that already walks one walks the other. The
+/// admission is a predicate over the RESULT, never a parallel parse.
+///
+/// A literal keeps its own arm above it because a literal - and only a
+/// literal - is checked against the declared parameter type, which
+/// [`lower_binding_expr`] knows nothing about.
 ///
 /// **A binding is NOT type-checked, and cannot be here.** A path names
 /// something in the runtime scope the element is rendered in - a list row's
@@ -921,7 +941,11 @@ enum ArgFail {
 /// parameters positionally and refuses a call that leaves a non-optional one
 /// unfilled, so this is only ever asked about an argument that was actually
 /// written.
-fn lower_arg(expr: &Expression, declared: &TypeShape) -> Result<BindingExpr, ArgFail> {
+fn lower_arg(
+    expr: &Expression,
+    declared: &TypeShape,
+    scope: &ImportScope,
+) -> Result<BindingExpr, ArgFail> {
     match expr {
         // CAPTURE, then NARROW - and the narrowing rules live on
         // [`LiteralValue::narrow`], not here. The widths of the two
@@ -934,14 +958,121 @@ fn lower_arg(expr: &Expression, declared: &TypeShape) -> Result<BindingExpr, Arg
         }
         Expression::BooleanLiteral(b) => lower_literal_arg(LiteralValue::Bool(b.value), declared),
         Expression::NumericLiteral(n) => lower_literal_arg(numeric_literal(n), declared),
-        // A BINDING PATH. `expr_path` recovers an identifier or a static member
-        // chain and NOTHING else, which is exactly the line: a call
-        // (`Id({id})`), a computed member (`row[i]`), an arithmetic expression
-        // and a template literal all answer `None` here and stay refused.
-        other => match expr_path(other) {
-            Some(path) => Ok(BindingExpr::Path(path.split('.').map(str::to_owned).collect())),
-            None => Err(ArgFail::NotALiteral),
-        },
+        // EVERYTHING ELSE, through the door that already exists. This used to
+        // read `expr_path`, which recovers an identifier or a static member
+        // chain and nothing else - so a chain ROOTED AT A CALL
+        // (`uiComponent().props.pane`) answered `None` and was refused,
+        // although the very same text in an ordinary attribute lowers
+        // perfectly well one function along. The refusal was an accident of
+        // which reader this position happened to call, not a rule anybody
+        // wrote down; the rule is [`admissible_arg`], and it is applied to
+        // what the ordinary lowering produced.
+        //
+        // A lowering REFUSAL and an inadmissible SHAPE are one answer here:
+        // both mean this text is not an effect argument, and
+        // [`ArgFail::NotALiteral`] is the caller's only word for that. The
+        // string `lower_binding_expr` returns is dropped rather than wrapped
+        // because the caller turns this into [`EffectError::ArgNotALiteral`],
+        // which carries the attribute, the effect and the index - the three
+        // things an author needs to find the argument.
+        other => {
+            let lowered = lower_binding_expr(other, scope).map_err(|_| ArgFail::NotALiteral)?;
+            admissible_arg(&lowered)
+                .then_some(lowered)
+                .ok_or(ArgFail::NotALiteral)
+        }
+    }
+}
+
+/// **May this expression stand in an effect argument?** - the whole of the
+/// line Rule 46a draws, in one recursive predicate.
+///
+/// An argument is a **literal**, a **binding path**, a **symbol**, a **member
+/// read on one of those**, or a **call whose own arguments are admissible by
+/// this same rule**. Nothing else.
+///
+/// # Why a call is not a widening of Rule 46a
+///
+/// Rule 46a is *an imported call is not an expression language; a computation
+/// belongs in a Module*, and it is intact. What is admitted here is not a
+/// computation but a **value in call form**: `pane("name")` names a
+/// constructor and the members it fills, in the one spelling TypeScript has
+/// for that. Nothing is evaluated, nothing is combined, and no operator is
+/// admitted - `a + b`, a template literal, `a ?? b`, `a === b`, `!flag` and a
+/// conditional are each refused below BY NAME, which is where the rule's line
+/// actually lives. A reader who arrives asking "did calls just become
+/// expressions?" is asking the right question, and the answer is that the
+/// operators are still the boundary; an argument that CONSTRUCTS is on the
+/// naming side of it, exactly as a path is.
+///
+/// The precedent is the caller's own: a binding path was refused here for the
+/// same reason - it looked like structure - until it was noticed that a path
+/// NAMES rather than computes. This is that same observation one shape along.
+///
+/// # Why no name is checked, and why that is Rule 52 holding
+///
+/// **This predicate never looks at a callee's name.** `pane`, `listItem`,
+/// `frobnicate` and a misspelling of any of them are one case here, because
+/// [`ObjectSymbol::intern`] is total and *"which identifiers matter is the
+/// consumer's question"* - the reason already written at the ordinary call arm
+/// of [`lower_binding_expr`]. A callee that resolves to no declared symbol is
+/// refused by the consumer, at the door that holds the registry; a parser that
+/// refused it here would be holding a second copy of that registry, and the
+/// two would disagree the first time one of them grew.
+///
+/// The same follows for a nested literal: `pane("name")`'s `"name"` is NOT
+/// narrowed against anything, because the thing that declares what `pane`'s
+/// members are is not in this crate. Only the OUTER argument has a declared
+/// type here, and only it is checked ([`lower_arg`]).
+///
+/// # A member read is admitted at whatever it is rooted in
+///
+/// `MemberOf` recurses into its base rather than testing that base against a
+/// list, so `uiComponent().props.pane` is admitted for the reason its base
+/// `uiComponent()` is - which arrives as [`BindingExpr::SymbolValue`], a bare
+/// identifier call being a symbol and not a `Call`. It also admits
+/// `pane("a").name`, a projection out of a constructed value, which nothing
+/// has asked for yet; refusing that would need an extra clause saying "a
+/// member chain may not be rooted in a call with arguments", and there is no
+/// sentence to write under it. One recursion, no arity rule - the same
+/// argument the symbol registry makes about `listOf()` and `listOf(a, b)`
+/// being one symbol.
+///
+/// # Exhaustive with no wildcard, deliberately
+///
+/// A variant appended to [`BindingExpr`] arrives here as a compile error and
+/// gets a decision, rather than being silently admitted (a `_ => true` tail)
+/// or silently refused (a `_ => false` one). The refusals are listed by name
+/// for the same reason the admissions are: this is the only place that says
+/// which TypeScript an effect argument may be written in.
+fn admissible_arg(expr: &BindingExpr) -> bool {
+    use BindingExpr as B;
+    match expr {
+        // NAMES a value: a literal is one, a path names one in the runtime
+        // scope, a symbol names one in the consumer's.
+        B::Literal(_) | B::Path(_) | B::SymbolValue(_) => true,
+        // A read ON a value, admitted exactly when what it reads from is.
+        B::MemberOf(base, _) => admissible_arg(base),
+        // A value in CALL form, and the recursion that makes this rule a rule
+        // rather than a list: a constructor's arguments are arguments.
+        B::Call { args, .. } => args.iter().all(admissible_arg),
+        // Everything that COMBINES or DEFERS. `a ?? b`, `c ? x : y`, `a == b`,
+        // `a != b`, `!flag` are operators; `[..]` and `{..}` are structure an
+        // effect signature has no parameter for; an arrow - async or not - is
+        // a computation with a body, which is the Module case Rule 46a names.
+        // `null` is refused because an argument that is nothing is an argument
+        // not written, and the caller already has a word for that (an
+        // unfilled optional parameter).
+        B::Array(_)
+        | B::Record(_)
+        | B::Async(_)
+        | B::Coalesce(_)
+        | B::Cond { .. }
+        | B::Eq { .. }
+        | B::Arrow { .. }
+        | B::Null
+        | B::Not(_)
+        | B::Ne { .. } => false,
     }
 }
 

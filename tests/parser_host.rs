@@ -595,23 +595,37 @@ fn arguments_are_checked_against_the_declared_signature() {
             declared: TypeShape::S32,
         }
     );
-    // Neither a literal nor a binding path: every one of these COMPUTES. An
-    // effect call is not an expression language; a computation is a Module,
+    // Every one of these COMBINES or DEFERS: an operator, a structure, a body.
+    // An effect call is not an expression language; a computation is a Module,
     // referenced opaquely (Rule 46a).
     //
     // `props.destination` is deliberately NOT in this list any more - it is a
     // path, it is now admitted, and the test below is what it moved to. The
     // line Rule 46a draws is between naming and computing, and a member chain
     // was only ever on the wrong side of it by accident of implementation.
+    //
+    // **`f()` left this list too**, and for the same kind of reason: a call
+    // that CONSTRUCTS names a value and the members it is made of, which is
+    // the naming side. The test below it is where it moved to, and the whole
+    // of the line now lives in `libtsx::parse`'s `admissible_arg`. What the
+    // list holds after both departures is only operators, structure and
+    // bodies - which is what Rule 46a was always about.
     for arg in [
         "1 + 2",
-        "f()",
         "`sprocket`",
         "() => 1",
+        "async () => { f(); }",
         "{ id: 1 }",
         "[1]",
         "row[i]",
         "!flag",
+        "a ?? b",
+        "a === b",
+        "a != b",
+        "c ? a : b",
+        "null",
+        "f(...xs)",
+        "f?.()",
     ] {
         assert_eq!(
             refusal(&with(&format!("frobnicate({arg})"))),
@@ -621,6 +635,166 @@ fn arguments_are_checked_against_the_declared_signature() {
                 index: 0,
             },
             "`{arg}` was not refused as a non-literal",
+        );
+    }
+}
+
+/// **AN ARGUMENT AND AN ATTRIBUTE ARE ONE VOCABULARY.** A symbol
+/// (`grue()`), a member read on one (`grue().sprocket`) and a value in call
+/// form (`plugh("xyzzy")`) are each admitted in an effect argument, and each
+/// lowers to EXACTLY what the same text lowers to in an ordinary attribute.
+///
+/// The assertion is against the attribute's own output rather than against a
+/// hand-written expectation, and that is the whole design of this test: the
+/// argument position takes `lower_binding_expr` - the door that already
+/// exists - so there is one lowering and not two that happen to agree today.
+/// A hand-written expectation would pass just as well against a second copy,
+/// which is the outcome this is written to detect.
+///
+/// **The callees are the mock's nonsense names on purpose** (Rule 52). The
+/// parser admits a SHAPE and learns no name: `ObjectSymbol::intern` is total,
+/// and which identifiers MEAN anything is the consumer's question, answered
+/// at the door that holds the registry. If this test needed a real
+/// embedding's spelling to pass, the name would have leaked into the parser.
+#[test]
+fn an_effect_argument_may_be_a_symbol_a_member_read_or_a_value_in_call_form() {
+    // The SAME text in two positions: an ordinary attribute and an effect
+    // argument. The pair is parsed in one document so no difference in
+    // context can account for a difference in the answer.
+    let both = |text: &str| -> (BindingExpr, BindingExpr) {
+        let doc = ctx()
+            .parse_tsx(&format!(
+                r#"
+                import {{ frobnicate }} from "{ZORK}";
+                <Widget id="a" value={{{text}}} onGrommet={{frobnicate({text})}} />
+                "#
+            ))
+            .expect("the shape parses in both positions");
+        let Some(Node::Element(el)) = doc.root_nodes.first() else {
+            panic!("one element");
+        };
+        let Some(AttrValue::BindingExpr(attribute)) = el.attr("value") else {
+            panic!("an ordinary attribute binding");
+        };
+        let Some(AttrValue::BindingExpr(BindingExpr::Call { args, .. })) = el.attr("onGrommet")
+        else {
+            panic!("an effect");
+        };
+        assert_eq!(args.len(), 1, "one argument was written");
+        (attribute.clone(), args[0].clone())
+    };
+
+    // A bare zero-argument call is a SYMBOL, not a `Call` - libtsx's own
+    // strictness, and the reason `uiComponent()` needed no new shape here.
+    let (attribute, argument) = both("grue()");
+    assert_eq!(argument, attribute, "a symbol lowers the same in both");
+    assert!(
+        matches!(argument, BindingExpr::SymbolValue(_)),
+        "a bare identifier call is a symbol: {argument:?}",
+    );
+
+    // A member chain ROOTED AT A CALL - the shape that was refused, in the
+    // exact form a per-instance prop read is written in.
+    let (attribute, argument) = both("grue().sprocket.bletch");
+    assert_eq!(argument, attribute, "a member read lowers the same in both");
+    let (base, path) = argument.member_path();
+    assert!(
+        matches!(base, BindingExpr::SymbolValue(_)),
+        "the chain is rooted in a symbol: {base:?}",
+    );
+    assert_eq!(
+        path,
+        ["sprocket", "bletch"],
+        "and carries every accessor in source order",
+    );
+
+    // A CONSTRUCTOR: a call WITH arguments, which names a value and the
+    // members it is made of. Not a computation - see `admissible_arg`.
+    let (attribute, argument) = both(r#"plugh("xyzzy")"#);
+    assert_eq!(argument, attribute, "a constructor lowers the same in both");
+    let BindingExpr::Call {
+        namespace,
+        name,
+        args,
+        ..
+    } = &argument
+    else {
+        panic!("a call: {argument:?}");
+    };
+    assert_eq!((namespace.as_str(), name.as_str()), ("", "plugh"));
+    assert_eq!(
+        args,
+        &vec![BindingExpr::Literal(LiteralValue::String("xyzzy".into()))],
+        "the constructor's own argument travels with it",
+    );
+}
+
+/// **THE RULE IS RECURSIVE**: a constructor's arguments are arguments, held to
+/// the same predicate, however deep.
+///
+/// `plugh(grue("a"), grue("b"))` is the case the fact effects need - a value
+/// built out of values - and it is admitted by the rule applying to itself
+/// rather than by a second clause about nesting. The refusal recurses too: one
+/// operator anywhere inside refuses the whole argument, which is what keeps
+/// "no computation" from being a property of the OUTERMOST call only.
+#[test]
+fn a_constructors_own_arguments_are_held_to_the_same_rule() {
+    let with = |call: &str| {
+        format!(
+            r#"
+            import {{ frobnicate }} from "{ZORK}";
+            <Widget id="a" onGrommet={{{call}}} />
+            "#
+        )
+    };
+    let argument = |call: &str| -> BindingExpr {
+        let doc = ctx().parse_tsx(&with(call)).expect("a nested constructor");
+        let Some(Node::Element(el)) = doc.root_nodes.first() else {
+            panic!("one element");
+        };
+        let Some(AttrValue::BindingExpr(BindingExpr::Call { args, .. })) = el.attr("onGrommet")
+        else {
+            panic!("an effect");
+        };
+        args[0].clone()
+    };
+
+    let nested = argument(r#"frobnicate(plugh(grue("a"), grue("b")))"#);
+    let BindingExpr::Call { name, args, .. } = &nested else {
+        panic!("a call: {nested:?}");
+    };
+    assert_eq!(name, "plugh");
+    assert_eq!(args.len(), 2, "both constructed-from values are carried");
+    for (index, arg) in args.iter().enumerate() {
+        let BindingExpr::Call { name, args, .. } = arg else {
+            panic!("the inner constructors survive: {arg:?}");
+        };
+        assert_eq!(name, "grue");
+        assert_eq!(
+            args,
+            &vec![BindingExpr::Literal(LiteralValue::String(
+                if index == 0 { "a" } else { "b" }.into()
+            ))],
+            "each inner literal is the one written, at capture width",
+        );
+    }
+
+    // ...and the refusal recurses with it. An operator NESTED inside an
+    // otherwise admissible call refuses the argument, so "no computation" is
+    // not a property of the outermost call alone.
+    for call in [
+        r#"frobnicate(plugh(1 + 2))"#,
+        r#"frobnicate(plugh(grue(a ?? b)))"#,
+        r#"frobnicate(plugh(() => 1))"#,
+    ] {
+        assert_eq!(
+            refusal(&with(call)),
+            EffectError::ArgNotALiteral {
+                attr: "onGrommet".into(),
+                effect: "frobnicate".into(),
+                index: 0,
+            },
+            "`{call}` hides a computation inside a constructor and must be refused",
         );
     }
 }

@@ -1393,19 +1393,28 @@ pub enum EffectError {
         /// The parameter type the signature declares.
         declared: TypeShape,
     },
-    /// An argument is neither a literal nor a **binding path**. An effect call
-    /// is not an expression language: anything wanting a computation is a
-    /// Module, referenced opaquely (Rule 46a).
+    /// An argument is none of the forms that NAME a value. An effect call is
+    /// not an expression language: anything wanting a computation is a Module,
+    /// referenced opaquely (Rule 46a).
     ///
     /// **A binding path is not an expression, and is admitted** - `{id}`,
     /// `{props.user.name}` lower to [`Expr::Get`], the same distinct
     /// first-class form [`AttrValue::Binding`] already is for an ordinary
-    /// attribute. What stays refused is everything that computes: a call, an
-    /// arithmetic expression, a template literal, an arrow function, an object
-    /// or array literal. That line is the whole of Rule 46a and it has not
-    /// moved; what moved is that a *path* was never on the computing side of
-    /// it, and treating it as one meant a row's own key could not be handed to
-    /// an effect at all.
+    /// attribute. **Nor is a symbol, or a value in CALL form** - `listItem()`,
+    /// `uiComponent().props.pane`, `pane("name")` - admitted with its own
+    /// arguments held to this same rule, recursively. What stays refused is
+    /// everything that COMBINES or DEFERS: an arithmetic expression, a
+    /// template literal, an equality, a conditional, a coalesce, a negation,
+    /// an arrow function, an object or array literal, a spread. That line is
+    /// the whole of Rule 46a and it has not moved; what moved, twice, is which
+    /// side of it a shape was on. A *path* was never on the computing side,
+    /// and treating it as one meant a row's own key could not be handed to an
+    /// effect at all; a CONSTRUCTOR is not on it either - `pane("name")` names
+    /// a value and the members it is made of, and refusing it meant a fact
+    /// write could name no value but a bare string.
+    ///
+    /// The predicate is `libtsx::parse`'s `admissible_arg`, which is where the
+    /// line is argued and the refusals are listed by name.
     ArgNotALiteral {
         /// The attribute that announced an effect.
         attr: String,
